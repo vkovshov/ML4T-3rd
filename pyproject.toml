@@ -3,7 +3,8 @@ name = "ml4t"
 version = "3.0.0"
 description = "Machine Learning for Algorithmic Trading — 3rd Edition"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.14,<3.15"
+#requires-python = ">=3.14"
 license = "MIT"
 authors = [{ name = "Stefan Jansen" }]
 
