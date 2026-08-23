@@ -40,7 +40,6 @@ subset requires a non-default profile such as `py312`, `benchmark`, or `rapids`.
 | Ch12 `10_shap_nlp_sentiment` | torch CUDA bug on 3.14 + shap | py312 |
 | Ch14 `06_conditional_autoencoder` | torch CUDA bug on 3.14 + shap | py312 |
 | Ch15 `06_fed_announcement_bsts` | tfcausalimpact (TFP BSTS, isolated `/opt/bsts/bin/python`) | py312 |
-| Ch21 `05_deep_hedging_pfhedge` | pfhedge (unmaintained, numpy<2) | py312 |
 | Ch02 `21_storage_benchmark_database` | requires benchmark image + database services | benchmark |
 | Ch12 `02_gbm_comparison` (GPU section) | RAPIDS cuML, LightGBM CUDA | rapids |
 
@@ -523,10 +522,12 @@ Some datasets require API keys (set in `.env`):
 - **NASDAQ Data Link** (US equities): Free API key from [data.nasdaq.com](https://data.nasdaq.com/)
 - **Databento** (CME futures): $125 free signup credit from [databento.com](https://databento.com/)
 
-**AlgoSeek** (NASDAQ-100 minute bars, S&P 500 option chains) needs no key and no account. Download
-the archives from [algoseek.com/ml-for-trading](https://algoseek.com/ml-for-trading/) and convert
-them once — see [AlgoSeek datasets](../data/README.md#algoseek-datasets), which also names the two
-datasets AlgoSeek has not published yet and the notebooks that wait on them.
+**AlgoSeek** (NASDAQ-100 minute bars, S&P 500 option chains, NASDAQ-100 TAQ ticks) needs no key and
+no account. Download the archives from
+[algoseek.com/ml-for-trading](https://algoseek.com/ml-for-trading/); the two large ones convert once
+and the ticks only need unzipping — see [AlgoSeek datasets](../data/README.md#algoseek-datasets).
+The fourth AlgoSeek dataset the book uses, the S&P 500 daily bars, ships with this repository, so
+there is nothing to download or configure for it.
 
 ---
 

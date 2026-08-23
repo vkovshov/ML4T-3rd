@@ -467,7 +467,7 @@ preamble. Full details in the **[Docker environments guide](envs/README.md)**.
 |--------------|------------------------------------------------------------------|-------------------------|
 | `ml4t`       | All 27 chapters + 9 case studies (CPU)                           | Default for everything  |
 | `ml4t-gpu`   | Same `ml4t` image, run with the NVIDIA runtime (`--profile gpu`) | Deep-learning chapters  |
-| `ml4t-py312` | Python 3.12 for signatory, esig, gensim, pfhedge, tfcausalimpact | ~10 notebooks           |
+| `ml4t-py312` | Python 3.12 for signatory, esig, gensim, tfcausalimpact           | ~10 notebooks           |
 | `benchmark`  | Database clients (TimescaleDB, ClickHouse, QuestDB, InfluxDB)    | Ch02 storage benchmarks |
 | `rapids`     | RAPIDS cuML + LightGBM CUDA (build locally)                      | One Ch12 GPU benchmark  |
 
@@ -507,6 +507,11 @@ Found an error, a broken link, or have a suggestion? Early feedback is especiall
 ## License
 
 Code: [MIT License](LICENSE) · Book content: © 2026 Stefan Jansen. All rights reserved.
+
+`data/equities/market/sp500/daily_bars.parquet` is © AlgoSeek LLC, redistributed here with
+AlgoSeek's permission for readers of the book. AlgoSeek retains all rights to it; cite
+[algoseek.com](https://algoseek.com) as the source in anything you publish from it. The MIT license
+covers the code, not this file. See [data/README.md](data/README.md#attribution).
 
 <p align="center">
   <a href="https://amzn.to/4eigy2F">Get the book</a> •

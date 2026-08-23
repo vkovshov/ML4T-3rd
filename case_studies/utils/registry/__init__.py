@@ -47,8 +47,10 @@ Usage::
 # --- completeness ---
 from .completeness import (
     BacktestRunStatus,
+    PredictionCoverage,
     TrainingRunStatus,
     backtest_run_status,
+    evaluate_prediction_coverage,
     skip_backtest_if_complete,
     skip_training_if_complete,
     training_run_status,
@@ -68,9 +70,9 @@ from .maintenance import (
 from .metrics import (
     compute_backtest_fold_metrics,
     compute_classification_metrics_from_predictions,
+    compute_cross_sectional_direction_auc,
     compute_fold_metrics_from_predictions,
     compute_prediction_fold_metrics,
-    compute_regression_vs_binary_auc,
 )
 
 # --- queries ---
@@ -117,12 +119,17 @@ from .registration import (
 from .specs import (
     DEFAULT_SEED,
     HASH_LENGTH,
+    IDENTITY_VERSION,
+    LEGACY_IDENTITY_VERSION,
+    SUPPORTED_IDENTITY_VERSIONS,
     backtest_hash_from_parts,
     build_training_spec,
     canonical_json,
+    canonical_value,
     compute_hash,
     load_preset,
     prediction_hash_from_parts,
+    project_training_identity,
     training_hash_from_spec,
 )
 
@@ -137,10 +144,15 @@ __all__ = [
     # specs
     "DEFAULT_SEED",
     "HASH_LENGTH",
+    "IDENTITY_VERSION",
+    "LEGACY_IDENTITY_VERSION",
+    "SUPPORTED_IDENTITY_VERSIONS",
     "canonical_json",
+    "canonical_value",
     "compute_hash",
     "training_hash_from_spec",
     "prediction_hash_from_parts",
+    "project_training_identity",
     "backtest_hash_from_parts",
     "load_preset",
     "build_training_spec",
@@ -164,6 +176,8 @@ __all__ = [
     # completeness
     "TrainingRunStatus",
     "BacktestRunStatus",
+    "PredictionCoverage",
+    "evaluate_prediction_coverage",
     "training_run_status",
     "backtest_run_status",
     "skip_training_if_complete",
@@ -173,7 +187,7 @@ __all__ = [
     "compute_backtest_fold_metrics",
     "compute_fold_metrics_from_predictions",
     "compute_classification_metrics_from_predictions",
-    "compute_regression_vs_binary_auc",
+    "compute_cross_sectional_direction_auc",
     # maintenance
     "DuplicateBacktest",
     "find_semantic_backtest_duplicates",

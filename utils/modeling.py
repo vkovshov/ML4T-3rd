@@ -6,9 +6,11 @@ Provides:
 - prepare_cv_folds(): Preprocess data into train/val folds (impute, scale)
 - ModelingDataset: Container for joined data with detected schema
 
-Cross-sectional IC computation lives in the library — call
-``ml4t.diagnostic.metrics.cross_sectional_ic`` against a polars frame
-of (date, symbol, y_true, y_pred) directly.
+The cross-sectional IC itself is the library's: call
+``ml4t.diagnostic.metrics.cross_sectional_ic`` against a polars frame of
+(date, symbol, y_true, y_pred) directly. ``cross_sectional_ic_mean()`` below is
+the adapter for callers holding aligned numpy arrays instead, which is what a
+scikit-learn or Optuna objective has in hand inside a fold.
 
 Usage:
     from utils.modeling import load_modeling_dataset, load_configs, prepare_cv_folds
@@ -25,9 +27,10 @@ import json
 import os
 import random
 import warnings
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -42,7 +45,7 @@ from utils.artifact_specs import (
     resolve_market_semantics,
     resolve_storage_path,
 )
-from utils.cv_splits import generate_cv_splits, make_wf_config
+from utils.cv_splits import earliest_train_start, generate_cv_splits, make_wf_config
 
 RANDOM_SEED = 42
 MIN_TEMPORAL_DATE_COVERAGE = 0.95  # Allow short calendar-edge gaps, not missing windows.
@@ -52,6 +55,50 @@ MIN_TEMPORAL_DATE_COVERAGE = 0.95  # Allow short calendar-edge gaps, not missing
 # (6.1%) for fold 1. A stale artifact whose fold IDs have shifted presents as a
 # leading gap of roughly half the window, so this bound still rejects it.
 MAX_TEMPORAL_WARMUP_FRACTION = 0.10
+
+
+def cross_sectional_ic_mean(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    dates: np.ndarray,
+    entities: np.ndarray,
+    *,
+    min_obs: int = 10,
+) -> float:
+    """Mean cross-sectional Spearman IC over the dates where it is defined.
+
+    The library computes the per-date series from two polars frames. Model
+    evaluation reaches it holding four aligned numpy arrays instead - what a
+    scikit-learn or Optuna objective has in hand inside a fold - so this adapts
+    the one to the other. It is the only thing this function does: the
+    correlation itself is ``ml4t.diagnostic``'s.
+
+    A date carries no coefficient when fewer than ``min_obs`` entities are
+    priced, or when every prediction or every return ties. ml4t-diagnostic 0.1.2
+    and later report those as null; 0.1.1 returns NaN, which ``drop_nulls`` does
+    not remove and which turns the mean of the whole series into NaN. Both are
+    dropped here, so the value does not depend on which of the two is installed.
+
+    Returns NaN when no date has a defined coefficient - a real answer to "what
+    was the average IC", unlike 0.0, which reads as "measured, and it was zero".
+    """
+    # Local import: `ml4t.diagnostic` brings scikit-learn's OpenMP runtime up
+    # transitively, and this module is imported by notebooks that must load a
+    # gradient-boosting library first. See .github/scripts/check_openmp_import_order.py.
+    from ml4t.diagnostic.metrics import cross_sectional_ic_series
+
+    ic_per_date = cross_sectional_ic_series(
+        pl.DataFrame({"timestamp": dates, "symbol": entities, "prediction": y_pred}),
+        pl.DataFrame({"timestamp": dates, "symbol": entities, "forward_return": y_true}),
+        pred_col="prediction",
+        ret_col="forward_return",
+        date_col="timestamp",
+        entity_col="symbol",
+        method="spearman",
+        min_obs=min_obs,
+    )
+    defined = ic_per_date.drop_nulls("ic").filter(pl.col("ic").is_finite())
+    return float(defined["ic"].mean()) if defined.height else float("nan")
 
 
 def seed_everything(seed: int = RANDOM_SEED) -> None:
@@ -115,13 +162,24 @@ class ModelingDataset:
     join_cols: list[str]
     splits: list[dict[str, Any]]
     label_buffer: str
+    # Which case study this was loaded from. Callers that persist or cache anything derived from
+    # the dataset need it, and it is not otherwise recoverable from the frame.
+    case_study_id: str = ""
     cv_config: Any = None  # WalkForwardConfig (optional, avoids hard import dep)
     task_type: str = "regression"  # "regression" or "classification"
     num_classes: int = 0  # 0 for regression, 2+ for classification
     class_values: list = field(default_factory=list)  # sorted unique values for classification
-    temporal_by_fold: pd.DataFrame | None = None  # Per-fold temporal features (has 'fold' column)
+    # Per-fold temporal features, carrying a 'fold' column. Held lazily where the loader
+    # can: on us_equities_panel this artifact is 68.7M rows, and materialising it cost
+    # 8.7 GB for the whole run when every consumer wants one fold. Reach it through
+    # ``fold_temporal_frame``, never by indexing it directly.
+    temporal_by_fold: pl.LazyFrame | pl.DataFrame | pd.DataFrame | None = None
     temporal_keys: list[str] = field(default_factory=list)  # Join keys for temporal features
     temporal_feature_names: list[str] = field(default_factory=list)  # Temporal feature column names
+    temporal_artifact_splits: list[dict[str, Any]] = field(default_factory=list)
+    # The float type the design matrices are built in. Read from the case study's
+    # ``features.storage_dtype``; fold preparation honours it rather than pinning float64.
+    feature_dtype: str = "float64"
     # Continuous-return label that classification predictions are scored against.
     # None for regression labels. When set, the column lives in ``dataset`` and
     # downstream IC computation must use it instead of the binary ``label_col``.
@@ -157,6 +215,7 @@ class ModelingDataset:
                 eval_label_col=self.eval_label_col,
                 max_symbols=self.lineage_inputs["max_symbols"],
                 symbols=self.lineage_inputs["symbols"],
+                feature_dtype=self.feature_dtype,
             )
         return self._input_lineage
 
@@ -180,8 +239,21 @@ def build_modeling_input_lineage(
     eval_label_col: str | None,
     max_symbols: int,
     symbols: list[str] | None,
+    feature_dtype: str = "float64",
 ) -> dict[str, Any]:
-    """Build the portable input identity carried by persisted training runs."""
+    """Build the portable input identity carried by persisted training runs.
+
+    ``feature_dtype`` is part of the identity because the artifacts are not. The parquet files
+    a case study reads are unchanged by a precision declaration, so without this a result fitted
+    in double precision and one fitted in single resolve to the same training identity, and the
+    registry serves the older one for a spec that asked for the other.
+
+    It is written into the payload only when it is not ``float64``. A key added unconditionally
+    changes the fingerprint of every case study, including the eight that declared nothing, and
+    would invalidate every training run already registered against them. Omitting the default
+    keeps those fingerprints exactly as they were and gives only the declaring case study a new
+    one. Any future default must be added the same way, for the same reason.
+    """
     split_fields = ("fold", "train_start", "train_end", "val_start", "val_end")
 
     def _normalize(key: str, value: Any) -> str:
@@ -210,6 +282,8 @@ def build_modeling_input_lineage(
         "max_symbols": int(max_symbols),
         "symbols": sorted(symbols) if symbols else None,
     }
+    if feature_dtype != "float64":
+        payload["feature_dtype"] = feature_dtype
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["fingerprint"] = hashlib.sha256(canonical.encode()).hexdigest()
     return payload
@@ -416,11 +490,177 @@ def get_classification_eval_label(case_study_id: str, label: str) -> str:
     return str(mapping[label])
 
 
+def get_direction_labels(case_study_id: str, label: str) -> tuple[str, ...]:
+    """Return the classification labels cut from a given continuous-return label.
+
+    ``labels.classification_eval_label`` read backwards. It declares which continuous return
+    each classification label was derived from; inverting it says which direction labels exist
+    for a return, which is what scoring a regression model by AUC needs. No separate
+    declaration is added for the inverse - one mapping cannot disagree with itself.
+
+    Returns an empty tuple when the case study declares no classification label for this
+    return, which is the case for five of the nine.
+    """
+    from utils import CASE_STUDIES_DIR
+
+    setup_path = CASE_STUDIES_DIR / case_study_id / "config" / "setup.yaml"
+    setup = yaml.safe_load(setup_path.read_text())
+    mapping = (setup.get("labels") or {}).get("classification_eval_label") or {}
+    return tuple(sorted(k for k, v in mapping.items() if v == label))
+
+
+def verify_artifact_sidecars(
+    artifacts: Mapping[str, Path],
+    *,
+    require_sidecar: bool = True,
+    values: bool = True,
+) -> dict[str, str]:
+    """Check each input artifact against the digest sidecar its producer wrote.
+
+    ``case_studies/utils/artifact_digest.py`` writes ``<artifact>.digest.json``
+    beside every artifact, recording the content hash, the row count and the key
+    columns. Until this function existed nothing read one: stage 02 and stage 03
+    wrote them and the chain stopped, so an upstream value change could not reach
+    a downstream identity. What it closes is narrow and worth stating exactly - the
+    registry records feature-set *names* and no digest of feature *values*, so a
+    model trained on corrected features and one trained on the leaky version it
+    replaced produce the identical training_hash unless something reads the values.
+
+    Raises on a digest that disagrees with the file. Whether a *missing* sidecar
+    also raises is the caller's to choose, because the two carry different
+    evidence. A disagreeing sidecar is a value that moved without its record
+    moving with it, which is the defect itself, and it is never acceptable. A
+    missing sidecar means the producer recorded nothing, which cannot be told
+    apart from a silent change but is also the state of every artifact written
+    before the sidecar existed.
+
+    Returns the verified digest per artifact, so the caller can carry it into the
+    training spec. Artifacts skipped under ``require_sidecar=False``, and every
+    artifact under ``values=False``, are absent from the mapping rather than
+    present with a null.
+
+    ``values`` chooses what the check costs, and the two settings answer different
+    questions. With it, the parquet is read and every row hashed, which is what the
+    recorded content digest is - order-independent, so it moves when and only when
+    a value moves. Without it, only the row count is compared, which parquet
+    metadata answers without reading a column. The cheap check cannot see a value
+    change that preserves the row count, and it does see the case that a crash
+    creates: ``write_artifact`` writes the parquet before its sidecar, so an
+    interrupted regeneration leaves new data beside the previous record, and new
+    data almost always has a different number of rows.
+
+    ``load_modeling_dataset`` runs the cheap check on every load and the full one
+    under ``verify_input_digests``; ``scripts/verify_artifact_sidecars.py`` runs the
+    full one over every case study, once, after a regeneration. That split is about
+    cost: hashing us_equities_panel's feature matrix is a multi-GB read plus a sort
+    over 68M row hashes.
+
+    Whether a *missing* sidecar raises is the caller's to choose, because presence
+    and disagreement carry different evidence. A missing sidecar means the producer
+    recorded nothing, which is the state of every artifact written before the
+    sidecar existed, and requiring presence before those are regenerated fails for
+    absence rather than for a changed value. Measured rather than assumed: on
+    2026-08-09 the production artifacts carried 49 sidecars out of 51, both gaps in
+    sp500_options, while the CI fixtures under
+    ``ml4t/third-edition-test-data/intermediates`` carried **none** - 0 of 7 for
+    cme_futures, 0 of 5 for etfs, 0 of 6 for fx_pairs, 0 of 6 for us_equities_panel.
+    """
+    from case_studies.utils.artifact_digest import read_digest, sidecar_path, value_digest
+
+    verified: dict[str, str] = {}
+    problems: list[str] = []
+    for name, path in sorted(artifacts.items()):
+        side = sidecar_path(path)
+        if not side.exists():
+            if require_sidecar:
+                problems.append(f"{name}: no digest sidecar beside {path.name}")
+            continue
+        try:
+            record = read_digest(path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            problems.append(f"{name}: sidecar unreadable ({exc})")
+            continue
+        recorded = record.get("digest")
+        if not recorded:
+            problems.append(f"{name}: sidecar records no digest")
+            continue
+
+        rows = record.get("n_rows")
+        if not values:
+            if rows is None:
+                continue
+            try:
+                actual_rows = cast(
+                    pl.DataFrame,
+                    pl.scan_parquet(path).select(pl.len()).collect(),
+                ).item()
+            except (OSError, pl.exceptions.PolarsError) as exc:
+                problems.append(f"{name}: {path.name} unreadable ({exc})")
+                continue
+            if int(rows) != int(actual_rows):
+                problems.append(
+                    f"{name}: {path.name} holds {actual_rows} rows, its sidecar records {rows}"
+                )
+            continue
+
+        try:
+            frame = pl.read_parquet(path)
+        except (OSError, pl.exceptions.PolarsError) as exc:
+            problems.append(f"{name}: {path.name} unreadable ({exc})")
+            continue
+        actual = value_digest(frame)
+        if actual != recorded:
+            problems.append(f"{name}: {path.name} hashes {actual}, its sidecar records {recorded}")
+            continue
+        if rows is not None and int(rows) != frame.height:
+            problems.append(
+                f"{name}: {path.name} holds {frame.height} rows, its sidecar records {rows}"
+            )
+            continue
+        verified[name] = recorded
+
+    if problems:
+        raise ValueError(
+            "input artifacts do not match the digests their producers recorded, so a "
+            "training run built on them would carry an identity that does not describe "
+            "its inputs: " + "; ".join(problems)
+        )
+    return verified
+
+
+def feature_storage_dtype(case_study_id: str) -> pl.DataType:
+    """The float type a case study stores and fits its feature matrices in.
+
+    ``float64`` unless ``features.storage_dtype`` in the case study's ``setup.yaml`` says
+    otherwise. Declared per case study because only the large panels need the narrower type:
+    ``nasdaq100_microstructure`` is 16,098,877 rows x 88 features, which is 10.9 GB of modeling
+    dataset in double precision against 5.6 GB in single, while the small case studies fit
+    comfortably either way and narrowing them would move their numbers for no gain.
+    """
+    # Read from the repository, not through ``get_case_study_dir``, which redirects to
+    # ``ML4T_OUTPUT_DIR``. Every CI job points that at a scratch directory holding no
+    # ``config/``, so going through the redirect would resolve every case study to the default
+    # and silently answer a question about what a case study declares with "nothing".
+    from utils import CASE_STUDIES_DIR
+
+    setup_path = CASE_STUDIES_DIR / case_study_id / "config" / "setup.yaml"
+    if not setup_path.exists():
+        return pl.Float64
+    declared = (yaml.safe_load(setup_path.read_text()) or {}).get("features", {})
+    name = (declared or {}).get("storage_dtype", "float64")
+    if name not in {"float32", "float64"}:
+        raise ValueError(
+            f"{case_study_id}: features.storage_dtype must be float32 or float64, got {name!r}"
+        )
+    return pl.Float32 if name == "float32" else pl.Float64
+
+
 def load_modeling_dataset(
     case_study_id: str,
     primary_label: str,
     max_symbols: int = 0,
     symbols: list[str] | None = None,
+    verify_input_digests: bool = False,
 ) -> ModelingDataset:
     """Load and join features + temporal + labels for a case study.
 
@@ -483,14 +723,36 @@ def load_modeling_dataset(
             f"Missing prerequisites for '{case_study_id}': " + ", ".join(p for p, _ in missing)
         )
 
-    # Load artifacts
-    features = pl.read_parquet(features_path)
+    # Load artifacts. The declared storage type is applied in the scan, so a case study that
+    # fits in single precision never materialises the double-precision form on the way.
+    storage_dtype = feature_storage_dtype(case_study_id)
+
+    def _read(path: Path) -> pl.DataFrame:
+        frame = pl.scan_parquet(path)
+        if storage_dtype != pl.Float64:
+            narrow = [n for n, t in frame.collect_schema().items() if t == pl.Float64]
+            if narrow:
+                frame = frame.with_columns([pl.col(c).cast(storage_dtype) for c in narrow])
+        return frame.collect()
+
+    features = _read(features_path)
 
     temporal_path = resolve_storage_path(
         case_study_id, temporal_spec, "features/model_based.parquet"
     )
-    temporal = pl.read_parquet(temporal_path) if temporal_path.exists() else None
+    # Scanned, not read. This artifact is per-fold, so it is a multiple of the feature table:
+    # 68.7M rows on us_equities_panel against the panel's 9.9M. Every consumer wants one fold,
+    # so the fold predicate is pushed into the scan instead of the whole thing being held.
+    temporal = pl.scan_parquet(temporal_path) if temporal_path.exists() else None
+    if temporal is not None and storage_dtype != pl.Float64:
+        narrow = [n for n, t in temporal.collect_schema().items() if t == pl.Float64]
+        if narrow:
+            temporal = temporal.with_columns([pl.col(c).cast(storage_dtype) for c in narrow])
+    temporal_columns = temporal.collect_schema().names() if temporal is not None else []
 
+    # Labels are deliberately not narrowed. ``features.storage_dtype`` covers the design
+    # matrix; the label is the target IC and every metric are measured against, and
+    # ``gbm_fold`` states that it stays float64 whatever the design matrix is cast to.
     labels = pl.read_parquet(label_path)
 
     # Auto-detect label column (the non-ID column in the label file)
@@ -504,8 +766,9 @@ def load_modeling_dataset(
     # Normalize date column names across DataFrames
     if alt_date in labels.columns and date_col not in labels.columns:
         labels = labels.rename({alt_date: date_col})
-    if temporal is not None and alt_date in temporal.columns and date_col not in temporal.columns:
+    if temporal is not None and alt_date in temporal_columns and date_col not in temporal_columns:
         temporal = temporal.rename({alt_date: date_col})
+        temporal_columns = [date_col if c == alt_date else c for c in temporal_columns]
 
     # Detect join columns
     label_keys = sorted(set(labels.columns) & ID_COLS)
@@ -529,33 +792,38 @@ def load_modeling_dataset(
     _temporal_feature_names = []
 
     if temporal is not None:
-        _temporal_keys = sorted(set(temporal.columns) & set(feature_keys))
+        temporal_schema = temporal.collect_schema()
+        _temporal_keys = sorted(set(temporal_columns) & set(feature_keys))
         casts = {
             k: features.schema[k]
             for k in _temporal_keys
-            if temporal.schema[k] != features.schema[k]
+            if temporal_schema[k] != features.schema[k]
         }
         if casts:
             temporal = temporal.cast(casts)
 
-        if "fold" in temporal.columns:
-            # Per-fold temporal features — join fold 0 as placeholder for schema,
-            # store full per-fold data for fold-aware preparation functions.
+        if "fold" in temporal_columns:
+            # Per-fold temporal features. The dataset carries one fold as a placeholder so the
+            # schema is complete; the per-fold values are substituted at fold preparation time
+            # by ``fold_temporal_frame``, which reads the fold it is asked for and no more.
             _temporal_feature_names = [
-                c for c in temporal.columns if c not in set(_temporal_keys) | {"fold"}
+                c for c in temporal_columns if c not in set(_temporal_keys) | {"fold"}
             ]
-            fold_ids = sorted(temporal["fold"].unique().to_list())
-            placeholder_fold = fold_ids[0]
-            placeholder = temporal.filter(pl.col("fold") == placeholder_fold).drop("fold")
-            placeholder_dedup = placeholder.unique(subset=_temporal_keys, keep="last")
+            fold_ids = sorted(temporal.select(pl.col("fold").unique()).collect()["fold"].to_list())
+            placeholder_dedup = (
+                temporal.filter(pl.col("fold") == fold_ids[0])
+                .drop("fold")
+                .unique(subset=_temporal_keys, keep="last")
+                .collect()
+            )
             dataset = features.join(placeholder_dedup, on=_temporal_keys, how="left", suffix="_t")
-            del placeholder, placeholder_dedup
+            del placeholder_dedup
 
-            # Convert to pandas for fold-preparation functions
-            temporal_by_fold_pd = temporal.to_pandas()
+            # Kept lazy. Materialising it here is what made a run hold every fold at once.
+            temporal_by_fold_pd = temporal
         else:
             # Legacy: single feature set, join directly
-            temporal_dedup = temporal.unique(subset=_temporal_keys, keep="last")
+            temporal_dedup = temporal.unique(subset=_temporal_keys, keep="last").collect()
             dataset = features.join(temporal_dedup, on=_temporal_keys, how="left", suffix="_t")
             del temporal_dedup
     else:
@@ -574,9 +842,7 @@ def load_modeling_dataset(
         primary_entity = entity_cols[0]
         dataset = dataset.filter(pl.col(primary_entity).is_in(list(symbols)))
     elif max_symbols > 0 and entity_cols:
-        primary_entity = entity_cols[0]
-        top = dataset.group_by(primary_entity).len().sort("len", descending=True).head(max_symbols)
-        dataset = dataset.filter(pl.col(primary_entity).is_in(top[primary_entity]))
+        dataset = reduce_to_top_entities(dataset, entity_cols[0], max_symbols)
 
     # Feature columns = everything except IDs and label
     feature_names = [c for c in dataset.columns if c not in ID_COLS and c != label_col]
@@ -600,13 +866,41 @@ def load_modeling_dataset(
         outcome_horizon=resolve_label_horizon(case_study_id, primary_label, setup),
         date_col=date_col,
     )
+    temporal_artifact_splits: list[dict[str, Any]] = []
     if temporal_by_fold_pd is not None:
+        assert temporal is not None
         validate_temporal_fold_coverage(
             dataset,
             temporal,
             splits,
             date_col=date_col,
         )
+        # The artifact carries one fold set, built on the primary label's geometry, and
+        # the rows above were selected from it by ``fold`` id. So the values this load
+        # returns for fold F were fit on data through the *primary* label's train_end,
+        # and a label whose own validation opens earlier than that is scored on sessions
+        # its features already saw. Coverage does not see this: an artifact can cover
+        # every date a variant is scored on and still have been fit past the start of
+        # that window. Checked here rather than in a notebook because every model
+        # notebook reaches its data through this call, and only the label being loaded
+        # is checked, so the cost is one label timeline rather than all of them.
+        from case_studies.utils.cv_window import (
+            assert_variant_folds_are_out_of_sample,
+            configured_labels,
+            temporal_artifact_fold_boundaries,
+        )
+
+        configured = configured_labels(case_study_id)
+        artifact_label = configured[0] if configured else primary_label
+        temporal_artifact_splits = temporal_artifact_fold_boundaries(
+            case_study_id,
+            artifact_label,
+            temporal_path,
+        )
+        if configured and primary_label != configured[0]:
+            assert_variant_folds_are_out_of_sample(
+                case_study_id, configured[0], variants=[primary_label]
+            )
 
     # WalkForwardConfig for library integration
     # Normalize month-based buffers to days (pd.Timedelta rejects 'M' as ambiguous)
@@ -660,6 +954,21 @@ def load_modeling_dataset(
         input_artifacts["model_based"] = temporal_path
     if eval_label_path is not None:
         input_artifacts["eval_label"] = eval_label_path
+    # Two depths, and the flag chooses between them rather than between checking
+    # and not. The row-count comparison reads parquet metadata and no column, so it
+    # runs always: write_artifact writes the parquet before its sidecar, and an
+    # interrupted regeneration therefore leaves new data beside the previous
+    # record, which almost always has a different number of rows. Comparing the
+    # content digest is what catches a value change that keeps the row count, and
+    # that means hashing every row - a multi-GB read plus a sort over 68M row
+    # hashes on us_equities_panel, paid per load. It is the same work
+    # scripts/verify_artifact_sidecars.py does once over everything after a
+    # regeneration, which is where a sweep should pay it.
+    verify_artifact_sidecars(
+        input_artifacts,
+        require_sidecar=verify_input_digests,
+        values=verify_input_digests,
+    )
     return ModelingDataset(
         dataset=dataset,
         feature_names=feature_names,
@@ -669,6 +978,7 @@ def load_modeling_dataset(
         join_cols=join_cols,
         splits=splits,
         label_buffer=label_buffer,
+        case_study_id=case_study_id,
         cv_config=cv_config,
         task_type=task_type,
         num_classes=num_classes,
@@ -676,6 +986,8 @@ def load_modeling_dataset(
         temporal_by_fold=temporal_by_fold_pd,
         temporal_keys=_temporal_keys,
         temporal_feature_names=_temporal_feature_names,
+        temporal_artifact_splits=temporal_artifact_splits,
+        feature_dtype="float32" if storage_dtype == pl.Float32 else "float64",
         eval_label_col=eval_label_col,
         lineage_inputs={
             "artifacts": input_artifacts,
@@ -685,6 +997,58 @@ def load_modeling_dataset(
     )
 
 
+def reduce_to_top_entities(
+    dataset: pl.DataFrame,
+    primary_entity: str,
+    max_symbols: int,
+) -> pl.DataFrame:
+    """Keep the ``max_symbols`` entities with the most rows, ties broken by name.
+
+    Row counts tie readily on these panels, and a tie broken by frame order is
+    not stable across runs or across callers. The entity name is the secondary
+    key so that every caller reducing the same dataset to the same size gets the
+    same universe. Without it a reduced stage-04 run and the reduced model
+    notebooks downstream of it can choose different equal-history symbols, and
+    the ones only a single side chose carry null temporal features - a wrong
+    answer that runs clean rather than a failure.
+
+    Production runs set ``max_symbols=0`` and never reach this.
+    """
+    top = (
+        dataset.group_by(primary_entity)
+        .len()
+        .sort(["len", primary_entity], descending=[True, False])
+        .head(max_symbols)
+    )
+    # implode: is_in against a bare Series of the same dtype is deprecated in
+    # polars as ambiguous, and membership in the value set is what is meant.
+    return dataset.filter(pl.col(primary_entity).is_in(top[primary_entity].implode()))
+
+
+def _inclusive_end_of(boundary: str) -> pd.Timestamp:
+    """Widen a configured end *date* to cover every bar of that session.
+
+    ``setup.yaml`` configures ``holdout_end`` as a date. Parsed, it is that date
+    at midnight, and every fold filter in this module is ``timestamp <= val_end``.
+    On a daily panel the bar already sits at midnight and the two agree. On an
+    intraday panel every bar of the final session sorts *after* midnight, so the
+    whole session is excluded from every modeling path: nasdaq100_microstructure
+    writes 2021-12-31 into its holdout fold - 38,610 rows added when the producer
+    side was fixed - and no consumer scores one of them.
+
+    A boundary that already carries a time of day is meant literally and is
+    returned unchanged, so a config can still name an instant inside a session -
+    including an explicit midnight. That is why this reads the configured *string*
+    rather than the parsed Timestamp: "2021-12-31" and "2021-12-31 00:00:00" parse
+    to the same instant, and only the first one means the whole day.
+    """
+    parsed = pd.Timestamp(boundary)
+    names_a_time = any(sep in str(boundary) for sep in (" ", "T"))
+    if names_a_time or parsed != parsed.normalize():
+        return parsed
+    return parsed + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+
+
 def append_holdout_fold_if_needed(
     mds: ModelingDataset,
     prediction_split: str,
@@ -692,13 +1056,19 @@ def append_holdout_fold_if_needed(
 ) -> None:
     """Append a holdout fold to ``mds.splits`` when ``prediction_split=='holdout'``.
 
-    Mirrors the etfs reference pattern at
-    ``case_studies/etfs/04_model_based_features.py`` lines 109-116: train on
-    everything from the first CV fold's ``train_start`` through ``holdout_start``,
-    validate on ``[holdout_start, holdout_end]``. The combined fold becomes
-    fold N+1, so downstream code iterating ``mds.splits`` produces one
-    holdout prediction set per (training run, config) pair without any other
-    change to the training loop.
+    The holdout fold trains on everything available before ``holdout_start`` and
+    validates on ``[holdout_start, holdout_end]``. It becomes fold N+1, so downstream
+    code iterating ``mds.splits`` produces one holdout prediction set per
+    (training run, config) pair without any other change to the training loop.
+
+    "Everything available" is ``min(train_start)`` across the CV folds, not
+    ``splits[0]["train_start"]``. ``generate_cv_splits`` steps backward from the holdout
+    boundary, so fold 0 is the most *recent* fold and carries the *latest* training start.
+    Measured on etfs: ``splits[0]`` starts 2008-01-02 where the earliest fold starts
+    2005-01-03, so indexing the list built a holdout retrain that silently discarded three
+    years. ``case_studies/etfs/04_model_based_features.py`` says so in its CV Fold Setup
+    prose - "Indexing the list hands it the shortest window of the set, silently" - and
+    this function cited that notebook while doing the thing it warns against.
 
     Idempotent — if the trailing fold already covers the holdout window
     (val_end matches setup.yaml's holdout_end), no fold is appended.
@@ -734,17 +1104,21 @@ def append_holdout_fold_if_needed(
     # made the idempotency check below never match (str(Timestamp) != YAML
     # string) and risked a tz-naive/aware comparison on the pandas filter path.
     ho_start_ts = pd.Timestamp(holdout_start)
-    ho_end_ts = pd.Timestamp(holdout_end)
-    trailing = mds.splits[-1]
-    if (
-        trailing.get("val_end") is not None
-        and pd.Timestamp(trailing.get("val_end")) == ho_end_ts
-        and pd.Timestamp(trailing.get("val_start")) == ho_start_ts
-    ):
-        return  # already covered
+    ho_end_ts = _inclusive_end_of(holdout_end)
+    # Any fold covering the holdout window, not just the trailing one: the CV
+    # folds run newest first and only the appended holdout fold lands at the end,
+    # so reading one position is a second place the ordering has to be right.
+    already_covered = any(
+        s.get("val_end") is not None
+        and pd.Timestamp(s["val_end"]) == ho_end_ts
+        and pd.Timestamp(s["val_start"]) == ho_start_ts
+        for s in mds.splits
+    )
+    if already_covered:
+        return
     holdout_fold = {
         "fold": len(mds.splits),
-        "train_start": pd.Timestamp(mds.splits[0]["train_start"]),
+        "train_start": earliest_train_start(mds.splits),
         "train_end": ho_start_ts,
         "val_start": ho_start_ts,
         "val_end": ho_end_ts,
@@ -991,10 +1365,7 @@ def validate_temporal_fold_coverage(
         dataset_dates = dataset.select(date_col).unique()[date_col].to_pandas()
     else:
         dataset_dates = dataset[date_col].drop_duplicates()
-    if isinstance(temporal_by_fold, pl.DataFrame):
-        temporal_pd = temporal_by_fold.select([date_col, "fold"]).unique().to_pandas()
-    else:
-        temporal_pd = temporal_by_fold[[date_col, "fold"]].drop_duplicates()
+    temporal_pd = temporal_fold_index(temporal_by_fold, date_col).to_pandas()
 
     dataset_index = pd.DatetimeIndex(pd.to_datetime(dataset_dates, utc=True)).unique().sort_values()
     temporal_pd = temporal_pd.copy()
@@ -1047,7 +1418,99 @@ def validate_temporal_fold_coverage(
         )
 
 
-def _replace_temporal_columns(
+def validate_temporal_split_geometry(
+    requested_splits: list[dict[str, Any]],
+    canonical_splits: list[dict[str, Any]],
+    temporal_by_fold: pl.DataFrame | pd.DataFrame | None,
+) -> None:
+    """Require requests to use the fold geometry that fitted temporal features."""
+    if temporal_by_fold is None:
+        return
+    fields = ("train_start", "train_end", "val_start", "val_end")
+    canonical = {int(split["fold"]): split for split in canonical_splits}
+    failures: list[str] = []
+    for requested in requested_splits:
+        fold = int(requested["fold"])
+        fitted = canonical.get(fold)
+        if fitted is None:
+            failures.append(f"fold {fold} has no fitted temporal artifact geometry")
+            continue
+        mismatches = [
+            field
+            for field in fields
+            if pd.Timestamp(requested[field]).tz_localize(None)
+            != pd.Timestamp(fitted[field]).tz_localize(None)
+        ]
+        if mismatches:
+            failures.append(f"fold {fold} differs in {mismatches}")
+    if failures:
+        raise ValueError(
+            "Custom CV cannot reuse fold-specific temporal features fitted on different "
+            f"boundaries: {'; '.join(failures)}. Use canonical folds or regenerate the "
+            "temporal artifact for the requested geometry."
+        )
+
+
+def fold_temporal_frame(
+    temporal_by_fold: Any,
+    fold_id: int,
+    *,
+    temporal_keys: Sequence[str] | None = None,
+    schema: Any = None,
+) -> pl.DataFrame:
+    """The temporal feature rows of one fold, as polars, whatever form the artifact is held in.
+
+    One definition, because selecting a fold out of the temporal artifact was written four
+    separate times - twice against pandas and twice against polars - and copies of a selection
+    rule agree only by luck. It is also the only place that decides how much of the artifact is
+    read: given a :class:`polars.LazyFrame` the fold predicate reaches the scan, so a run holds
+    one fold's rows rather than every fold's.
+
+    ``temporal_keys`` deduplicates, keeping the last row per key as the artifact writer intends.
+    ``schema`` is the frame the result will be joined to; the join keys are cast to match it,
+    because an artifact written with a different integer width joins to nothing and reports
+    itself as missing values rather than as an error.
+    """
+    if temporal_by_fold is None:
+        raise ValueError("no temporal artifact to select a fold from")
+
+    if isinstance(temporal_by_fold, pl.LazyFrame):
+        frame = temporal_by_fold.filter(pl.col("fold") == fold_id).drop("fold").collect()
+    elif isinstance(temporal_by_fold, pl.DataFrame):
+        frame = temporal_by_fold.filter(pl.col("fold") == fold_id).drop("fold")
+    else:  # pandas, for artifacts and tests that still build one eagerly
+        frame = pl.from_pandas(
+            temporal_by_fold[temporal_by_fold["fold"] == fold_id].drop(columns=["fold"])
+        )
+
+    if temporal_keys:
+        frame = frame.unique(subset=list(temporal_keys), keep="last")
+    if schema is not None:
+        casts = {
+            key: schema[key]
+            for key in (temporal_keys or [])
+            if key in frame.columns and key in schema and frame.schema[key] != schema[key]
+        }
+        if casts:
+            frame = frame.cast(casts)
+    return frame
+
+
+def temporal_fold_index(temporal_by_fold: Any, date_col: str) -> pl.DataFrame:
+    """The distinct ``(date, fold)`` pairs an artifact carries, without reading its features.
+
+    What every coverage check needs, and all it needs. Against a lazy artifact the projection
+    reaches the scan, so this costs two columns rather than the whole table.
+    """
+    columns = [date_col, "fold"]
+    if isinstance(temporal_by_fold, pl.LazyFrame):
+        return temporal_by_fold.select(columns).unique().collect()
+    if isinstance(temporal_by_fold, pl.DataFrame):
+        return temporal_by_fold.select(columns).unique()
+    return pl.from_pandas(temporal_by_fold[columns].drop_duplicates())
+
+
+def replace_temporal_columns(
     dataset_pd: pd.DataFrame,
     mask: np.ndarray,
     temporal_by_fold: pd.DataFrame,
@@ -1060,8 +1523,9 @@ def _replace_temporal_columns(
     Returns a copy of the masked rows with temporal columns overwritten.
     """
     rows = dataset_pd.loc[mask].copy()
-    fold_temp = temporal_by_fold[temporal_by_fold["fold"] == fold_id].drop(columns=["fold"])
-    fold_temp = fold_temp.drop_duplicates(subset=temporal_keys, keep="last")
+    fold_temp = fold_temporal_frame(
+        temporal_by_fold, fold_id, temporal_keys=temporal_keys
+    ).to_pandas()
 
     # Drop old temporal columns and merge fold-specific ones
     rows = rows.drop(columns=temporal_feature_names, errors="ignore")
@@ -1135,7 +1599,10 @@ def prepare_cv_folds(
         val_mask = (dates_series >= val_start) & (dates_series <= val_end)
 
         if has_fold_temporal:
-            train_rows = _replace_temporal_columns(
+            assert temporal_by_fold is not None
+            assert temporal_keys is not None
+            assert temporal_feature_names is not None
+            train_rows = replace_temporal_columns(
                 dataset_pd,
                 train_mask,
                 temporal_by_fold,
@@ -1143,7 +1610,7 @@ def prepare_cv_folds(
                 temporal_feature_names,
                 fold_id,
             )
-            val_rows = _replace_temporal_columns(
+            val_rows = replace_temporal_columns(
                 dataset_pd,
                 val_mask,
                 temporal_by_fold,
@@ -1209,6 +1676,7 @@ def prepare_cv_folds(
                 "entities": val_meta[entity_col].values if entity_col else None,
                 "n_train": len(X_train),
                 "n_val": len(X_val),
+                "preprocessor": preprocessor,
             }
         )
 
@@ -1294,15 +1762,15 @@ def prepare_single_fold(
 
         # Replace temporal columns with fold-specific values if available
         if _has_fold_temporal:
-            fold_temp_pd = temporal_by_fold[temporal_by_fold["fold"] == fold_id].drop(
-                columns=["fold"]
+            assert temporal_by_fold is not None
+            assert temporal_keys is not None
+            assert temporal_feature_names is not None
+            fold_temp_pl = fold_temporal_frame(
+                temporal_by_fold,
+                fold_id,
+                temporal_keys=temporal_keys,
+                schema=train_df.schema,
             )
-            fold_temp_pl = pl.from_pandas(fold_temp_pd)
-            fold_temp_pl = fold_temp_pl.unique(subset=temporal_keys, keep="last")
-            # Cast temporal keys to match dataset dtypes
-            for k in temporal_keys:
-                if k in fold_temp_pl.columns and fold_temp_pl.schema[k] != train_df.schema[k]:
-                    fold_temp_pl = fold_temp_pl.cast({k: train_df.schema[k]})
 
             for df_name in ("train_df", "val_df"):
                 df = train_df if df_name == "train_df" else val_df
@@ -1337,7 +1805,10 @@ def prepare_single_fold(
         val_mask = (dates_series >= val_start) & (dates_series <= val_end)
 
         if _has_fold_temporal:
-            train_rows = _replace_temporal_columns(
+            assert temporal_by_fold is not None
+            assert temporal_keys is not None
+            assert temporal_feature_names is not None
+            train_rows = replace_temporal_columns(
                 dataset,
                 train_mask,
                 temporal_by_fold,
@@ -1345,7 +1816,7 @@ def prepare_single_fold(
                 temporal_feature_names,
                 fold_id,
             )
-            val_rows = _replace_temporal_columns(
+            val_rows = replace_temporal_columns(
                 dataset,
                 val_mask,
                 temporal_by_fold,
@@ -1417,6 +1888,7 @@ def prepare_single_fold(
         "entities": entities,
         "n_train": n_train,
         "n_val": n_val,
+        "preprocessor": preprocessor,
     }
 
 
@@ -1526,3 +1998,10 @@ def compute_classification_metrics(
                 metrics[f"auc_class_{c}"] = auc
 
     return metrics
+
+
+# Deprecated private aliases. Thirty notebook cells import these names with their leading
+# underscore, which is what made them look private in the first place; each is a
+# cross-module interface and is now public. The aliases keep those callers working until
+# each notebook is re-executed with the public name, and go when the last one moves.
+_replace_temporal_columns = replace_temporal_columns
