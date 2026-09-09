@@ -111,6 +111,8 @@ from utils.style import COLORS, FIGSIZE, add_message_title
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "sp500_equity_option_analytics"
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
 LABEL = ""
 MAX_SYMBOLS = 0
 MAX_RISK_VARIANTS = 0
@@ -124,6 +126,20 @@ TOP_N_COMBOS = None
 # parameter wins; otherwise the case study's own declaration does.
 
 # %%
+# A preview run reads and registers in a smoke chain's own workspace, under `.preview/<case>`,
+# and `open_study` is what activates that root. Activation rewrites `ML4T_OUTPUT_DIR` for the
+# rest of the process, so it has to happen before the first `get_case_study_dir` rather than
+# beside the registry read further down: `CASE_DIR` has to already answer for the workspace.
+_preview_study = None
+if EXECUTION_TIER == "preview":
+    if not WORKSPACE:
+        raise ValueError("preview execution requires WORKSPACE")
+    _preview_study = open_study(
+        CASE_STUDY_ID,
+        execution_tier="preview",
+        workspace=WORKSPACE,
+        entry_point="16_risk_management",
+    )
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
 REGISTRY_DB = CASE_DIR / "run_log" / "registry.db"
 bt_config = get_backtest_config(CASE_STUDY_ID)
@@ -164,8 +180,12 @@ print(f"Case study: {CASE_STUDY_ID}; label: {RISK_LABEL}; selected lineages: {TO
 # `run_log` are symlinks: true in a maintainer worktree, false in every clean clone and CI run.
 # `CASE_DIR` is already the directory this notebook resolved, including under a preview, so
 # asking it directly answers for the registry the rest of the notebook reads.
-_study = Study.at(CASE_DIR, case_study=CASE_STUDY_ID, entry_point="16_risk_management")
-_members, _population_notes = prediction_members_in_force(_study)
+_study = (
+    _preview_study
+    if _preview_study is not None
+    else Study.at(CASE_DIR, case_study=CASE_STUDY_ID, entry_point="16_risk_management")
+)
+_members, _population_notes = prediction_members_in_force(_study, CASE_DIR)
 for _note in _population_notes:
     print(_note)
 CURRENT_MEMBERS = _members
@@ -440,32 +460,49 @@ SUPERSEDES_RISK_POPULATIONS: dict[str, str] = {}
 
 _risk_plan = None
 try:
-    _risk_writable = open_study(CASE_STUDY_ID, entry_point="16_risk_management")
+    _risk_writable = (
+        _preview_study
+        if _preview_study is not None
+        else open_study(CASE_STUDY_ID, entry_point="16_risk_management")
+    )
 except PermissionError as exc:
     print(f"Not recording the risk plan here: {exc}")
 else:
-    if _risk_writable.root != CASE_DIR:
+    # A preview's `root` stays the case directory while its writes go to the workspace, so
+    # the registry this run writes is `storage_root` for its tier. At canonical the two are
+    # identical and the guard is exactly as strict as before.
+    if _risk_writable.storage_root(EXECUTION_TIER) != CASE_DIR:
         raise RuntimeError(
             f"16 ran its sweep against {CASE_DIR} but opened a study rooted at "
             f"{_risk_writable.root}. Recording the plan there would describe a registry this "
             "run did not write."
         )
-    _risk_plan = OfficialPopulation.create(
-        _risk_writable,
-        name=RISK_POPULATION,
-        member_kind="backtest",
-        members=[plan["backtest_hash"] for plan in plans],
-        supersedes=population_supersedes(
+    if EXECUTION_TIER != "canonical":
+        # `OfficialPopulation.create` refuses a preview, and rightly: a published population is
+        # a durable claim about what this case study publishes, and a preview is discarded with
+        # its workspace. The risk sweep still executes and still registers. `_risk_plan` stays
+        # None, which the attestation below already tests for.
+        print(
+            f"{EXECUTION_TIER} tier: the risk sweep executes and registers, and publishes no "
+            f"official population under {RISK_POPULATION}."
+        )
+    else:
+        _risk_plan = OfficialPopulation.create(
             _risk_writable,
             name=RISK_POPULATION,
-            declared=SUPERSEDES_RISK_POPULATIONS.get(RISK_POPULATION),
-        ),
-    )
-    # Before any member executes; see `sweep_attestation_name`.
-    _attempt = open_sweep_attempt(_risk_writable, _risk_plan, UPSTREAM_PLANS)
-    print(
-        f"Risk plan {RISK_POPULATION}: {_risk_plan.hash}, {len(plans)} planned, attempt {_attempt}"
-    )
+            member_kind="backtest",
+            members=[plan["backtest_hash"] for plan in plans],
+            supersedes=population_supersedes(
+                _risk_writable,
+                name=RISK_POPULATION,
+                declared=SUPERSEDES_RISK_POPULATIONS.get(RISK_POPULATION),
+            ),
+        )
+        # Before any member executes; see `sweep_attestation_name`.
+        _attempt = open_sweep_attempt(_risk_writable, _risk_plan, UPSTREAM_PLANS)
+        print(
+            f"Risk plan {RISK_POPULATION}: {_risk_plan.hash}, {len(plans)} planned, attempt {_attempt}"
+        )
 
 # %%
 failures = []
@@ -700,26 +737,30 @@ fig_tradeoff.show()
 # on every label - so the second label's run could not publish at all.
 
 # %%
-# A candidate set is immutable under its name, so a field that has grown has to name the
-# generation it replaces. Keyed by the full set name because that is what the refusal prints.
+# A candidate set is immutable under its name, so a field whose membership has moved has to name
+# the generation it replaces. Keyed by the full set name because that is what the refusal prints.
 # Resolved through `candidate_set_supersedes` rather than passed straight to `create`: a
 # reader's clean clone has no generation to supersede, and `create` refuses a first version that
-# claims to replace one. Two generations precede this one and both stay readable by hash, which
-# is what keeps a holdout registered against either traceable to the field it actually saw:
-# `328d2009685c` is the single-label field frozen on 2026-08-30, before the four variant labels
-# had baseline, allocation or overlay rows; `aa6b3986124b` replaced it on 2026-09-01 under a
-# per-stage count of advancing configurations, which admitted a label whose sweep had produced
-# one row per configuration and stopped; `04cb35eec43f` replaced that one later the same day and
-# held 3,710 members, 66 of them allocation backtests from a grid no current sweep plan declares.
-# `37169a5be187` replaced it with the declared grids only and holds 3,644, and `774c32c6e79b`
-# replaced that. Every one of those five was frozen over a field that was still being produced:
-# the allocation and risk plans behind them were all written at 21:40 UTC on 2026-09-01, while
-# the baseline sweeps that feed them published at 22:34-22:46 and three of the baselines they
-# rank were registered at 22:42. This generation is the first frozen over sweeps that ran in
-# stage order and recorded that they finished. Only the tip is declarable - `create` refuses
-# anything else and names the tip - so this value moves on every generation.
+# claims to replace one. Five generations precede this one and all five stay readable by hash,
+# which is what keeps a holdout registered against any of them traceable to the field it saw:
+# `328d2009685c` is the single-label field frozen on 2026-08-30 with 1,097 members, before the
+# four variant labels had baseline, allocation or overlay rows; `aa6b3986124b` replaced it on
+# 2026-09-01 with 3,680 under a per-stage count of advancing configurations, which admitted a
+# label whose sweep had produced one row per configuration and stopped; `04cb35eec43f` replaced
+# that one later the same day and held 3,710, 66 of them allocation backtests from a grid no
+# current sweep plan declares; `37169a5be187` replaced it with the declared grids only and held
+# 3,644; `774c32c6e79b` replaced that with 3,811. All five were frozen over a field that was
+# still being produced: the allocation and risk plans behind them were written at 21:40 UTC on
+# 2026-09-01, while the baseline sweeps that feed them published at 22:34-22:46 and three of the
+# baselines they rank were registered at 22:42. `57cb9eb3133c` is the tip, frozen 2026-09-02
+# over sweeps that ran in stage order and recorded that they finished. It holds 3,811 as well and
+# differs from `774c32c6e79b` in 54 members: the `fwd_ret_10d` allocation backtests registered at
+# 00:55 on 2026-09-01 gave way to the 54 the re-executed 15 registered at 00:30 on 2026-09-02, so
+# every member now rides an attestation that carries its own grid. Only the tip is declarable -
+# `create` refuses anything else and names the tip - so this value moves on every generation, and
+# it is wrong whenever it names a generation the registry has already superseded.
 SUPERSEDES_CANDIDATE_SETS: dict[str, str] = {
-    "sp500_equity_option_analytics:holdout-candidates": "774c32c6e79b",
+    "sp500_equity_option_analytics:holdout-candidates": "57cb9eb3133c",
 }
 
 # %% [markdown]
@@ -789,7 +830,11 @@ try:
         raise PermissionError(
             "the sweep plans reported above are not all complete for the predictions in force"
         )
-    writable = open_study(CASE_STUDY_ID, entry_point="16_risk_management")
+    writable = (
+        _preview_study
+        if _preview_study is not None
+        else open_study(CASE_STUDY_ID, entry_point="16_risk_management")
+    )
 except PermissionError as exc:
     holdout_candidates = None
     print(
@@ -804,7 +849,10 @@ else:
     # root other than the one they will be read back from - which is how a member that is
     # complete at freeze time is incomplete at read time. Refusing is better than writing a set
     # nobody reads.
-    if writable.root != CASE_DIR:
+    # A preview's `root` stays the case directory while its writes go to the workspace, so
+    # the registry this run writes is `storage_root` for its tier. At canonical the two are
+    # identical and the guard is exactly as strict as before.
+    if writable.storage_root(EXECUTION_TIER) != CASE_DIR:
         raise RuntimeError(
             f"16 resolved its candidate field from {CASE_DIR} but opened a study rooted at "
             f"{writable.root}. Freezing here would write the set where the holdout notebooks "

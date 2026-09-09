@@ -29,6 +29,29 @@ from .registry.specs import canonical_json, compute_hash
 
 DIGEST_LENGTH = 16
 
+# The parquet encoding every identity-defining artifact is written under.
+#
+# Registry training identity digests these files' *bytes* - `utils/modeling.py`'s
+# `_sha256_file` feeds `computation.feature_artifacts` and
+# `computation.input_data_spec.artifacts`, both inside the hashed `computation` block. Two
+# files holding identical data therefore hash differently if they were written with a
+# different compression codec or row-group size, so a polars upgrade that moves a default
+# would fork the `training_hash` of every run reading that artifact: cached runs stop
+# matching, the sweep refits everything, and no number has moved to say why.
+#
+# These are polars 1.41.1's own defaults, written out. Verified byte-identical to writing
+# with none of them passed, so stating them moves nothing today and pins the encoding
+# against a future default change. `tests/test_artifact_digest_encoding.py` records the
+# bytes a fixed frame produces under them, so a change arrives as a red test rather than as
+# a registry that has quietly grown two identities for one piece of work.
+_PARQUET_WRITE_SETTINGS: dict[str, Any] = {
+    "compression": "zstd",
+    "compression_level": None,
+    "statistics": True,
+    "row_group_size": None,
+    "data_page_size": None,
+}
+
 
 def value_digest(df: pl.DataFrame, columns: Sequence[str] | None = None) -> str:
     """Return the content digest of *df* over *columns* (default: all).
@@ -46,6 +69,30 @@ def value_digest(df: pl.DataFrame, columns: Sequence[str] | None = None) -> str:
         {"columns": cols, "rows": hashlib.sha256(row_hashes).hexdigest()},
     )
     return compute_hash(content, length=DIGEST_LENGTH)
+
+
+PREDICTION_LABEL_COLUMN = "label"
+
+
+def published_prediction_digest(df: pl.DataFrame) -> str:
+    """The content digest of a published prediction frame, excluding its label column.
+
+    A published frame states which label it was produced under, so a coverage check can tell
+    which declaration applies to it (ml4t/agent-workspace#887). That column is data *about*
+    the frame - it is a constant, and the registry already holds the same value on the
+    prediction set's parent training run - so it is excluded from the frame's content
+    identity, exactly as it is kept out of `computation`.
+
+    Excluding it is what makes writing it free. `value_digest` over the whole frame is
+    recorded as `prediction_coverage.artifact_digest` and re-checked against the file on
+    every completeness test, so a column added to the frame would make every registered
+    prediction set fail its own digest and every re-registration raise "immutable prediction
+    artifact conflict". Digesting the frame without the column gives the same value for a
+    frame written before the column existed and for one written after, so the fleet's
+    recorded digests stay valid and nothing is stranded.
+    """
+    columns = [c for c in df.columns if c != PREDICTION_LABEL_COLUMN]
+    return value_digest(df, columns)
 
 
 def fold_digests(df: pl.DataFrame, *, fold_column: str = "fold") -> dict[str, str]:
@@ -170,7 +217,7 @@ def write_artifact(
     # this pair exists to make impossible.
     serialized = json.dumps(record, indent=2, sort_keys=True) + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(path)
+    df.write_parquet(path, **_PARQUET_WRITE_SETTINGS)
     sidecar_path(path).write_text(serialized)
     return record
 

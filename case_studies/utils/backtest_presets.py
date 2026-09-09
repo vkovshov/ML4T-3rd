@@ -7,6 +7,11 @@ from typing import Any
 import polars as pl
 import yaml
 
+from case_studies.utils.backtest_loaders import (
+    VECTORIZED_CASE_STUDIES,
+    declared_rebalance_step,
+    declares_rebalance_step,
+)
 from case_studies.utils.backtest_loaders import BacktestConfig as CaseStudyBacktestConfig
 from utils.paths import get_case_study_dir
 
@@ -357,6 +362,8 @@ def ensure_backtest_spec(
             else getattr(case_config, "min_trade_value", 100.0)
         ),
     }
+    if "step" in execution:
+        rebalance["step"] = int(execution["step"])
     strategy = {
         "signal": deepcopy(strategy_spec.get("signal", {})),
         "rebalance": rebalance,
@@ -451,6 +458,20 @@ def build_backtest_spec(
             "label=; "
             "pass the label this spec is being built for."
         )
+    # The same refusal for the step, and for a sharper reason: the step is emitted below only
+    # when a label resolves one, while `run_backtest` stamps the declared step onto whatever
+    # spec it is handed. So an unlabelled call here does not build a spec on the wrong grid -
+    # it builds a spec that hashes to an identity no run ever registers, and a caller that
+    # pre-hashes it to decide what to skip finds every registered row missing
+    # (ml4t/agent-workspace#1028). Measured on us_firm_characteristics: 2,276 of 2,276
+    # registered baseline rows invisible to `11_backtest`'s own skip check.
+    if declares_rebalance_step(case_study) and not label:
+        raise ValueError(
+            f"{case_study} declares labels.rebalance_step, which is part of the backtest "
+            "identity, so build_backtest_spec needs a non-empty label=; pass the label this "
+            "spec is being built for. Without it the spec hashes to an identity no run "
+            "registers."
+        )
     resolved_signal = deepcopy(signal)
     if case_study == "sp500_options":
         resolved_signal.setdefault("schedule_contract", SP500_OPTIONS_SCHEDULE_CONTRACT)
@@ -458,11 +479,16 @@ def build_backtest_spec(
     strategy_spec: dict[str, Any] = {
         "signal": resolved_signal,
         "execution": {
+            # `VECTORIZED_CASE_STUDIES` rather than a second copy of the same set. The
+            # membership was written out here as well, and the two are read by different
+            # things: this one decides the dispatch in `backtest_runner`, and the constant
+            # decides `IS_VECTORIZED` in four risk-management notebooks. Adding a case study
+            # to one and not the other gives a notebook the wrong branch with nothing raising.
             "mode": (
                 execution_mode
                 if execution_mode is not None
                 else "vectorized"
-                if case_study in {"us_firm_characteristics", "sp500_options"}
+                if case_study in VECTORIZED_CASE_STUDIES
                 else "engine"
             ),
             "engine_preset": "realistic",
@@ -470,6 +496,16 @@ def build_backtest_spec(
             # default for an unlabelled caller and for a label with no override, so a case study
             # that declares nothing produces byte-identical specs to before this parameter existed.
             "cadence": case_config.cadence_for(label),
+            # The step composes with the cadence to decide which slots are traded, so it
+            # belongs to the identity beside it (ml4t/agent-workspace#1005). Emitted only
+            # when the case study declares one, so a case study that declares nothing
+            # produces byte-identical specs to before this key existed - the same rule
+            # `cadence_for` follows above.
+            **(
+                {"step": _step}
+                if (_step := declared_rebalance_step(case_study, label)) is not None
+                else {}
+            ),
             "fill_timing": case_config.execution_delay.upper().replace(" ", "_"),
             "min_weight_change": (
                 min_weight_change

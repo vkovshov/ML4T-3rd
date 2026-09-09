@@ -1,14 +1,20 @@
 """Tests for utils/data_quality.py.
 
 Pins:
-- apply_max_symbols: seed determinism + edge cases (no-op when max<=0 or >=N).
-  Called by every loader; non-determinism would break reproducibility of tests
-  and notebooks that depend on a sampled subset.
+- apply_max_symbols: the one entity-reduction rule (most-observed, ties by name)
+  and its edge cases. Called by every loader, and reached from the modelling side
+  by utils.modeling.reduce_to_top_entities, so a producer and a consumer reducing
+  the same panel to the same size get the same universe. When it was a seeded
+  random sample the two disagreed: on nasdaq100_microstructure's fixture the labels
+  covered {AAPL, AMD, CMCSA, CSCO, SIRI} and the temporal features
+  {AAPL, AMD, AMZN, FB, TSLA}.
 - check_ohlc_invariants: correct detection of OHLC violations, graceful
   handling of null values (TAQ no-trade bars), and missing-column tolerance.
 """
 
 from __future__ import annotations
+
+import math
 
 import polars as pl
 import pytest
@@ -64,28 +70,32 @@ def test_apply_max_symbols_exceeds_universe_is_passthrough() -> None:
     assert out.equals(df)
 
 
-def test_apply_max_symbols_samples_requested_count() -> None:
+def test_apply_max_symbols_keeps_the_requested_count() -> None:
     df = _make_prices(["A", "B", "C", "D", "E"])
     out = apply_max_symbols(df, 3)
     assert out["symbol"].n_unique() == 3
 
 
-def test_apply_max_symbols_is_seed_deterministic() -> None:
-    """Same seed → same subset; critical for reproducible tests."""
-    df = _make_prices(["A", "B", "C", "D", "E", "F", "G", "H"])
+def test_apply_max_symbols_keeps_the_most_observed() -> None:
+    """The rule itself: history, not a draw."""
+    df = pl.concat(
+        [
+            _make_prices(["A"], n_rows=1),
+            _make_prices(["B"], n_rows=5),
+            _make_prices(["C"], n_rows=3),
+        ]
+    )
+    assert sorted(apply_max_symbols(df, 2)["symbol"].unique().to_list()) == ["B", "C"]
 
-    first = apply_max_symbols(df, 3, seed=42)["symbol"].unique().sort().to_list()
-    second = apply_max_symbols(df, 3, seed=42)["symbol"].unique().sort().to_list()
-    assert first == second
 
+def test_apply_max_symbols_breaks_a_tie_on_the_entity_name() -> None:
+    """Equal row counts are common - twelve nasdaq fixture symbols, five tied.
 
-def test_apply_max_symbols_different_seed_yields_different_sample() -> None:
-    df = _make_prices(["A", "B", "C", "D", "E", "F", "G", "H"])
-
-    s42 = set(apply_max_symbols(df, 3, seed=42)["symbol"].unique().to_list())
-    s7 = set(apply_max_symbols(df, 3, seed=7)["symbol"].unique().to_list())
-    # At least one sample differs — very high probability for k=3, n=8
-    assert s42 != s7
+    Without the tie break the answer comes out of frame order, so two callers
+    reducing the same panel to the same size can pick different symbols.
+    """
+    df = _make_prices(["D", "C", "B", "A"], n_rows=4)
+    assert sorted(apply_max_symbols(df, 2)["symbol"].unique().to_list()) == ["A", "B"]
 
 
 def test_apply_max_symbols_preserves_all_rows_per_symbol() -> None:
@@ -96,16 +106,45 @@ def test_apply_max_symbols_preserves_all_rows_per_symbol() -> None:
     assert per_symbol["len"].to_list() == [5, 5]
 
 
-def test_apply_max_symbols_sort_then_sample_is_order_invariant() -> None:
-    """Shuffling the input before sampling must yield the same subset: the
-    function sorts symbols before seeding the RNG so unstable loader order
-    (e.g., parquet partition order) can't perturb the selection."""
+def test_apply_max_symbols_is_invariant_to_input_order() -> None:
+    """Parquet partition order must not perturb the selection."""
     df_asc = _make_prices(["A", "B", "C", "D", "E"])
     df_desc = df_asc.sort("symbol", descending=True)
 
-    s1 = apply_max_symbols(df_asc, 2, seed=42)["symbol"].unique().sort().to_list()
-    s2 = apply_max_symbols(df_desc, 2, seed=42)["symbol"].unique().sort().to_list()
+    s1 = apply_max_symbols(df_asc, 2)["symbol"].unique().sort().to_list()
+    s2 = apply_max_symbols(df_desc, 2)["symbol"].unique().sort().to_list()
     assert s1 == s2
+
+
+def test_apply_max_symbols_reduces_a_lazyframe_the_same_way() -> None:
+    """Every loader passing include_microstructure=True reduces lazily."""
+    df = pl.concat(
+        [
+            _make_prices(["A"], n_rows=1),
+            _make_prices(["B"], n_rows=5),
+            _make_prices(["C"], n_rows=3),
+        ]
+    )
+    eager = apply_max_symbols(df, 2)["symbol"].unique().sort().to_list()
+    lazy = apply_max_symbols(df.lazy(), 2).collect()["symbol"].unique().sort().to_list()
+    assert eager == lazy == ["B", "C"]
+
+
+def test_the_loader_and_the_modelling_side_choose_the_same_universe() -> None:
+    """The coverage assertion the split was missing: same set, not same count.
+
+    A consumer symbol the producer never covered joins to null features and the
+    notebook runs clean on a wrong answer, which is why this is a set comparison.
+    """
+    from utils.modeling import reduce_to_top_entities
+
+    df = _make_prices(["A", "B", "C", "D", "E", "F"], n_rows=4)
+    # Give three symbols more history so the choice is not the whole universe.
+    df = pl.concat([df, _make_prices(["B", "D", "F"], n_rows=3)])
+
+    producer = set(apply_max_symbols(df, 3)["symbol"].unique().to_list())
+    consumer = set(reduce_to_top_entities(df, "symbol", 3)["symbol"].unique().to_list())
+    assert producer == consumer == {"B", "D", "F"}
 
 
 def test_apply_max_symbols_custom_symbol_col() -> None:
@@ -320,3 +359,65 @@ def test_the_gate_refuses_a_feature_frame_that_holds_none_of_the_columns_named()
             feature_cols=model_based_cols,
             label_col="fwd_ret_15m",
         )
+
+
+def test_check_ohlc_invariants_tolerates_adjustment_rounding() -> None:
+    """A high that IS the close, one ulp below it, is not a violation.
+
+    An adjusted panel applies its cumulative ratio to each field separately, so the
+    two products can differ in the last bit even though the bar's high and close are
+    the same price. The strict comparison this replaced reported 760 such rows on the
+    ETF panel, all with a breach smaller than one float64 epsilon of the close.
+    """
+    close = 862.5 * 0.9873456789
+    high = math.nextafter(close, 0.0)  # one ulp below: the same price, rounded apart
+    assert high < close, "the fixture must actually breach a strict comparison"
+
+    df = pl.DataFrame(
+        {
+            "open": [close],
+            "high": [high],
+            "low": [math.nextafter(close, 0.0)],
+            "close": [close],
+            "volume": [1_000],
+        }
+    )
+    invariants = check_ohlc_invariants(df)
+    assert (invariants["valid_pct"] == 100.0).all()
+
+
+def test_check_ohlc_invariants_rtol_zero_restores_strict_comparison() -> None:
+    """The tolerance is what admits the ulp, not some other leniency in the check.
+
+    Without this, the test above would still pass if the comparison had been changed
+    to something that never fails, and nothing would say so.
+    """
+    close = 862.5 * 0.9873456789
+    df = pl.DataFrame(
+        {
+            "open": [close],
+            "high": [math.nextafter(close, 0.0)],
+            "low": [close],
+            "close": [close],
+            "volume": [1_000],
+        }
+    )
+    strict = check_ohlc_invariants(df, rtol=0.0)
+    row = strict.filter(pl.col("check") == "high_gte_close").row(0, named=True)
+    assert row["valid_pct"] == 0.0
+
+
+def test_check_ohlc_invariants_still_detects_a_real_violation() -> None:
+    """One cent on a $100 bar is 1e-4 relative, eleven orders above the tolerance."""
+    df = pl.DataFrame(
+        {
+            "open": [100.0],
+            "high": [99.99],  # a cent below the close: a genuine defect
+            "low": [99.0],
+            "close": [100.0],
+            "volume": [1_000],
+        }
+    )
+    invariants = check_ohlc_invariants(df)
+    row = invariants.filter(pl.col("check") == "high_gte_close").row(0, named=True)
+    assert row["valid_pct"] == 0.0

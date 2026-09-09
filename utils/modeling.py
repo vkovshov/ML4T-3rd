@@ -42,6 +42,7 @@ from utils.artifact_specs import (
     load_feature_spec,
     load_label_spec,
     resolve_label_buffer,
+    resolve_label_buffer_unit,
     resolve_label_horizon,
     resolve_market_semantics,
     resolve_storage_path,
@@ -281,7 +282,24 @@ class ModelingDataset:
 
 
 def _sha256_file(path: Path) -> str:
-    """Return a stable digest for an identity-defining input artifact."""
+    """Digest an identity-defining input artifact's bytes.
+
+    Stable across repeated writes, not across encodings. Two parquet files holding
+    identical data hash differently if they were written with a different compression
+    codec or row-group size, and this digest is inside `computation.feature_artifacts` and
+    `computation.input_data_spec.artifacts`, which are inside the hashed `computation`
+    block - so a codec change forks the `training_hash` of every run reading that artifact.
+
+    Two things hold that shut. `artifact_digest._PARQUET_WRITE_SETTINGS` states the
+    encoding these artifacts are written under rather than inheriting a library default,
+    and `tests/test_artifact_digest_encoding.py` records the bytes a fixed frame produces
+    under it, so a change arrives as a failing test rather than as a registry that has
+    grown two identities for one piece of work.
+
+    `artifact_digest.value_digest` digests column *values* and is what a new identity
+    version should use here; changing it now would re-key all 1,305 registered training
+    runs across the nine live registries, which is a re-derivation rather than a fix.
+    """
     digest = hashlib.sha256()
     with path.open("rb") as src:
         for chunk in iter(lambda: src.read(1024 * 1024), b""):
@@ -787,15 +805,17 @@ def load_modeling_dataset(
     # fits in single precision never materialises the double-precision form on the way.
     storage_dtype = feature_storage_dtype(case_study_id)
 
-    def _read(path: Path) -> pl.DataFrame:
-        frame = pl.scan_parquet(path)
+    def _narrow(frame: pl.LazyFrame) -> pl.LazyFrame:
         if storage_dtype != pl.Float64:
             narrow = [n for n, t in frame.collect_schema().items() if t == pl.Float64]
             if narrow:
                 frame = frame.with_columns([pl.col(c).cast(storage_dtype) for c in narrow])
-        return frame.collect()
+        return frame
 
-    features = _read(features_path)
+    # Scanned, not read. A reduced run has to narrow the entity axis *before* the panel is
+    # materialised, and it cannot choose which entities to keep until the join keys are known,
+    # so the collect waits until both are settled - see "Universe reduction" below.
+    features_lazy = _narrow(pl.scan_parquet(features_path))
 
     temporal_path = resolve_storage_path(
         case_study_id, temporal_spec, "features/model_based.parquet"
@@ -813,38 +833,108 @@ def load_modeling_dataset(
     # Labels are deliberately not narrowed. ``features.storage_dtype`` covers the design
     # matrix; the label is the target IC and every metric are measured against, and
     # ``gbm_fold`` states that it stays float64 whatever the design matrix is cast to.
-    labels = pl.read_parquet(label_path)
+    labels_lazy = pl.scan_parquet(label_path)
+
+    label_columns = labels_lazy.collect_schema().names()
+    feature_columns = features_lazy.collect_schema().names()
 
     # Auto-detect label column (the non-ID column in the label file)
-    label_col = [c for c in labels.columns if c not in ID_COLS][0]
+    label_col = [c for c in label_columns if c not in ID_COLS][0]
 
     # Detect date column from features
-    feature_keys = sorted(set(features.columns) & ID_COLS)
+    feature_keys = sorted(set(feature_columns) & ID_COLS)
     date_col = "timestamp" if "timestamp" in feature_keys else "date"
     alt_date = "timestamp" if date_col == "date" else "date"
 
     # Normalize date column names across DataFrames
-    if alt_date in labels.columns and date_col not in labels.columns:
-        labels = labels.rename({alt_date: date_col})
+    if alt_date in label_columns and date_col not in label_columns:
+        labels_lazy = labels_lazy.rename({alt_date: date_col})
+        label_columns = [date_col if c == alt_date else c for c in label_columns]
     if temporal is not None and alt_date in temporal_columns and date_col not in temporal_columns:
         temporal = temporal.rename({alt_date: date_col})
         temporal_columns = [date_col if c == alt_date else c for c in temporal_columns]
 
     # Detect join columns
-    label_keys = sorted(set(labels.columns) & ID_COLS)
+    label_keys = sorted(set(label_columns) & ID_COLS)
     join_cols = sorted(set(feature_keys) & set(label_keys))
     entity_cols = [c for c in join_cols if c != date_col]
+
+    # One pass for both uses below. The sort used to call ``n_unique`` from its key function,
+    # which re-counts the column on every comparison.
+    cardinality: dict[str, int] = {}
+    if entity_cols:
+        cardinality = (
+            features_lazy.select([pl.col(c).n_unique().alias(c) for c in entity_cols])
+            .collect()
+            .row(0, named=True)
+        )
 
     # Filter out constant entity columns (e.g. instrument_id='straddle_30d_atm')
     # that break cross-sectional IC computation by collapsing all entities into one group.
     # NOTE: join_cols retains ALL shared ID columns for data integrity during joins;
     # entity_cols is filtered separately for IC computation only.
-    entity_cols = [c for c in entity_cols if features[c].n_unique() > 1]
+    entity_cols = [c for c in entity_cols if cardinality[c] > 1]
 
     # Sort by cardinality descending so the primary entity (most unique values)
     # comes first. Important when downstream code uses entity_cols[0] for IC
     # (e.g., CME futures: 'product' has 30 values vs 'position' has 3).
-    entity_cols = sorted(entity_cols, key=lambda c: features[c].n_unique(), reverse=True)
+    entity_cols = sorted(entity_cols, key=lambda c: cardinality[c], reverse=True)
+
+    # Universe reduction, pushed into the SCANS instead of applied to the finished panel.
+    #
+    # It used to run at the bottom of this function, after features and labels had both been
+    # read whole and joined, which left a reduction with almost nothing to save: five of
+    # nasdaq100_microstructure's 115 symbols - 4.3% of the universe - still peaked at 39.98 GB
+    # against the full run's 51.5 GB. A preview that costs 78% of production is not a preview,
+    # and it is what stopped the smoke-then-full loop from running on the two largest case
+    # studies at all.
+    #
+    # The universe it selects is unchanged. ``top_entities`` ranks entities by their row count
+    # in the finished panel, so the count is taken here on the key-only inner join of the two
+    # scans, which carries exactly the rows the panel carries: the temporal join is a left join
+    # against a frame made unique on its keys, and neither it nor the META_LEAK drop moves a row.
+    #
+    # Production runs pass ``max_symbols=0`` and no ``symbols``, so neither branch fires.
+    #
+    # Bound before the filter because the fold geometry below is derived from the label frame,
+    # and a reduced universe is a different timeline: ``generate_cv_splits`` reads the unique
+    # timestamps of whatever frame it is handed, so dropping 25 of cme_futures' 30 products
+    # removes four sessions and moves every fold boundary two sessions earlier. Measured
+    # 2026-09-06: the same call over the full universe puts fold 0's validation window at
+    # 2019-01-03..2020-01-02 and over a five-product preview at 2018-12-31..2019-12-30. Nothing
+    # downstream follows that shift - ``canonical_window`` always reads the whole label parquet -
+    # so the backtest loads prices for the canonical window, the preview's predictions carry two
+    # sessions that window does not, and ``Strategy._decision_weights`` refuses the decision
+    # artifact for keys outside the price grid. Before #780 the reduction ran after both frames
+    # were read whole, so this call already saw the full timeline; pushing it into the scans is
+    # what put a reduced frame here.
+    unreduced_labels_lazy = labels_lazy
+    if entity_cols:
+        primary_entity = entity_cols[0]
+        keep: list | None = None
+        if symbols:
+            keep = list(symbols)
+        elif max_symbols > 0:
+            from utils.data_quality import top_entities
+
+            keep = top_entities(
+                features_lazy.select(join_cols).join(
+                    labels_lazy.select(join_cols), on=join_cols, how="inner"
+                ),
+                max_symbols,
+                primary_entity,
+            )
+        if keep is not None:
+            # implode: is_in against a bare Series of the same dtype is deprecated in polars
+            # as ambiguous, and membership in the value set is what is meant.
+            keep_values = pl.Series(primary_entity, keep).implode()
+            features_lazy = features_lazy.filter(pl.col(primary_entity).is_in(keep_values))
+            labels_lazy = labels_lazy.filter(pl.col(primary_entity).is_in(keep_values))
+            if temporal is not None and primary_entity in temporal_columns:
+                temporal = temporal.filter(pl.col(primary_entity).is_in(keep_values))
+
+    features = features_lazy.collect()
+    labels = labels_lazy.collect()
 
     # Join features + temporal (left join to keep all feature rows)
     temporal_by_fold_pd = None
@@ -882,7 +972,17 @@ def load_modeling_dataset(
             # Kept lazy. Materialising it here is what made a run hold every fold at once.
             temporal_by_fold_pd = temporal
         else:
-            # Legacy: single feature set, join directly
+            # Fold-free: one value per key, joined straight on. A refit schedule produces this
+            # shape, and so does any stage that fits nothing per fold.
+            #
+            # The names are recorded here for the same reason the fold branch records them:
+            # they say which of the panel's columns came from the model-based artifact. They
+            # were not recorded before, so a fold-free artifact reported no model-based
+            # features at all while its columns sat in `dataset` regardless - the features
+            # were used, and nothing that asks which ones they are could answer. Every
+            # consumer of this list also requires `temporal_by_fold`, which stays None here,
+            # so filling it in changes no fold substitution.
+            _temporal_feature_names = [c for c in temporal_columns if c not in set(_temporal_keys)]
             temporal_dedup = temporal.unique(subset=_temporal_keys, keep="last").collect()
             dataset = features.join(temporal_dedup, on=_temporal_keys, how="left", suffix="_t")
             del temporal_dedup
@@ -897,19 +997,16 @@ def load_modeling_dataset(
     if drop_cols:
         dataset = dataset.drop(drop_cols)
 
-    # Optional universe reduction
-    if symbols and entity_cols:
-        primary_entity = entity_cols[0]
-        dataset = dataset.filter(pl.col(primary_entity).is_in(list(symbols)))
-    elif max_symbols > 0 and entity_cols:
-        dataset = reduce_to_top_entities(dataset, entity_cols[0], max_symbols)
-
     # Feature columns = everything except IDs and label
     feature_names = [c for c in dataset.columns if c not in ID_COLS and c != label_col]
 
     # CV splits — read buffer from setup.yaml (explicit, handles non-standard labels)
     setup = yaml.safe_load((case_dir / "config" / "setup.yaml").read_text())
     label_buffer = resolve_label_buffer(case_study_id, primary_label, setup)
+    # Whether that duration counts sessions or calendar time is the label's to declare,
+    # not each consumer's to guess: `35D` to option expiry is calendar, `21D` on a daily
+    # equity panel is 21 sessions, and the duration alone cannot tell them apart.
+    buffer_unit = resolve_label_buffer_unit(case_study_id, primary_label, setup)
     if not label_buffer:
         raise ValueError(
             f"No explicit label buffer found for '{primary_label}' in "
@@ -920,11 +1017,12 @@ def load_modeling_dataset(
     # feature-joined frame lets warm-up nulls or feature availability shift the
     # calendar and makes model selection disagree with canonical_window().
     splits = generate_cv_splits(
-        labels,
+        unreduced_labels_lazy.select(date_col).unique().collect(),
         case_study_id=case_study_id,
         label_buffer=label_buffer,
         outcome_horizon=resolve_label_horizon(case_study_id, primary_label, setup),
         date_col=date_col,
+        buffer_unit=buffer_unit,
     )
     temporal_artifact_splits: list[dict[str, Any]] = []
     if temporal_by_fold_pd is not None:
@@ -968,7 +1066,12 @@ def load_modeling_dataset(
     if wf_horizon and wf_horizon.endswith("M") and wf_horizon[:-1].isdigit():
         wf_horizon = f"{int(wf_horizon[:-1]) * 30}D"
     try:
-        cv_config = make_wf_config(case_study_id, label_horizon=wf_horizon, date_col=date_col)
+        cv_config = make_wf_config(
+            case_study_id,
+            label_horizon=wf_horizon,
+            date_col=date_col,
+            buffer_unit=buffer_unit,
+        )
     except Exception as exc:
         warnings.warn(f"WalkForwardConfig creation failed for {case_study_id}: {exc}", stacklevel=2)
         cv_config = None
@@ -1064,25 +1167,22 @@ def reduce_to_top_entities(
 ) -> pl.DataFrame:
     """Keep the ``max_symbols`` entities with the most rows, ties broken by name.
 
-    Row counts tie readily on these panels, and a tie broken by frame order is
-    not stable across runs or across callers. The entity name is the secondary
-    key so that every caller reducing the same dataset to the same size gets the
-    same universe. Without it a reduced stage-04 run and the reduced model
-    notebooks downstream of it can choose different equal-history symbols, and
-    the ones only a single side chose carry null temporal features - a wrong
-    answer that runs clean rather than a failure.
+    The modelling-side entry point to :func:`utils.data_quality.top_entities`, which
+    is the one rule; the loaders reach the same one through ``apply_max_symbols``.
+    Two callers reducing the same dataset to the same size have to get the same
+    universe, or the ones only a single side chose carry null temporal features - a
+    wrong answer that runs clean rather than a failure.
 
     Production runs set ``max_symbols=0`` and never reach this.
     """
-    top = (
-        dataset.group_by(primary_entity)
-        .len()
-        .sort(["len", primary_entity], descending=[True, False])
-        .head(max_symbols)
-    )
+    from utils.data_quality import top_entities
+
+    selected = top_entities(dataset, max_symbols, primary_entity)
     # implode: is_in against a bare Series of the same dtype is deprecated in
     # polars as ambiguous, and membership in the value set is what is meant.
-    return dataset.filter(pl.col(primary_entity).is_in(top[primary_entity].implode()))
+    return dataset.filter(
+        pl.col(primary_entity).is_in(pl.Series(primary_entity, selected).implode())
+    )
 
 
 def _inclusive_end_of(boundary: str) -> pd.Timestamp:
@@ -1128,14 +1228,13 @@ def append_holdout_fold_if_needed(
     The fold becomes fold N+1, so downstream code iterating ``mds.splits`` produces one holdout
     prediction set per (training run, config) pair without any other change to the training loop.
 
-    "Everything available" is ``min(train_start)`` across the CV folds, not
-    ``splits[0]["train_start"]``. ``generate_cv_splits`` steps backward from the holdout
-    boundary, so fold 0 is the most *recent* fold and carries the *latest* training start.
-    Measured on etfs: ``splits[0]`` starts 2008-01-02 where the earliest fold starts
-    2005-01-03, so indexing the list built a holdout retrain that silently discarded three
-    years. ``case_studies/etfs/04_model_based_features.py`` says so in its CV Fold Setup
-    prose - "Indexing the list hands it the shortest window of the set, silently" - and
-    this function cited that notebook while doing the thing it warns against.
+    "Everything available" is ``min(train_start)`` across the CV folds, which
+    :func:`utils.cv_splits.earliest_train_start` reads from the windows. Indexing the
+    list is what this function used to do, and it silently discarded three years on
+    etfs - 2008-01-02 against an earliest fold start of 2005-01-03 - because fold 0
+    was then the most recent fold. Under ml4t-diagnostic 0.1.4 fold 0 is the earliest
+    and ``splits[0]["train_start"]`` happens to agree, which is exactly why the read
+    stays on the boundaries: it was right before the order changed and is right after.
 
     Idempotent — if the trailing fold already covers the holdout window
     (val_end matches setup.yaml's holdout_end), no fold is appended.
@@ -1174,9 +1273,9 @@ def append_holdout_fold_if_needed(
     # string) and risked a tz-naive/aware comparison on the pandas filter path.
     ho_start_ts = pd.Timestamp(holdout_start)
     ho_end_ts = _inclusive_end_of(holdout_end)
-    # Any fold covering the holdout window, not just the trailing one: the CV
-    # folds run newest first and only the appended holdout fold lands at the end,
-    # so reading one position is a second place the ordering has to be right.
+    # Any fold covering the holdout window, not just the trailing one: reading a
+    # single position is a second place the ordering would have to be right, and
+    # the appended holdout fold is not the only thing that can land at the end.
     already_covered = any(
         s.get("val_end") is not None
         and pd.Timestamp(s["val_end"]) == ho_end_ts

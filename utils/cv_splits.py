@@ -29,7 +29,7 @@ Design decisions:
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -38,7 +38,11 @@ import pandas as pd
 import polars as pl
 import yaml
 
-from utils.artifact_specs import resolve_market_semantics
+from utils.artifact_specs import (
+    DEFAULT_LABEL_BUFFER_UNIT,
+    LABEL_BUFFER_UNITS,
+    resolve_market_semantics,
+)
 from utils.paths import get_case_study_dir
 
 if TYPE_CHECKING:
@@ -92,6 +96,32 @@ def normalize_label_buffer(s: str) -> str:
     return s
 
 
+def _horizon_for_config(
+    normalized_buffer: str,
+    *,
+    calendar_id: str | None,
+    buffer_unit: str,
+) -> int | str:
+    """Turn a normalized buffer into what the splitter should count.
+
+    A ``D`` buffer is passed as an ``int`` so the library counts **sessions**, which is
+    right for a session-gridded panel: "21D" as ``pd.Timedelta("21 days")`` is about 15
+    sessions, and under-buffering the holdout boundary leaks. It is wrong for a
+    calendar-anchored horizon such as ``sp500_options``' 35 days to option expiry, where
+    counting 35 sessions over-trims by about two weeks.
+
+    The duration cannot say which it is, so the label declares it -
+    ``utils.artifact_specs.resolve_label_buffer_unit``. Without a calendar there are no
+    sessions to count and the duration is the only reading available.
+    """
+    if buffer_unit not in LABEL_BUFFER_UNITS:
+        raise ValueError(f"buffer_unit is {buffer_unit!r}, not one of {list(LABEL_BUFFER_UNITS)}")
+    if buffer_unit != "sessions" or calendar_id is None:
+        return normalized_buffer
+    d_match = re.match(r"^(\d+)D$", normalized_buffer)
+    return int(d_match.group(1)) if d_match else normalized_buffer
+
+
 def _purge_holdout_touching_validation(
     val_idx: np.ndarray,
     timestamps: pd.DatetimeIndex,
@@ -99,8 +129,15 @@ def _purge_holdout_touching_validation(
     holdout_start: str | None,
     outcome_horizon: str,
     calendar_id: str | None,
+    buffer_unit: str = DEFAULT_LABEL_BUFFER_UNIT,
 ) -> np.ndarray:
-    """Exclude validation signals whose label endpoint reaches the holdout."""
+    """Exclude validation signals whose label endpoint reaches the holdout.
+
+    ``buffer_unit`` decides how ``outcome_horizon`` is read, the same way it decides it
+    for the fold geometry: sessions counted back from the boundary's position, or a
+    calendar duration subtracted from the boundary itself. A calendar-anchored horizon
+    read as sessions purges further than the label reaches.
+    """
     if not holdout_start or outcome_horizon in {"", "0D", "0H"}:
         return val_idx
 
@@ -115,7 +152,7 @@ def _purge_holdout_touching_validation(
         boundary = boundary.tz_localize(None)
 
     trading_day_match = re.fullmatch(r"(\d+)D", outcome_horizon)
-    if calendar_id is not None and trading_day_match:
+    if calendar_id is not None and trading_day_match and buffer_unit == "sessions":
         horizon = int(trading_day_match.group(1))
         holdout_pos = int(timestamps.searchsorted(boundary, side="left"))
         return val_idx[val_idx < holdout_pos - horizon]
@@ -172,6 +209,8 @@ def make_walk_forward_config(
     case_study_id: str,
     label_horizon: str = "0D",
     date_col: str = "timestamp",
+    *,
+    buffer_unit: str = DEFAULT_LABEL_BUFFER_UNIT,
 ) -> WalkForwardConfig:
     """Create a WalkForwardConfig from a case study's setup.yaml.
 
@@ -197,13 +236,9 @@ def make_walk_forward_config(
 
     eval_config = load_evaluation_config(case_study_id)
     calendar_id = _map_calendar_id(eval_config.get("calendar"))
-
-    # For D-unit buffers with a calendar, pass as int (trading days)
-    normalized_horizon: int | str = normalize_label_buffer(label_horizon)
-    if calendar_id is not None and isinstance(normalized_horizon, str):
-        d_match = re.match(r"^(\d+)D$", normalized_horizon)
-        if d_match:
-            normalized_horizon = int(d_match.group(1))
+    normalized_horizon = _horizon_for_config(
+        normalize_label_buffer(label_horizon), calendar_id=calendar_id, buffer_unit=buffer_unit
+    )
 
     return WalkForwardConfig(
         n_splits=eval_config["n_splits"],
@@ -222,12 +257,15 @@ def make_wf_config(
     case_study_id: str,
     label_horizon: str = "0D",
     date_col: str = "timestamp",
+    *,
+    buffer_unit: str = DEFAULT_LABEL_BUFFER_UNIT,
 ) -> WalkForwardConfig:
     """Backward-compatible alias for make_walk_forward_config."""
     return make_walk_forward_config(
         case_study_id=case_study_id,
         label_horizon=label_horizon,
         date_col=date_col,
+        buffer_unit=buffer_unit,
     )
 
 
@@ -239,6 +277,7 @@ def generate_cv_splits(
     outcome_horizon: str | None = None,
     date_col: str = "timestamp",
     *,
+    buffer_unit: str = DEFAULT_LABEL_BUFFER_UNIT,
     cv_config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Generate walk-forward date splits from evaluation config.
@@ -272,18 +311,16 @@ def generate_cv_splits(
     -------
     list[dict]
         Split dicts with keys ``fold``, ``train_start``, ``train_end``,
-        ``val_start``, ``val_end``, **ordered newest first**. Fold 0 validates
-        on the most recent window and carries the *latest* ``train_start``; the
-        last element is the oldest fold and carries the earliest. The order is
-        asserted before the list is returned, so it cannot change silently.
+        ``val_start``, ``val_end``, **ordered oldest first**. Fold 0 validates
+        on the earliest window and carries the earliest ``train_start``; the
+        last element is the most recent fold. The order is asserted before the
+        list is returned, so it cannot change silently.
 
         Index it only when you mean a position in that order. For "the most
         recent fold" and "everything available before the holdout", call
         :func:`most_recent_split` and :func:`earliest_train_start`, which read
         the boundaries rather than the position and are correct whatever order
-        the list is in. ``splits[0]["train_start"]`` under a comment reading
-        "train on everything up to holdout_start" is the measured failure: on
-        etfs it starts 2013-01-17 where the earliest fold starts 2006-01-13.
+        the list is in - they did not change when the order did.
     """
     from ml4t.diagnostic.splitters import WalkForwardCV
     from ml4t.diagnostic.splitters.config import WalkForwardConfig as LibWalkForwardConfig
@@ -293,7 +330,7 @@ def generate_cv_splits(
     # and reads fold 0 the same way either way.
     if cv_config is not None and "splits" in cv_config:
         precomputed = cv_config["splits"]
-        _assert_newest_first(precomputed, source="the precomputed splits in cv_config")
+        _assert_chronological(precomputed, source="the precomputed splits in cv_config")
         return precomputed
 
     # Normalize label buffer (strip ISO prefix, convert M → days)
@@ -332,11 +369,9 @@ def generate_cv_splits(
     # library interprets it as trading days (not calendar days). This fixes
     # the under-buffering where "21D" → pd.Timedelta("21 days") → ~15 trading
     # days instead of the intended 21 trading days.
-    label_horizon: int | str = label_buffer
-    if calendar_id is not None:
-        d_match = re.match(r"^(\d+)D$", label_buffer)
-        if d_match:
-            label_horizon = int(d_match.group(1))
+    label_horizon = _horizon_for_config(
+        label_buffer, calendar_id=calendar_id, buffer_unit=buffer_unit
+    )
 
     # Build WalkForwardConfig (library Pydantic model)
     config = LibWalkForwardConfig(
@@ -388,6 +423,7 @@ def generate_cv_splits(
             holdout_start=eval_config.get("holdout_start"),
             outcome_horizon=outcome_horizon,
             calendar_id=calendar_id,
+            buffer_unit=buffer_unit,
         )
         if len(val_idx) == 0:
             raise ValueError(
@@ -404,49 +440,64 @@ def generate_cv_splits(
             }
         )
 
-    _assert_newest_first(splits)
+    _assert_chronological(splits)
     return splits
 
 
-def _assert_newest_first(
+def _assert_chronological(
     splits: list[dict[str, Any]],
     source: str = "generate_cv_splits",
 ) -> None:
-    """Fail if the folds are not ordered newest first.
+    """Fail if the folds are not ordered oldest first.
 
-    The order is a property of ``fold_direction="backward"`` in the library
-    config, and roughly forty call sites depend on it - some by indexing, some
-    by writing the fold id into an artifact that a later stage reads back by id.
-    If a library change reversed it, every one of them would keep running and
-    quietly mean the opposite. This turns that into an immediate failure.
+    ``ml4t-diagnostic`` 0.1.4 constructs the backward validation windows from the
+    held-out test boundary and then emits the completed folds chronologically, so
+    fold 0 validates on the earliest window and the fold id increases with time.
+    Every earlier release emitted the same windows in the opposite order. Roughly
+    forty call sites read that order - some by indexing, some by writing the fold
+    id into an artifact a later stage reads back by id - and a library change that
+    reversed it again would leave all of them running while quietly meaning the
+    opposite. This turns that into an immediate failure.
 
     It applies to a ``cv_config`` carrying explicit splits too. A caller cannot
-    tell which path produced its list, so a stored fold set that runs oldest
-    first hands fold id 0 to the earliest window while everything built through
-    the generated path gives it to the latest. Measured on the two committed
-    configs: ``us_firm_characteristics/config/cv_config.json`` runs newest first
-    and agrees, ``fx_pairs/config/cv_config.json`` runs oldest first - fold 0
-    validates from 2015-10-28, fold 7 from 2022-12-15 - while
-    ``fx_pairs/04_model_based_features`` tags its artifact through
-    ``generate_cv_splits``. The two meanings of "fold 0" then meet in a join.
+    tell which path produced its list, so a stored fold set that still runs newest
+    first hands fold id 0 to the latest window while everything built through the
+    generated path now hands it to the earliest, and the two meanings meet in a
+    join. Two committed configs carry precomputed splits, and this named them the
+    wrong way round until 2026-09-07. Both now run oldest first and both agree with
+    what their case study has registered:
+    ``us_firm_characteristics/config/cv_config.json`` was renumbered by #791, which
+    re-ran the case study rather than migrating its rows.
+    ``fx_pairs/config/cv_config.json`` ran newest first, fold 0 validating from
+    2023-01-03 down to fold 7 at 2016-01-05, and was refused here until #1073
+    renumbered it. That one cost no re-run: its 148 registered training specs were
+    already written by 0.1.4's generator and carry ascending ids, so the committed
+    file was a stale record rather than an input - no notebook reads it, because
+    ``generate_cv_splits`` takes the precomputed path only for a caller that passes
+    ``cv_config=`` explicitly. ``us_equities_panel``'s config carries no ``splits``
+    list at all and goes through the generated path, so it is not in question.
+
+    ``tests/test_cv_splits.py`` asserts that state directly on the committed files,
+    so it is executable rather than a comment that can go stale the way this one
+    did.
     """
     val_starts = [_split_value(s, "val_start", "test_start") for s in splits]
-    if any(later >= earlier for earlier, later in zip(val_starts, val_starts[1:], strict=False)):
+    if any(later <= earlier for earlier, later in zip(val_starts, val_starts[1:], strict=False)):
         raise RuntimeError(
-            f"{source} produced folds that are not ordered newest first: "
-            f"val_starts {[str(v) for v in val_starts]}. Fold 0 is read as the most "
-            "recent fold everywhere, and stage-04 artifacts carry these ids, so an "
-            "ascending set joins each fold against the wrong end of the sample. "
+            f"{source} produced folds that are not ordered oldest first: "
+            f"val_starts {[str(v) for v in val_starts]}. Fold 0 is read as the "
+            "earliest fold everywhere, and stage-04 artifacts carry these ids, so a "
+            "descending set joins each fold against the wrong end of the sample. "
             "Renumber the source rather than reversing it at the call site."
         )
-    # The ids, not just the order. Reversing an ascending list leaves fold 0 on the
-    # oldest window while the list reads newest first, and every join is by id.
+    # The ids, not just the order. Reversing a descending list leaves fold 0 on the
+    # newest window while the list reads oldest first, and every join is by id.
     ids = [s["fold"] for s in splits]
     if ids != list(range(len(splits))):
         raise RuntimeError(
             f"{source} produced fold ids {ids} against list positions "
-            f"{list(range(len(splits)))}. The list runs newest first, so fold 0 is "
-            "the most recent fold and the ids have to follow the positions - a "
+            f"{list(range(len(splits)))}. The list runs oldest first, so fold 0 is "
+            "the earliest fold and the ids have to follow the positions - a "
             "downstream artifact is joined on the id, never on the position."
         )
 
@@ -476,9 +527,57 @@ def earliest_train_start(splits: Sequence[dict[str, Any]]) -> pd.Timestamp:
 
     A holdout retrain trains on the whole history before the holdout boundary,
     which is ``min(train_start)`` over the fold set and never one fold's own
-    start. Folds run newest first, so ``splits[0]["train_start"]`` is the latest
-    start in the set and hands the retrain the shortest window it could have had.
+    start. Reading a single fold's ``train_start`` hands the retrain a shorter
+    window than it should have, whichever end of the list that fold sits at.
     """
     if not splits:
         raise ValueError("No splits to choose from")
     return min(pd.Timestamp(s["train_start"]) for s in splits)
+
+
+def select_folds(
+    splits: Sequence[dict[str, Any]],
+    fold_ids: Iterable[int],
+) -> list[dict[str, Any]]:
+    """The folds carrying *fold_ids*, in the order they appear in *splits*.
+
+    A reduction has to say **which** folds it keeps. A count off one end of an
+    ordered list does not: ``splits[:2]`` kept the two most recent folds before
+    ml4t-diagnostic 0.1.4 and keeps the two earliest after it, and neither reading
+    is written down anywhere, so the same code silently became a different
+    experiment. Three case studies reduced their fold set that way (#1076).
+
+    Naming the ids is also what makes the reduction checkable against the windows:
+    a reader can hold ``[0, 1]`` against the fold table, and cannot hold ``[:2]``
+    against anything without knowing which release produced the list.
+
+    This is the same contract the model families already apply to the ``folds``
+    key of a preview reduction (``case_studies/utils/linear.py`` and
+    ``case_studies/utils/gbm.py`` both filter by id and refuse an id the fold set
+    does not carry). ``MAX_FOLDS = n`` is the count form of it, and
+    ``tests/pm_helpers.py::PREVIEW_TRANSLATED_PARAMETERS`` is where the harness
+    turns that count into ids for every notebook that takes ``PREVIEW_REDUCTIONS``:
+    ``list(range(n))``, the earliest n. A notebook that reads ``MAX_FOLDS``
+    directly passes ``range(MAX_FOLDS)`` here and means the same thing by it.
+
+    Raises
+    ------
+    ValueError
+        If *fold_ids* is empty, or names an id the fold set does not carry. A
+        reduction that silently keeps fewer folds than it asked for reports under
+        the same name as one that got what it asked for.
+    """
+    requested = [int(fold_id) for fold_id in fold_ids]
+    if not requested:
+        raise ValueError("select_folds was given no fold ids; a reduction has to keep some fold")
+    available = {int(_split_value(s, "fold")): s for s in splits}
+    missing = sorted(set(requested) - set(available))
+    if missing:
+        raise ValueError(
+            f"fold reduction names {missing}, which the fold set does not carry - "
+            f"it has {sorted(available)}. Reduce to ids that exist rather than to a "
+            "count, so a set with fewer folds than expected fails here instead of "
+            "reporting a smaller experiment under the same name."
+        )
+    wanted = set(requested)
+    return [s for s in splits if int(_split_value(s, "fold")) in wanted]

@@ -54,6 +54,13 @@ on:
         description: "pytest -k filter (e.g. 'us_equities_panel or nasdaq100' to run only those)"
         type: string
         default: ""
+      # The candidate path is exercised only by a commit that moves the resolve, so
+      # without this there is no way to run it deliberately - including to prove it
+      # works before a lock bump depends on it.
+      force_image_candidate:
+        description: "Build the ml4t image from this commit and measure test-unit-image in it"
+        type: boolean
+        default: false
 
 env:
   ML4T_DATA_PATH: ${{ github.workspace }}/test-data/data
@@ -76,6 +83,10 @@ jobs:
       run_py312: ${{ steps.build.outputs.run_py312 }}
       run_neo4j: ${{ steps.build.outputs.run_neo4j }}
       run_benchmark: ${{ steps.build.outputs.run_benchmark }}
+      # Whether this change moves what `ml4t/ml4t:latest` would install. Read
+      # straight off the filter rather than through `build`, because it gates a
+      # job rather than shaping a matrix.
+      image_inputs: ${{ steps.filter.outputs.image-inputs }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v4
@@ -123,6 +134,16 @@ jobs:
             # matrix; it gets its own filter, wired into run_py312 below.
             docker-notebooks:
               - 'tests/test_docker_notebooks.py'
+            # The resolve `envs/ml4t/Dockerfile` performs. When one of these moves,
+            # `ml4t/ml4t:latest` is by definition not the environment this commit
+            # declares, so test-unit-image builds a candidate from the commit
+            # instead of measuring in a published image that predates it. Keep in
+            # step with the `ml4t` filter in docker-publish.yml; a test asserts both
+            # cover what the Dockerfile reads.
+            image-inputs:
+              - 'uv.lock'
+              - 'pyproject.toml'
+              - 'envs/ml4t/Dockerfile'
             ch01:
               - '01_process_is_edge/**'
             ch02-03:
@@ -406,6 +427,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # notebook_provenance.py --since diffs against the base or the previous
+          # tip, and neither is in a shallow clone.
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v6
         with:
           version: "latest"
@@ -420,7 +445,22 @@ jobs:
         # stays a ~1-minute gate.
         run: |
           uv venv --python 3.14
-          uv pip install jupytext==1.19.3 pytest nbformat
+          # Pin every one of these to uv.lock. The list is a set of NAMES, and
+          # letting uv resolve their versions freely makes an external release
+          # decide what a required check measures. ml4t-diagnostic 0.1.4 shipped on
+          # 2026-09-05 with WalkForwardCV returning folds oldest-first;
+          # `"ml4t-diagnostic>=0.1.2"` picked it up on the next run and turned
+          # test-unit red on `main` and on every branch cut from it, with no commit
+          # in the repository having changed. The lock said 0.1.2 the whole time.
+          #
+          # Same derivation as envs/ml4t/Dockerfile: export the lock as a
+          # fully-pinned requirements file and hand it to uv as a constraint, so
+          # this stays a fast minimal venv and still cannot drift off what the
+          # repository declares.
+          uv export --frozen --extra live --extra dev --no-emit-project --no-hashes \
+            --format requirements-txt \
+            | grep -iE '^[a-z0-9._-]+==' > /tmp/locked-constraints.txt
+          uv pip install --constraint /tmp/locked-constraints.txt jupytext pytest nbformat
       - name: Notebook pairs open in JupyterLab (#372 regression gate)
         run: |
           source .venv/bin/activate
@@ -437,6 +477,40 @@ jobs:
         run: |
           source .venv/bin/activate
           python -m pytest tests/test_notebook_output_hygiene.py -q
+      # A committed .ipynb must be its CURRENT .py, executed for real. The gate
+      # existed only as a pre-commit hook, so it fired on every local commit and
+      # on nothing that publishes - a stale render reaches a reader through a
+      # merge, and no merge was covered. Here it covers what this change touched:
+      # a notebook it edited, or one whose paired .py it edited. Scoped, so one
+      # stale notebook elsewhere is somebody else's and does not block this PR.
+      #
+      # It runs on push to main as well as on the PR. Branch protection means
+      # everything should arrive via a PR, but this workflow's own history is that
+      # exports used to land on main as pushes and nothing CI ran had seen them -
+      # a gate that only fires on the path we believe is the only path is how that
+      # happened. On a push the base is the previous tip, so the scope is exactly
+      # what the push introduced.
+      - name: Notebooks this change touched were executed from their current .py
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        run: |
+          source .venv/bin/activate
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # What does this branch add on top of the base: merge-base diff.
+            python .github/scripts/notebook_provenance.py check \
+              --since "origin/${{ github.base_ref }}"
+            exit $?
+          fi
+          # What does the published tree become: diff the previous tip directly,
+          # so a force-push that reverts a notebook relative to it is still seen.
+          base="${{ github.event.before }}"
+          if [[ "$base" =~ ^0+$ ]] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            # First push, or a force-push that dropped the old tip. There is no
+            # honest scope, so check everything rather than guess a narrower one.
+            echo "previous tip unavailable ($base) - checking every notebook"
+            python .github/scripts/notebook_provenance.py check
+            exit $?
+          fi
+          python .github/scripts/notebook_provenance.py check --since "$base" --no-merge-base
 
   # ---------------------------------------------------------------------------
   # Fast native unit tests — download-script logic (no Docker, no network,
@@ -495,6 +569,11 @@ jobs:
         # against a restatement of its rules - and without the package the helper has no one to
         # ask, so the corpus sweep would pass while checking nothing. Pinned to the version in
         # `uv.lock`, as jupytext above is.
+        # nest-asyncio is a core project dependency and the import surface of
+        # `25_live_trading/async_utils.py`, whose run_async is what
+        # tests/test_async_utils.py exercises. It is pure Python and a few KB, so
+        # it does not compromise the fast-gate intent of this list.
+        #
         # pyarrow is what polars converts through in `DataFrame.to_pandas`, which
         # `load_modeling_dataset` calls on the fold-tagged temporal artifact. The
         # variant-geometry guard hangs off exactly that frame, so without pyarrow
@@ -503,9 +582,25 @@ jobs:
         # inspection: the helper-level tests never reach the conversion and passed.
         run: |
           uv venv --python 3.14
-          uv pip install pytest pytest-timeout numpy pandas polars pyyaml python-dotenv plotly gymnasium requests \
-            scipy statsmodels scikit-learn matplotlib hmmlearn pyarrow \
-            "ml4t-diagnostic>=0.1.2" jupytext==1.19.3 papermill==2.7.0 ml4t-backtest ml4t-data ml4t-engineer databento
+          # Pin every one of these to uv.lock. The list is a set of NAMES, and
+          # letting uv resolve their versions freely makes an external release
+          # decide what a required check measures. ml4t-diagnostic 0.1.4 shipped on
+          # 2026-09-05 with WalkForwardCV returning folds oldest-first;
+          # `"ml4t-diagnostic>=0.1.2"` picked it up on the next run and turned
+          # test-unit red on `main` and on every branch cut from it, with no commit
+          # in the repository having changed. The lock said 0.1.2 the whole time.
+          #
+          # Same derivation as envs/ml4t/Dockerfile: export the lock as a
+          # fully-pinned requirements file and hand it to uv as a constraint, so
+          # this stays a fast minimal venv and still cannot drift off what the
+          # repository declares.
+          uv export --frozen --extra live --extra dev --no-emit-project --no-hashes \
+            --format requirements-txt \
+            | grep -iE '^[a-z0-9._-]+==' > /tmp/locked-constraints.txt
+          uv pip install --constraint /tmp/locked-constraints.txt \
+            pytest pytest-timeout numpy pandas polars pyyaml python-dotenv plotly gymnasium requests \
+            scipy statsmodels scikit-learn matplotlib hmmlearn pyarrow nest-asyncio \
+            ml4t-diagnostic jupytext papermill ml4t-backtest ml4t-data ml4t-engineer databento
       - name: Run download-logic unit tests
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -586,7 +681,10 @@ jobs:
         run: |
           .venv/bin/python -m pytest \
             tests/test_pm_helpers.py \
+            tests/test_fork_pull_request_gating.py \
+            tests/test_env_matches_lock.py \
             tests/test_create_test_data.py \
+            tests/test_generate_intermediates.py \
             tests/test_sample_registry_for_tests.py \
             tests/test_toolchain_pins.py \
             tests/test_conformal_embargo_coverage.py \
@@ -849,9 +947,30 @@ jobs:
         if: steps.reach.outputs.have_key
         run: |
           uv venv --python 3.14
-          uv pip install pytest numpy pandas polars pyyaml python-dotenv plotly gymnasium requests \
-            scipy statsmodels scikit-learn matplotlib hmmlearn pyarrow \
-            "ml4t-diagnostic>=0.1.2" jupytext==1.19.3
+          # ml4t-backtest joined with tests/test_backtest_presets.py:
+          # ensure_backtest_spec resolves the engine's own BacktestConfig
+          # (case_studies/utils/backtest_loaders.py:169 imports ml4t.backtest), and
+          # without the package four of its tests raise rather than skip. Measured in a
+          # venv holding exactly this list: 4 failed without it, 37 passed with it.
+          # Pin every one of these to uv.lock. The list is a set of NAMES, and
+          # letting uv resolve their versions freely makes an external release
+          # decide what a required check measures. ml4t-diagnostic 0.1.4 shipped on
+          # 2026-09-05 with WalkForwardCV returning folds oldest-first;
+          # `"ml4t-diagnostic>=0.1.2"` picked it up on the next run and turned
+          # test-unit red on `main` and on every branch cut from it, with no commit
+          # in the repository having changed. The lock said 0.1.2 the whole time.
+          #
+          # Same derivation as envs/ml4t/Dockerfile: export the lock as a
+          # fully-pinned requirements file and hand it to uv as a constraint, so
+          # this stays a fast minimal venv and still cannot drift off what the
+          # repository declares.
+          uv export --frozen --extra live --extra dev --no-emit-project --no-hashes \
+            --format requirements-txt \
+            | grep -iE '^[a-z0-9._-]+==' > /tmp/locked-constraints.txt
+          uv pip install --constraint /tmp/locked-constraints.txt \
+            pytest numpy pandas polars pyyaml python-dotenv plotly gymnasium requests \
+            scipy statsmodels scikit-learn matplotlib hmmlearn pyarrow ml4t-backtest \
+            ml4t-diagnostic jupytext
       # The precondition is the load-bearing half, the same shape as the
       # data-root anchoring step above. Every test in this job skips politely
       # when the data is absent, so a checkout that silently produced an empty
@@ -893,9 +1012,33 @@ jobs:
           # CI job, which is a real gap and is stated in that file's docstring.
           # The other three tests in the same file assert relations that hold on any
           # extract - they collect as six cases - and are what this job gates.
+          # The two deselects below are not quarantine entries: the quarantine file
+          # describes what test-unit does not run, and both of these are inside a
+          # file this job DOES run. They need the stage 01-05 artifacts of
+          # us_equities_panel and nasdaq100_microstructure, the two case studies
+          # whose rebuild has not produced them, so they fail on any checkout -
+          # here and on a workstation alike. Take them out when those two rebuild.
+          #
+          # The artifact dependency was true and was not the whole reason. Until
+          # 2026-09-06 the microstructure test also asserted `label_buffer ==
+          # "15min"` against a config that has declared 16min since #737, and that
+          # assertion reads the repo config and no data, so it failed two lines
+          # before the artifacts were ever touched. The rebuild alone would not have
+          # made the test pass, and whoever lifted this deselect afterwards would
+          # have read the red as the rebuild being wrong. The literal is corrected,
+          # so this deselect now blocks only on the artifacts, which is what it says.
           .venv/bin/python -m pytest \
             tests/test_eoa_universe_roster.py \
             tests/test_fixture_registry_identity.py \
+            tests/test_reduced_universe_is_shared.py \
+            tests/test_fixture_manifest_matches_builders.py \
+            tests/test_artifact_specs.py \
+            tests/test_backtest_presets.py \
+            tests/test_etf_baseline_parity.py \
+            tests/test_sp500_options_research.py::test_official_population_is_snapshotted_before_option_execution \
+            tests/test_us_firm_research_workflow.py::test_open_study_writes_canonical_results_to_output_dir \
+            --deselect tests/test_artifact_specs.py::test_us_equities_pilot_helpers_preserve_current_outputs \
+            --deselect tests/test_artifact_specs.py::test_microstructure_pilot_helpers_preserve_current_outputs \
             -m "not production_extract" \
             -v --tb=short -rs --junitxml=unit-data.xml
       # A skip here is a failure: these tests run in this job and nowhere else,
@@ -939,35 +1082,138 @@ jobs:
   # tmp_path. Measured with ML4T_DATA_PATH at the repo's own data/ directory,
   # which holds loaders and no market data.
   # ---------------------------------------------------------------------------
+  # A commit that moves the resolve gets its own image, because no published one
+  # can be the environment it declares.
+  #
+  # test-unit-image is required, and its first step refuses to measure anything in
+  # an image whose installed distributions do not match uv.lock. Against
+  # `ml4t/ml4t:latest` that made every lock-changing pull request unmergeable: the
+  # image can only be rebuilt from a lock that has landed, and the lock could not
+  # land without the check that needed the rebuild. #740 escaped it only because
+  # its branch predated the guard and so ran a workflow that did not have it, and
+  # the mismatch surfaced on main instead, where it blocked every open PR until
+  # someone dispatched a rebuild by hand.
+  #
+  # So on those commits the image under test is built here, from this tree, and
+  # `latest` stays out of it. It costs a CUDA build (~22 min, warm registry cache)
+  # on the ~18 commits in 60 days that touch these paths, and nothing at all on the
+  # rest.
+  build-image-candidate:
+    needs: changes
+    if: needs.changes.outputs.image_inputs == 'true' || github.event.inputs.force_image_candidate == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Free disk space (CUDA base + ML deps)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo docker image prune -af
+          df -h /
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      # Read-only: this never publishes. The tag is local to the tarball and the
+      # digest is whatever this tree builds, so nothing here can move `latest`.
+      - name: Build the image this commit declares
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: envs/ml4t/Dockerfile
+          platforms: linux/amd64
+          tags: ml4t/ml4t:candidate
+          outputs: type=docker,dest=/tmp/ml4t-candidate.tar
+          cache-from: type=registry,ref=ml4t/ml4t:buildcache-linux-amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ml4t-candidate-image
+          path: /tmp/ml4t-candidate.tar
+          if-no-files-found: error
+          retention-days: 1
+
   test-unit-image:
+    needs: [changes, build-image-candidate]
+    # Plain `always()`, and the candidate's result is handled in a step rather than
+    # here. A `!= 'failure'` in this condition would SKIP the job when the
+    # candidate build broke, and GitHub counts a skipped required check as
+    # satisfied - so a lock bump whose image would not build would have become
+    # mergeable without the image tests running at all. Skipping is the one
+    # outcome this job must never have.
+    if: always()
     runs-on: ubuntu-latest
     # The 26 files measured on 2026-08-24 ran in 3m21s; the list now contains 36.
     # --timeout=900 bounds a hung test but not a hung
     # import, collection or image pull, which would otherwise fall through to
     # GitHub's six-hour default.
     timeout-minutes: 30
-    container:
-      image: ml4t/ml4t:latest
     steps:
-      - name: Install git (for checkout inside container)
-        run: apt-get update && apt-get install -y git
+      # `needs` cannot fail this job, because the condition above is unconditional
+      # by design. This step is what turns a broken candidate into a red required
+      # check instead of a green one.
+      - name: The candidate image built
+        if: >-
+          needs.build-image-candidate.result == 'failure' ||
+          needs.build-image-candidate.result == 'cancelled'
+        run: |
+          echo "::error::build-image-candidate ${{ needs.build-image-candidate.result }}:"
+          echo "::error::this commit changes what the image installs, and no image was"
+          echo "::error::produced to measure it in. Measuring in ml4t/ml4t:latest would"
+          echo "::error::test the environment this commit replaces."
+          exit 1
       - uses: actions/checkout@v6
+      - name: Load the candidate image
+        if: needs.build-image-candidate.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: ml4t-candidate-image
+          path: /tmp
+      # Not a `container:` on the job, because that is resolved before any step
+      # runs and so cannot name an image this run produced. Running the same two
+      # commands through `docker run` is what lets one required job measure either
+      # image, which keeps the check name stable for branch protection.
+      - name: Which image this commit is measured in
+        id: image
+        run: |
+          if [ -f /tmp/ml4t-candidate.tar ]; then
+            docker load -i /tmp/ml4t-candidate.tar
+            ref=ml4t/ml4t:candidate
+            echo "::notice::measuring in an image built from this commit"
+          else
+            ref=ml4t/ml4t:latest
+            docker pull "$ref"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      # The image is built from uv.lock and drifts from it silently the moment the
+      # lock moves. It carried ml4t-models 0.1.0a4 for eleven days after the repo
+      # declared >=0.1.0a6, so public CI measured a dependency set the repository
+      # did not declare - and the notebook that failed on it read as a numerical
+      # problem, which cost four rounds of investigation aimed at the notebook.
+      #
+      # This is the check that would have caught it on the day the pin moved. It
+      # runs first because everything after it is only evidence about this commit
+      # if it passes: a green job in a drifted image is not evidence of green under
+      # the declared lock.
+      - name: The image's installed distributions match uv.lock
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$GITHUB_WORKSPACE" \
+            ${{ steps.image.outputs.ref }} \
+            python .github/scripts/check_env_matches_lock.py
       - name: Run modelling-environment unit tests
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-          ML4T_PATH: ${{ github.workspace }}
-          ML4T_DATA_PATH: ${{ github.workspace }}/data
-          MPLBACKEND: Agg
         run: |
           # utils.config requires a .env to exist and validates ML4T_DATA_PATH at
           # import, the same as test-unit's steps.
           printf 'ML4T_PATH=%s\nML4T_DATA_PATH=%s/data\n' \
             "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE" > .env
-          # Same reason as test-unit's sweep: the workflow-level ML4T_OUTPUT_DIR
-          # redirects every get_case_study_dir() call at a directory this job
-          # does not seed.
-          unset ML4T_OUTPUT_DIR
-          python -m pytest \
+          # ML4T_OUTPUT_DIR is deliberately not passed in: same reason as
+          # test-unit's sweep, the workflow-level value redirects every
+          # get_case_study_dir() call at a directory this job does not seed.
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$GITHUB_WORKSPACE" \
+            -e "PYTHONPATH=$GITHUB_WORKSPACE" \
+            -e "ML4T_PATH=$GITHUB_WORKSPACE" \
+            -e "ML4T_DATA_PATH=$GITHUB_WORKSPACE/data" \
+            -e MPLBACKEND=Agg \
+            ${{ steps.image.outputs.ref }} \
+            python -m pytest \
             tests/test_crypto_modeling_lineage.py \
             tests/test_common_sample_daily_ic.py \
             tests/test_cv_cached_results.py \
@@ -991,6 +1237,7 @@ jobs:
             tests/test_family_hook_dispatch.py \
             tests/test_model_analysis_selection.py \
             tests/test_model_source_identity_versions.py \
+            tests/test_prediction_sequence_cap.py \
             tests/test_registry_metrics.py \
             tests/test_research_contract_execution.py \
             tests/test_research_model_planning.py \
@@ -1000,11 +1247,18 @@ jobs:
             tests/test_sdf_macro_context.py \
             tests/test_sequence_dataset.py \
             tests/test_sequence_identity_roundtrip.py \
+            tests/test_sequence_holdout_rekey.py \
+            tests/test_smoke_configs.py \
             tests/test_tabular_dl.py \
             tests/test_tabular_dl_adapter.py \
             tests/test_holdout_expected_keys.py \
+            tests/test_holdout_force_regenerates.py \
+            tests/test_holdout_selection_is_single_sourced.py \
             tests/test_tabular_dl_identity.py \
             tests/test_tabular_dl_runtime.py \
+            tests/test_latent_convergence_guard.py \
+            tests/test_fold_seed_coupling.py \
+            tests/test_model_catalog_columns.py \
             tests/test_training_identity_migration.py \
             -q --tb=short --timeout=900 --timeout-method=thread -rf
 
@@ -1018,8 +1272,16 @@ jobs:
   test-chapters:
     name: ${{ matrix.name }}
     timeout-minutes: 60
-    needs: [lint, changes]
-    if: needs.changes.outputs.chapter_matrix != '[]'
+    needs: [lint, changes, build-image-candidate]
+    # `always()` is needed because build-image-candidate is skipped whenever the commit
+    # does not move what the image installs, and a skipped dependency skips its
+    # dependents. lint and changes are then checked explicitly, so this gate is exactly
+    # as strict as the `needs:` list it replaces.
+    if: >-
+      always()
+      && needs.lint.result == 'success'
+      && needs.changes.result == 'success'
+      && needs.changes.outputs.chapter_matrix != '[]'
 
     strategy:
       fail-fast: false
@@ -1027,16 +1289,40 @@ jobs:
         include: ${{ fromJSON(needs.changes.outputs.chapter_matrix) }}
 
     runs-on: ubuntu-latest
-    container:
-      image: ml4t/ml4t:latest
 
     steps:
-      - name: Install git (for checkout inside container)
-        run: apt-get update -qq && apt-get install -y -qq git git-lfs openssh-client >/dev/null
-
+      # secrets.TEST_DATA_DEPLOY_KEY is not exposed to a pull_request from a fork,
+      # so the "Checkout test data" step below cannot succeed there: actions/checkout
+      # falls back to the default token, which cannot see a private repository, and
+      # the job fails at a step that has nothing to do with the contribution. On #595,
+      # a two-line packaging fix from an outside contributor, that was 26 red checks -
+      # ch01 through ch26, all eight cs-* jobs and test-py312 - none of them the
+      # contributor's.
+      #
+      # Deciding once whether the run can reach the data, and gating the
+      # data-dependent steps on that, is the same shape as the fix #613 landed for
+      # test-unit-data. It is a step-level gate rather than a job-level `if:` for the
+      # reason recorded there: a job-level `if:` that evaluates false creates no check
+      # run at all, which is unsatisfiable when the context is required.
+      #
+      # What this does not fix, and is said out loud in the notice: a fork pull request
+      # is then green having exercised none of these notebooks. That is the honest
+      # state - it is what happens today, dressed as failure rather than as a skip -
+      # and the merge decision has to account for it.
+      - name: Can this run reach the test data?
+        id: reach
+        run: |
+          if [ -n "${{ secrets.TEST_DATA_DEPLOY_KEY }}" ]; then
+            echo "have_key=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_key=" >> "$GITHUB_OUTPUT"
+            echo "::notice::No test-data deploy key in this context, which is a fork pull request. This job checked out no test data and executed no notebook, so it asserts nothing about this change; the notebooks run on the branch once it is merged."
+          fi
       - uses: actions/checkout@v6
+        if: steps.reach.outputs.have_key
 
       - name: Checkout test data
+        if: steps.reach.outputs.have_key
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
@@ -1044,7 +1330,32 @@ jobs:
           ssh-key: ${{ secrets.TEST_DATA_DEPLOY_KEY }}
           lfs: false
 
+      - name: Resolve the image this commit declares
+        id: image
+        if: steps.reach.outputs.have_key
+        uses: ./.github/actions/resolve-ml4t-image
+        with:
+          candidate-result: ${{ needs.build-image-candidate.result }}
+
+      # This job used to execute notebooks in whatever `ml4t/ml4t:latest` happened to
+      # hold, because a job-level `container:` is resolved before any step runs and so
+      # could not name an image this run produced. A commit that moved uv.lock was then
+      # measured in the environment it replaced: on #787, which moved ml4t-diagnostic to
+      # 0.1.4, that surfaced as thirteen fold-ordering errors inside cme_futures and a
+      # red ch26, none of which names the environment as the cause.
+      #
+      # The image is a step-level choice now, so a lock bump is measured in the image
+      # built from the same commit and this check is a guard against drift rather than a
+      # standing report of it.
+      - name: The image's installed distributions match uv.lock
+        if: steps.reach.outputs.have_key
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$GITHUB_WORKSPACE" \
+            "${{ steps.image.outputs.ref }}" \
+            python .github/scripts/check_env_matches_lock.py
       - name: Seed case study intermediates
+        if: steps.reach.outputs.have_key
         run: |
           mkdir -p $ML4T_OUTPUT_DIR
           if [ -d test-data/intermediates ]; then
@@ -1067,6 +1378,7 @@ jobs:
           fi
 
       - name: Run chapter notebooks (${{ matrix.name }})
+        if: steps.reach.outputs.have_key
         env:
           PYTHONPATH: ${{ github.workspace }}
           TEST_FILTER_INPUT: ${{ github.event.inputs.test_filter }}
@@ -1074,9 +1386,18 @@ jobs:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
           FILTER="${TEST_FILTER_INPUT:-$MATRIX_FILTER}"
-          python -m pytest tests/test_chapter_notebooks.py \
-            -v --tb=short \
-            -k "$FILTER"
+          mkdir -p "$ML4T_OUTPUT_DIR"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            -v "$ML4T_OUTPUT_DIR:$ML4T_OUTPUT_DIR" \
+            -w "$GITHUB_WORKSPACE" \
+            -e PYTHONPATH -e ML4T_DATA_PATH -e ML4T_OUTPUT_DIR \
+            -e MPLBACKEND -e PLOTLY_RENDERER \
+            -e FRED_API_KEY \
+            "${{ steps.image.outputs.ref }}" \
+            python -m pytest tests/test_chapter_notebooks.py \
+              -v --tb=short \
+              -k "$FILTER"
 
   # ---------------------------------------------------------------------------
   # Case study pipeline tests — inside Docker (ml4t/ml4t:latest)
@@ -1084,8 +1405,16 @@ jobs:
   test-case-studies:
     name: cs-${{ matrix.case-study }}
     timeout-minutes: 90
-    needs: [lint, changes]
-    if: needs.changes.outputs.case_matrix != '[]'
+    needs: [lint, changes, build-image-candidate]
+    # `always()` is needed because build-image-candidate is skipped whenever the commit
+    # does not move what the image installs, and a skipped dependency skips its
+    # dependents. lint and changes are then checked explicitly, so this gate is exactly
+    # as strict as the `needs:` list it replaces.
+    if: >-
+      always()
+      && needs.lint.result == 'success'
+      && needs.changes.result == 'success'
+      && needs.changes.outputs.case_matrix != '[]'
 
     strategy:
       fail-fast: false
@@ -1093,16 +1422,40 @@ jobs:
         include: ${{ fromJSON(needs.changes.outputs.case_matrix) }}
 
     runs-on: ubuntu-latest
-    container:
-      image: ml4t/ml4t:latest
 
     steps:
-      - name: Install git
-        run: apt-get update -qq && apt-get install -y -qq git git-lfs openssh-client >/dev/null
-
+      # secrets.TEST_DATA_DEPLOY_KEY is not exposed to a pull_request from a fork,
+      # so the "Checkout test data" step below cannot succeed there: actions/checkout
+      # falls back to the default token, which cannot see a private repository, and
+      # the job fails at a step that has nothing to do with the contribution. On #595,
+      # a two-line packaging fix from an outside contributor, that was 26 red checks -
+      # ch01 through ch26, all eight cs-* jobs and test-py312 - none of them the
+      # contributor's.
+      #
+      # Deciding once whether the run can reach the data, and gating the
+      # data-dependent steps on that, is the same shape as the fix #613 landed for
+      # test-unit-data. It is a step-level gate rather than a job-level `if:` for the
+      # reason recorded there: a job-level `if:` that evaluates false creates no check
+      # run at all, which is unsatisfiable when the context is required.
+      #
+      # What this does not fix, and is said out loud in the notice: a fork pull request
+      # is then green having exercised none of these notebooks. That is the honest
+      # state - it is what happens today, dressed as failure rather than as a skip -
+      # and the merge decision has to account for it.
+      - name: Can this run reach the test data?
+        id: reach
+        run: |
+          if [ -n "${{ secrets.TEST_DATA_DEPLOY_KEY }}" ]; then
+            echo "have_key=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_key=" >> "$GITHUB_OUTPUT"
+            echo "::notice::No test-data deploy key in this context, which is a fork pull request. This job checked out no test data and executed no notebook, so it asserts nothing about this change; the notebooks run on the branch once it is merged."
+          fi
       - uses: actions/checkout@v6
+        if: steps.reach.outputs.have_key
 
       - name: Checkout test data
+        if: steps.reach.outputs.have_key
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
@@ -1110,7 +1463,32 @@ jobs:
           ssh-key: ${{ secrets.TEST_DATA_DEPLOY_KEY }}
           lfs: false
 
+      - name: Resolve the image this commit declares
+        id: image
+        if: steps.reach.outputs.have_key
+        uses: ./.github/actions/resolve-ml4t-image
+        with:
+          candidate-result: ${{ needs.build-image-candidate.result }}
+
+      # This job used to execute notebooks in whatever `ml4t/ml4t:latest` happened to
+      # hold, because a job-level `container:` is resolved before any step runs and so
+      # could not name an image this run produced. A commit that moved uv.lock was then
+      # measured in the environment it replaced: on #787, which moved ml4t-diagnostic to
+      # 0.1.4, that surfaced as thirteen fold-ordering errors inside cme_futures and a
+      # red ch26, none of which names the environment as the cause.
+      #
+      # The image is a step-level choice now, so a lock bump is measured in the image
+      # built from the same commit and this check is a guard against drift rather than a
+      # standing report of it.
+      - name: The image's installed distributions match uv.lock
+        if: steps.reach.outputs.have_key
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$GITHUB_WORKSPACE" \
+            "${{ steps.image.outputs.ref }}" \
+            python .github/scripts/check_env_matches_lock.py
       - name: Seed case study intermediates
+        if: steps.reach.outputs.have_key
         run: |
           mkdir -p $ML4T_OUTPUT_DIR
           if [ -d test-data/intermediates ]; then
@@ -1118,14 +1496,8 @@ jobs:
             echo "Seeded $(du -sh $ML4T_OUTPUT_DIR | cut -f1) of intermediates"
           fi
 
-      # ml4t/ml4t:latest only bakes in pytest + pytest-timeout (envs/ml4t/Dockerfile);
-      # pytest-rerunfailures lives in the dev extra, which this image doesn't install.
-      # Without it, overrides.yaml's `reruns:` key (tests/conftest.py) silently adds no
-      # retry marker, so a notebook marked flaky just fails outright here.
-      - name: Install pytest-rerunfailures
-        run: pip install --no-cache-dir "pytest-rerunfailures>=15.0"
-
       - name: Run pipeline (${{ matrix.case-study }})
+        if: steps.reach.outputs.have_key
         env:
           PYTHONPATH: ${{ github.workspace }}
           TEST_FILTER_INPUT: ${{ github.event.inputs.test_filter }}
@@ -1133,9 +1505,26 @@ jobs:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
           FILTER="${TEST_FILTER_INPUT:-$MATRIX_CASE_STUDY}"
-          python -m pytest tests/test_case_studies.py \
-            -v --tb=short \
-            -k "$FILTER"
+          mkdir -p "$ML4T_OUTPUT_DIR"
+          # The image bakes in pytest + pytest-timeout only (envs/ml4t/Dockerfile);
+          # pytest-rerunfailures lives in the dev extra it does not install. Without it
+          # overrides.yaml's `reruns:` key (tests/conftest.py) adds no retry marker and a
+          # notebook marked flaky fails outright. It is installed inside the run
+          # container rather than in a step of its own, because a step now runs on the
+          # runner and would install it where the notebooks do not execute.
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            -v "$ML4T_OUTPUT_DIR:$ML4T_OUTPUT_DIR" \
+            -w "$GITHUB_WORKSPACE" \
+            -e PYTHONPATH -e ML4T_DATA_PATH -e ML4T_OUTPUT_DIR \
+            -e MPLBACKEND -e PLOTLY_RENDERER \
+            -e FRED_API_KEY -e "FILTER=$FILTER" \
+            "${{ steps.image.outputs.ref }}" \
+            bash -c '
+              set -e
+              pip install --no-cache-dir "pytest-rerunfailures>=15.0"
+              python -m pytest tests/test_case_studies.py -v --tb=short -k "$FILTER"
+            '
 
   # ---------------------------------------------------------------------------
   # Py312 Docker image (Python 3.12: gensim, signatory, esig, tfcausalimpact,
@@ -1151,12 +1540,50 @@ jobs:
       image: ml4t/ml4t-py312:latest
 
     steps:
+      # secrets.TEST_DATA_DEPLOY_KEY is not exposed to a pull_request from a fork,
+      # so the "Checkout test data" step below cannot succeed there: actions/checkout
+      # falls back to the default token, which cannot see a private repository, and
+      # the job fails at a step that has nothing to do with the contribution. On #595,
+      # a two-line packaging fix from an outside contributor, that was 26 red checks -
+      # ch01 through ch26, all eight cs-* jobs and test-py312 - none of them the
+      # contributor's.
+      #
+      # Deciding once whether the run can reach the data, and gating the
+      # data-dependent steps on that, is the same shape as the fix #613 landed for
+      # test-unit-data. It is a step-level gate rather than a job-level `if:` for the
+      # reason recorded there: a job-level `if:` that evaluates false creates no check
+      # run at all, which is unsatisfiable when the context is required.
+      #
+      # What this does not fix, and is said out loud in the notice: a fork pull request
+      # is then green having exercised none of these notebooks. That is the honest
+      # state - it is what happens today, dressed as failure rather than as a skip -
+      # and the merge decision has to account for it.
+      - name: Can this run reach the test data?
+        id: reach
+        run: |
+          if [ -n "${{ secrets.TEST_DATA_DEPLOY_KEY }}" ]; then
+            echo "have_key=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_key=" >> "$GITHUB_OUTPUT"
+            echo "::notice::No test-data deploy key in this context, which is a fork pull request. This job checked out no test data and executed no notebook, so it asserts nothing about this change; the notebooks run on the branch once it is merged."
+          fi
       - name: Install git
-        run: apt-get update -qq && apt-get install -y -qq git git-lfs openssh-client >/dev/null
+        if: steps.reach.outputs.have_key
+        run: |
+          # A transient apt mirror failure used to kill the whole job.
+          for attempt in 1 2 3; do
+            apt-get update -qq && apt-get install -y -qq git git-lfs openssh-client >/dev/null && exit 0
+            echo "apt-get failed (attempt $attempt of 3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "::error::apt-get could not install git after three attempts"
+          exit 1
 
       - uses: actions/checkout@v6
+        if: steps.reach.outputs.have_key
 
       - name: Checkout test data
+        if: steps.reach.outputs.have_key
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
@@ -1165,6 +1592,7 @@ jobs:
           lfs: false
 
       - name: Run py312 notebooks
+        if: steps.reach.outputs.have_key
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
@@ -1181,16 +1609,27 @@ jobs:
   # ---------------------------------------------------------------------------
   test-neo4j:
     timeout-minutes: 30
-    needs: [lint, changes]
-    if: needs.changes.outputs.run_neo4j == 'true'
+    needs: [lint, changes, build-image-candidate]
+    # `always()` is needed because build-image-candidate is skipped whenever the commit
+    # does not move what the image installs, and a skipped dependency skips its
+    # dependents. lint and changes are then checked explicitly, so this gate is exactly
+    # as strict as the `needs:` list it replaces.
+    if: >-
+      always()
+      && needs.lint.result == 'success'
+      && needs.changes.result == 'success'
+      && needs.changes.outputs.run_neo4j == 'true'
 
     runs-on: ubuntu-latest
-    container:
-      image: ml4t/ml4t:latest
-      env:
-        NEO4J_URI: bolt://neo4j:7687
-        NEO4J_USER: neo4j
-        NEO4J_PASSWORD: password
+
+    # `bolt://neo4j:7687` resolved only because the job container shared GitHub's
+    # per-job network with the service. The notebooks now run under `docker run
+    # --network host`, so they reach the service on the port it publishes to the
+    # runner and the name the service is registered under stops mattering.
+    env:
+      NEO4J_URI: bolt://localhost:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: password
 
     services:
       neo4j:
@@ -1207,12 +1646,38 @@ jobs:
           --health-retries 10
 
     steps:
-      - name: Install git
-        run: apt-get update -qq && apt-get install -y -qq git git-lfs openssh-client >/dev/null
-
+      # secrets.TEST_DATA_DEPLOY_KEY is not exposed to a pull_request from a fork,
+      # so the "Checkout test data" step below cannot succeed there: actions/checkout
+      # falls back to the default token, which cannot see a private repository, and
+      # the job fails at a step that has nothing to do with the contribution. On #595,
+      # a two-line packaging fix from an outside contributor, that was 26 red checks -
+      # ch01 through ch26, all eight cs-* jobs and test-py312 - none of them the
+      # contributor's.
+      #
+      # Deciding once whether the run can reach the data, and gating the
+      # data-dependent steps on that, is the same shape as the fix #613 landed for
+      # test-unit-data. It is a step-level gate rather than a job-level `if:` for the
+      # reason recorded there: a job-level `if:` that evaluates false creates no check
+      # run at all, which is unsatisfiable when the context is required.
+      #
+      # What this does not fix, and is said out loud in the notice: a fork pull request
+      # is then green having exercised none of these notebooks. That is the honest
+      # state - it is what happens today, dressed as failure rather than as a skip -
+      # and the merge decision has to account for it.
+      - name: Can this run reach the test data?
+        id: reach
+        run: |
+          if [ -n "${{ secrets.TEST_DATA_DEPLOY_KEY }}" ]; then
+            echo "have_key=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_key=" >> "$GITHUB_OUTPUT"
+            echo "::notice::No test-data deploy key in this context, which is a fork pull request. This job checked out no test data and executed no notebook, so it asserts nothing about this change; the notebooks run on the branch once it is merged."
+          fi
       - uses: actions/checkout@v6
+        if: steps.reach.outputs.have_key
 
       - name: Checkout test data
+        if: steps.reach.outputs.have_key
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
@@ -1220,18 +1685,49 @@ jobs:
           ssh-key: ${{ secrets.TEST_DATA_DEPLOY_KEY }}
           lfs: false
 
+      - name: Resolve the image this commit declares
+        id: image
+        if: steps.reach.outputs.have_key
+        uses: ./.github/actions/resolve-ml4t-image
+        with:
+          candidate-result: ${{ needs.build-image-candidate.result }}
+
+      # Same as the two notebook jobs above: the image is a step-level choice, so a
+      # commit that moves uv.lock is measured in the image built from that commit.
+      - name: The image's installed distributions match uv.lock
+        if: steps.reach.outputs.have_key
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$GITHUB_WORKSPACE" \
+            "${{ steps.image.outputs.ref }}" \
+            python .github/scripts/check_env_matches_lock.py
       - name: Run Ch23 Knowledge Graph notebooks (pipeline order)
+        if: steps.reach.outputs.have_key
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          # Run in dependency order: upstream notebooks generate data for downstream
-          python -m pytest tests/test_docker_notebooks.py -v --tb=short \
-            -k "08_8k_event_extraction" && \
-          python -m pytest tests/test_docker_notebooks.py -v --tb=short \
-            -k "02_supply_chain_kg_construction" && \
-          python -m pytest tests/test_docker_notebooks.py -v --tb=short \
-            -k "07_dynamic_kg_temporal or 03_graph_rag_qa or 05_institutional_holdings_kg \
-                or 09_knowledge_graph_features"
+          mkdir -p "$ML4T_OUTPUT_DIR"
+          # --network host so the notebooks reach the neo4j service on the port it
+          # publishes to the runner. The job no longer shares GitHub's per-job network,
+          # which is what `bolt://neo4j:7687` depended on.
+          docker run --rm --network host \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            -v "$ML4T_OUTPUT_DIR:$ML4T_OUTPUT_DIR" \
+            -w "$GITHUB_WORKSPACE" \
+            -e PYTHONPATH -e ML4T_DATA_PATH -e ML4T_OUTPUT_DIR \
+            -e MPLBACKEND -e PLOTLY_RENDERER \
+            -e NEO4J_URI -e NEO4J_USER -e NEO4J_PASSWORD \
+            "${{ steps.image.outputs.ref }}" \
+            bash -c '
+              # Dependency order: upstream notebooks generate data for downstream ones.
+              python -m pytest tests/test_docker_notebooks.py -v --tb=short \
+                -k "08_8k_event_extraction" && \
+              python -m pytest tests/test_docker_notebooks.py -v --tb=short \
+                -k "02_supply_chain_kg_construction" && \
+              python -m pytest tests/test_docker_notebooks.py -v --tb=short \
+                -k "07_dynamic_kg_temporal or 03_graph_rag_qa or 05_institutional_holdings_kg \
+                    or 09_knowledge_graph_features"
+            '
 
   # ---------------------------------------------------------------------------
   # Benchmark Docker image (Ch02 storage benchmarks + database services)
@@ -1309,13 +1805,50 @@ jobs:
           --health-retries 5
 
     steps:
-      - name: Install git
+      # secrets.TEST_DATA_DEPLOY_KEY is not exposed to a pull_request from a fork,
+      # so the "Checkout test data" step below cannot succeed there: actions/checkout
+      # falls back to the default token, which cannot see a private repository, and
+      # the job fails at a step that has nothing to do with the contribution. On #595,
+      # a two-line packaging fix from an outside contributor, that was 26 red checks -
+      # ch01 through ch26, all eight cs-* jobs and test-py312 - none of them the
+      # contributor's.
+      #
+      # Deciding once whether the run can reach the data, and gating the
+      # data-dependent steps on that, is the same shape as the fix #613 landed for
+      # test-unit-data. It is a step-level gate rather than a job-level `if:` for the
+      # reason recorded there: a job-level `if:` that evaluates false creates no check
+      # run at all, which is unsatisfiable when the context is required.
+      #
+      # What this does not fix, and is said out loud in the notice: a fork pull request
+      # is then green having exercised none of these notebooks. That is the honest
+      # state - it is what happens today, dressed as failure rather than as a skip -
+      # and the merge decision has to account for it.
+      - name: Can this run reach the test data?
+        id: reach
         run: |
-          apt-get update -qq && apt-get install -y -qq git git-lfs openssh-client >/dev/null 2>&1 || true
+          if [ -n "${{ secrets.TEST_DATA_DEPLOY_KEY }}" ]; then
+            echo "have_key=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_key=" >> "$GITHUB_OUTPUT"
+            echo "::notice::No test-data deploy key in this context, which is a fork pull request. This job checked out no test data and executed no notebook, so it asserts nothing about this change; the notebooks run on the branch once it is merged."
+          fi
+      - name: Install git
+        if: steps.reach.outputs.have_key
+        run: |
+          # A transient apt mirror failure used to kill the whole job.
+          for attempt in 1 2 3; do
+            apt-get update -qq && apt-get install -y -qq git git-lfs openssh-client >/dev/null && exit 0
+            echo "apt-get failed (attempt $attempt of 3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "::error::apt-get could not install git after three attempts"
+          exit 1
 
       - uses: actions/checkout@v6
+        if: steps.reach.outputs.have_key
 
       - name: Checkout test data
+        if: steps.reach.outputs.have_key
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
@@ -1324,6 +1857,7 @@ jobs:
           lfs: false
 
       - name: Run Ch02 database benchmark notebooks
+        if: steps.reach.outputs.have_key
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |

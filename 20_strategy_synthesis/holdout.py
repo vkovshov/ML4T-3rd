@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import gc
 import json
+import shutil
 import sqlite3
 import time
 from datetime import date as dt_date
@@ -47,11 +48,8 @@ try:
 except ImportError:  # pragma: no cover - polars-version drift safety
     _PolarsPanicException = type("PanicException", (Exception,), {})
 
-from case_studies.research.population import published_members_at
-from case_studies.utils.backtest_explorer import BacktestExplorer
 from case_studies.utils.backtest_loaders import load_backtest_prices_for
 from case_studies.utils.backtest_runner import run_backtest
-from case_studies.utils.carrier_pins import prioritize_carrier_hash
 from case_studies.utils.conformal import (
     compute_holdout_conformal_widths,
     holdout_conformal_embargo_steps,
@@ -63,6 +61,14 @@ from case_studies.utils.registry import (
     register_training_run,
 )
 from case_studies.utils.registry.completeness import evaluate_prediction_coverage
+from case_studies.utils.strategy_analysis import (
+    LABEL_RESTRICTIONS,
+    SELECTION_STAGES,
+    UNIVERSE_RESTRICTIONS,
+    NoSelectableCandidates,
+    selectable_validation_candidates,
+)
+from utils.cv_splits import most_recent_split
 from utils.modeling import (
     RANDOM_SEED,
     load_configs,
@@ -124,63 +130,59 @@ def _delete_pre_registered_prediction(cs_id: str, prediction_hash: str) -> None:
         shutil.rmtree(pred_dir, ignore_errors=True)
 
 
-EXCLUDED_FROM_HOLDOUT_SELECTION = frozenset({"benchmark"})
-
-
 def _candidate_from_row(cs_id: str, row: dict) -> dict:
-    """Hydrate a backtest_explorer row into a full candidate dict.
+    """Hydrate a :func:`selectable_validation_candidates` row into a retrain candidate.
 
-    Pulls training_hash, checkpoint_value, training_spec, and strategy_spec
-    from the registry. Used by select_best_models to assemble each rank.
+    The row already carries the identities and the strategy spec the ranking read. What
+    the retrain additionally needs is the checkpoint the prediction set sits on - the
+    checkpoint is part of the configuration, so a replay that ignores it replays a
+    different model - and the training specification the refit is built from.
     """
     case_dir = get_case_study_dir(cs_id)
     db_path = case_dir / "run_log" / "registry.db"
-    db = sqlite3.connect(str(db_path))
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
-
-    pred_row = db.execute(
-        "SELECT training_hash, checkpoint_value, checkpoint_kind, split "
-        "FROM prediction_sets WHERE prediction_hash = ?",
-        (row["prediction_hash"],),
-    ).fetchone()
-
-    train_row = db.execute(
-        "SELECT spec_json, family, config_name FROM training_runs WHERE training_hash = ?",
-        (pred_row["training_hash"],),
-    ).fetchone()
-
-    bt_row = db.execute(
-        "SELECT spec_json FROM backtest_runs WHERE backtest_hash = ?",
-        (row["backtest_hash"],),
-    ).fetchone()
-
-    db.close()
+    try:
+        pred_row = db.execute(
+            "SELECT checkpoint_value, checkpoint_kind FROM prediction_sets "
+            "WHERE prediction_hash = ?",
+            (row["prediction_hash"],),
+        ).fetchone()
+        train_row = db.execute(
+            "SELECT spec_json FROM training_runs WHERE training_hash = ?",
+            (row["training_hash"],),
+        ).fetchone()
+    finally:
+        db.close()
 
     return {
         "backtest_hash": row["backtest_hash"],
         "prediction_hash": row["prediction_hash"],
-        "training_hash": pred_row["training_hash"],
+        "training_hash": row["training_hash"],
         "checkpoint_value": pred_row["checkpoint_value"],
         "checkpoint_kind": pred_row["checkpoint_kind"],
-        "family": train_row["family"],
-        "config_name": train_row["config_name"],
+        "family": row["family"],
+        "config_name": row["config_name"],
         "training_spec": json.loads(train_row["spec_json"]),
-        "strategy_spec": json.loads(bt_row["spec_json"]),
-        "val_sharpe": row["sharpe"],
-        "label": row.get("label") or dict(train_row).get("label", ""),
+        "strategy_spec": json.loads(row["spec_json"]),
+        # The Sharpe the selection was made on, which is the common-support one wherever the
+        # field was re-ranked. Reporting the stored value instead would have the two entry
+        # points agree on the configuration and print different numbers for it, and chapter
+        # 20 measures holdout decay against this.
+        "val_sharpe": (
+            row["comparison_sharpe"] if row["comparison_sharpe"] is not None else row["sharpe"]
+        ),
+        "label": row["label"] or "",
     }
 
 
-HOLDOUT_SELECTION_STAGES: tuple[str, ...] = ("signal", "allocation", "risk_overlay")
+HOLDOUT_SELECTION_STAGES: tuple[str, ...] = SELECTION_STAGES
 """Stages eligible for holdout rank-1 selection.
 
-``cost_sensitivity`` is excluded: those rows are perturbation analyses (what
-happens if costs are 2× our model?), not alternative strategies. ``benchmark``
-family is excluded separately via ``EXCLUDED_FROM_HOLDOUT_SELECTION``.
-
-This mirrors the trial-count basis the label-cohort ``cohort_metrics`` uses
-for DSR / RAS / Reality Check / PBO selection-bias adjustments - see
-``scripts/backfill_cohort_metrics.py::_list_label_cohorts``.
+An alias for :data:`case_studies.utils.strategy_analysis.SELECTION_STAGES`, kept for
+callers that import this name. The stage pool is a property of the selection rule
+(``reference/CASE_STUDY_PIPELINE.md`` section 5), not of this module, and declaring it
+twice is how the two holdout selectors came to disagree in the first place.
 """
 
 
@@ -192,109 +194,60 @@ def select_best_models(
     families: list[str] | None = None,
     labels: list[str] | None = None,
 ) -> list[dict]:
-    """Query registry for the top-N models by validation Sharpe across stages.
+    """The top-N distinct trained models by validation Sharpe, best first.
 
-    Pools validation backtests across ``HOLDOUT_SELECTION_STAGES``
-    (signal + allocation + risk_overlay) so the rank-1 reflects the best
-    end-to-end strategy spec - selection, allocator, and risk overlay
-    combined - not just the equal-weight baseline spec. Returns candidate dicts
-    deduplicated by ``prediction_hash`` so each rank corresponds to a
-    distinct trained model. For a given prediction_hash, the dedupe keeps
-    the highest-Sharpe backtest row (i.e., its winning strategy_spec).
+    The ranking is :func:`selectable_validation_candidates`, which is also what
+    ``resolve_canonical_rank1_lineage`` and therefore every case study's own holdout
+    notebook ranks. This function used to build its own pool - ``BacktestExplorer.best``
+    per stage, concatenated and re-sorted - with its own eligibility filter and its own
+    ordering, and the two were kept together by a comment. They disagreed. Measured on
+    ``fx_pairs`` 2026-09-07: ``deep_learning/tcn`` on ``fwd_ret_21d`` carries two
+    backtests tied at Sharpe 0.2639142245820113, this path answered ``9402978117e9`` and
+    the canonical resolver answered ``56070f34dff1``. Two strategy specifications for one
+    model, and the holdout replays the specification exactly, so the choice decided which
+    strategy spent the case study's single holdout use.
 
-    The dedupe matters for the holdout-retrain fallback in ``generate_holdout``:
-    if the rank-1 retrain produces degenerate (constant) predictions, the
-    fallback must select a *different* trained model rather than a different
-    strategy spec on the same model.
+    What is added here and belongs here, because it is about *retraining* rather than
+    about which configuration the case study reports:
 
-    Filters mirror ``select_best_model``: benchmark families excluded;
-    optional families/labels/min_ic restrictions applied before ranking.
+    * the dedupe by ``prediction_hash``, keeping each model's best-Sharpe backtest. The
+      holdout retrain falls back to rank-2 when rank-1's refit produces degenerate
+      predictions, and the fallback has to reach a different *trained model* rather than
+      a different strategy spec on the same one;
+    * ``min_ic``, a caller-supplied floor that no production path passes. IC selects
+      nothing (``reference/CASE_STUDY_PIPELINE.md`` section 5); this only ever narrows a
+      pool already ordered by Sharpe.
+
+    ``families`` and ``labels`` narrow the pool and are passed straight through;
+    ``labels`` replaces ``LABEL_RESTRICTIONS`` rather than adding to it.
     """
-    explorer = BacktestExplorer(cs_id)
-    # Holdout selection ranks over what the case study publishes. "Not retired" is a weaker
-    # set - a prediction no population ever listed was retired by nobody - and the scope goes
-    # into the query because `best()` applies its SQL limit before any filter applied to the
-    # result, so an ineligible row consumes a slot and can hide a live candidate below it.
-    # None when the registry declares no populations, which leaves the ranking as it was.
-    published = published_members_at(get_case_study_dir(cs_id), member_kind="prediction")
-    if published is not None and not published:
-        # `best()` tests this for truthiness, so an empty list reads as "no filter" and would
-        # rank every registered row - the opposite of what an empty population means.
-        raise ValueError(f"{cs_id} declares populations but publishes no prediction identities")
-    published = None if published is None else sorted(published)
-    # Pull a generous pool from each stage so dedupe-by-prediction_hash
-    # still yields top_n after the cross-stage merge. When ``labels``
-    # restricts the eligible label set, the per-stage top_n must be much
-    # larger because high-Sharpe rows on excluded labels (e.g.
-    # sp500_options' inflated fwd_ret_10d) otherwise dominate the
-    # explorer.best() top-N and crowd out the restricted-label rows
-    # before the label filter applies post-concat.
-    per_stage_n = max(top_n * 20, 5000 if labels else 200)
-    stage_frames = []
-    for stage in HOLDOUT_SELECTION_STAGES:
-        df = explorer.best(stage=stage, top_n=per_stage_n, prediction_hashes=published)
-        if not df.is_empty():
-            stage_frames.append(df)
-    if not stage_frames:
-        raise ValueError(
-            f"No validation backtests in stages {HOLDOUT_SELECTION_STAGES} for {cs_id}"
-        )
-    best_df = pl.concat(stage_frames, how="diagonal_relaxed").sort("sharpe", descending=True)
-
-    best_df = best_df.filter(~pl.col("family").is_in(list(EXCLUDED_FROM_HOLDOUT_SELECTION)))
-    if best_df.is_empty():
-        raise ValueError(
-            f"No non-benchmark backtests in stages {HOLDOUT_SELECTION_STAGES} for {cs_id}"
-        )
-
-    if families:
-        best_df = best_df.filter(pl.col("family").is_in(families))
-        if best_df.is_empty():
-            raise ValueError(
-                f"No backtests in stages {HOLDOUT_SELECTION_STAGES} for {cs_id} with families {families}"
-            )
-
-    if labels:
-        best_df = best_df.filter(pl.col("label").is_in(labels))
-        if best_df.is_empty():
-            raise ValueError(
-                f"No backtests in stages {HOLDOUT_SELECTION_STAGES} for {cs_id} with labels {labels}"
-            )
-
-    universe_pin = UNIVERSE_RESTRICTIONS.get(cs_id)
-    if universe_pin and "universe_filter" in best_df.columns:
-        best_df = best_df.filter(pl.col("universe_filter") == universe_pin)
-        if best_df.is_empty():
-            raise ValueError(
-                f"No backtests in stages {HOLDOUT_SELECTION_STAGES} for {cs_id} "
-                f"with universe_filter='{universe_pin}'"
-            )
+    candidates_df = selectable_validation_candidates(cs_id, labels=labels, families=families)
 
     if min_ic is not None:
         case_dir = get_case_study_dir(cs_id)
         db_path = case_dir / "run_log" / "registry.db"
-        db = sqlite3.connect(str(db_path))
-        ic_rows = db.execute(
-            "SELECT prediction_hash, ic_mean FROM prediction_metrics WHERE ic_mean IS NOT NULL"
-        ).fetchall()
-        db.close()
-        ic_map = {ph: val for ph, val in ic_rows}
-
-        viable_rows = []
-        for i in range(len(best_df)):
-            ph = best_df[i, "prediction_hash"]
-            ic = ic_map.get(ph)
-            if ic is not None and ic > min_ic:
-                viable_rows.append(i)
-
-        if viable_rows:
-            best_df = best_df[viable_rows]
-
-    best_df = prioritize_carrier_hash(best_df, cs_id)
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            ic_map = {
+                prediction_hash: ic_mean
+                for prediction_hash, ic_mean in db.execute(
+                    "SELECT prediction_hash, ic_mean FROM prediction_metrics "
+                    "WHERE ic_mean IS NOT NULL"
+                ).fetchall()
+            }
+        finally:
+            db.close()
+        viable = [
+            row
+            for row in candidates_df
+            if (ic := ic_map.get(row["prediction_hash"])) is not None and ic > min_ic
+        ]
+        if viable:
+            candidates_df = viable
 
     seen_phashes: set[str] = set()
     candidates: list[dict] = []
-    for row in best_df.iter_rows(named=True):
+    for row in candidates_df:
         ph = row["prediction_hash"]
         if ph in seen_phashes:
             continue
@@ -377,11 +330,12 @@ def build_holdout_split(mds, setup: dict) -> dict:
     hs = dt_date.fromisoformat(holdout_start)
     train_end = str(hs - timedelta(days=buffer_days))
 
-    # Match the validation fold window length
+    # Match the validation fold window length. Fold windows differ in length, so
+    # this reads the fold that ends nearest the holdout rather than a list position.
     if mds.splits:
-        first_split = mds.splits[0]
-        fold_start = dt_date.fromisoformat(str(first_split["train_start"])[:10])
-        fold_end = dt_date.fromisoformat(str(first_split["train_end"])[:10])
+        latest_split = most_recent_split(mds.splits)
+        fold_start = dt_date.fromisoformat(str(latest_split["train_start"])[:10])
+        fold_end = dt_date.fromisoformat(str(latest_split["train_end"])[:10])
         window_days = (fold_end - fold_start).days
         te = dt_date.fromisoformat(train_end)
         train_start = str(te - timedelta(days=window_days))
@@ -582,9 +536,16 @@ def has_holdout_predictions(cs_id: str, *, top_n: int = 5) -> bool:
     if not db_path.exists():
         return False
 
+    # Both refusals mean the same thing here: nothing is currently selectable, so no
+    # holdout can cover the current top-N. `ValueError` is this module's own refusal after
+    # the dedupe; `NoSelectableCandidates` is the canonical selector's for an empty pool -
+    # an initialised registry with no eligible validation backtest, a population that
+    # publishes nothing, a carrier pin left over from an earlier sweep. Answering False
+    # sends the caller to `generate_holdout`, which asks the same selector again without a
+    # guard and reports whichever refusal applies from inside the driver's own handler.
     try:
         candidates = select_best_models(cs_id, top_n=top_n)
-    except ValueError:
+    except (ValueError, NoSelectableCandidates):
         return False
     candidate_hashes = [c["training_hash"] for c in candidates]
     if not candidate_hashes:
@@ -601,10 +562,46 @@ def has_holdout_predictions(cs_id: str, *, top_n: int = 5) -> bool:
     return count > 0
 
 
-def delete_holdout_predictions(cs_id: str) -> int:
-    """Delete all existing holdout predictions and their backtests.
+def _referencing_columns(
+    db: sqlite3.Connection, parent_table: str, parent_column: str
+) -> list[tuple[str, str]]:
+    """Every ``(table, column)`` the schema declares as a foreign key into one column.
 
-    Deletion order respects FK constraints: child tables first, then parents.
+    Read from the schema rather than listed here. The hand-written list this replaces named
+    `fold_metrics`, `prediction_metrics`, `backtest_metrics`, `backtest_fold_metrics` and
+    `backtest_paired_metrics`, and omitted `prediction_coverage` and `cohort_metrics`, both
+    of which have been foreign keys into these tables since. Every registered holdout hits
+    that: `DELETE FROM prediction_sets` under `PRAGMA foreign_keys=ON` raises
+    `sqlite3.IntegrityError: FOREIGN KEY constraint failed` while its coverage row stands.
+    Reproduced on a copy of cme_futures' production registry, holdout 18d48c3b9cc2. A list
+    that has to be maintained by hand will be wrong again; the schema cannot be.
+    """
+    tables = [
+        row[0]
+        for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    ]
+    references = []
+    for table in tables:
+        for row in db.execute(f"PRAGMA foreign_key_list('{table}')").fetchall():
+            if row[2] == parent_table and row[4] == parent_column:
+                references.append((table, row[3]))
+    return sorted(references)
+
+
+def delete_holdout_predictions(cs_id: str) -> int:
+    """Delete all existing holdout predictions and their backtests, rows and artifacts.
+
+    Deletion order respects FK constraints: child tables first, then parents. Which tables
+    those are is read from the schema - see :func:`_referencing_columns`.
+
+    The artifact directories go with the rows. A prediction artifact is immutable per hash:
+    `register_prediction_set` refuses a hash whose `predictions.parquet` is already on disk
+    with a different digest, and the row it would have compared against is gone. Leaving the
+    directories behind therefore turns a regenerated holdout that lands on the same hash and
+    different content into an "immutable prediction artifact conflict" with nothing left in
+    the registry to explain it - which is exactly the state `force=True` exists to clear.
+    The directories are removed after the transaction commits, so a failed delete leaves both
+    halves intact rather than the rows behind their files.
     """
     case_dir = get_case_study_dir(cs_id)
     db_path = case_dir / "run_log" / "registry.db"
@@ -613,32 +610,44 @@ def delete_holdout_predictions(cs_id: str) -> int:
 
     db = sqlite3.connect(str(db_path))
     db.execute("PRAGMA foreign_keys=ON")
+    prediction_children = _referencing_columns(db, "prediction_sets", "prediction_hash")
+    backtest_children = _referencing_columns(db, "backtest_runs", "backtest_hash")
     rows = db.execute(
         "SELECT prediction_hash FROM prediction_sets WHERE split = 'holdout'"
     ).fetchall()
     deleted = 0
-    for (ph,) in rows:
-        bts = db.execute(
-            "SELECT backtest_hash FROM backtest_runs WHERE prediction_hash=?", (ph,)
-        ).fetchall()
-        for (bh,) in bts:
-            # Child tables first. backtest_paired_metrics has FK on
-            # challenger_hash; we also clean rows where the holdout backtest
-            # is referenced as benchmark_hash (no FK but logically stale).
-            db.execute(
-                "DELETE FROM backtest_paired_metrics WHERE challenger_hash=? OR benchmark_hash=?",
-                (bh, bh),
-            )
-            db.execute("DELETE FROM backtest_fold_metrics WHERE backtest_hash=?", (bh,))
-            db.execute("DELETE FROM backtest_metrics WHERE backtest_hash=?", (bh,))
-            db.execute("DELETE FROM backtest_runs WHERE backtest_hash=?", (bh,))
-        # Child tables of prediction_sets
-        db.execute("DELETE FROM fold_metrics WHERE prediction_hash=?", (ph,))
-        db.execute("DELETE FROM prediction_metrics WHERE prediction_hash=?", (ph,))
-        db.execute("DELETE FROM prediction_sets WHERE prediction_hash=?", (ph,))
-        deleted += 1
-    db.commit()
-    db.close()
+    stale_dirs: list[Path] = []
+    try:
+        for (ph,) in rows:
+            stale_dirs.append(case_dir / "run_log" / "predictions" / ph)
+            bts = db.execute(
+                "SELECT backtest_hash FROM backtest_runs WHERE prediction_hash=?", (ph,)
+            ).fetchall()
+            for (bh,) in bts:
+                stale_dirs.append(case_dir / "run_log" / "backtest" / bh)
+                for table, column in backtest_children:
+                    if table == "backtest_runs":
+                        continue
+                    db.execute(f"DELETE FROM {table} WHERE {column}=?", (bh,))
+                # No foreign key declares it, but a paired metric benchmarked against a
+                # deleted holdout backtest is as stale as one challenging it.
+                db.execute("DELETE FROM backtest_paired_metrics WHERE benchmark_hash=?", (bh,))
+                db.execute("DELETE FROM backtest_runs WHERE backtest_hash=?", (bh,))
+            for table, column in prediction_children:
+                if table == "backtest_runs":
+                    continue
+                db.execute(f"DELETE FROM {table} WHERE {column}=?", (ph,))
+            db.execute("DELETE FROM prediction_sets WHERE prediction_hash=?", (ph,))
+            deleted += 1
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    for stale in stale_dirs:
+        shutil.rmtree(stale, ignore_errors=True)
     return deleted
 
 
@@ -1048,35 +1057,6 @@ TRAIN_DISPATCH = {
 }
 
 
-# Per-case-study label restrictions for Ch20 rank-1 selection. sp500_options
-# has only one canonical label (`ret_to_expiry`) after the 2026-05-17 purge
-# of the legacy fwd_ret_5d/10d/dh_5d/dh_10d sweep entries - those went
-# through the vectorized backtest path which treats their 5d/10d forward
-# returns as daily returns, inflating Sharpes to non-credible levels
-# (e.g. fwd_ret_10d allocation Sharpe ~6.5). Only ret_to_expiry runs
-# through the HTM daily-MTM dispatch that honors option bid-ask costs.
-# Per-case-study label whitelist. Used by both the holdout retrain selector
-# (this module) and the cluster-diagnostics rank-1 selector
-# (01_aggregate_synthesis.py). Both consumers must agree, hence the single
-# canonical definition here imported by 01_aggregate_synthesis.
-LABEL_RESTRICTIONS: dict[str, frozenset[str]] = {
-    "sp500_options": frozenset({"ret_to_expiry"}),
-}
-
-
-# Per-CS canonical universe pin: case_study -> strategy.signal.universe_filter
-# value eligible to anchor the holdout-retrain rank-1. sp500_options trades only
-# the liquid (bottom-quintile half-spread) subset; full-universe rows are kept
-# for the Ch18 htm_cost_cascade comparison only and must never be selected as the
-# deployed carrier (the full-universe round-trip spread consumes the VRP edge).
-# Without this, full-universe allocation backtests from the standard sweep leak
-# into the holdout selection by raw Sharpe. Mirrors
-# case_studies/utils/strategy_analysis.py::UNIVERSE_RESTRICTIONS - keep in sync.
-UNIVERSE_RESTRICTIONS: dict[str, str] = {
-    "sp500_options": "liquid",
-}
-
-
 def generate_holdout(
     cs_id: str,
     *,
@@ -1122,21 +1102,27 @@ def generate_holdout(
         if verbose:
             print(msg, flush=True)
 
-    if has_holdout_predictions(cs_id):
-        if force:
-            n = delete_holdout_predictions(cs_id)
-            _log(f"  Deleted {n} existing holdout prediction(s)")
-        else:
-            _log("  Holdout predictions exist - loading from registry")
-            return load_existing_holdout(cs_id)
+    # `force` deletes unconditionally. Gating the delete on `has_holdout_predictions`
+    # skipped it exactly when it was needed: that check looks for a holdout tied to one of
+    # the *current* validation top-N, and its own docstring says it returns False when a
+    # holdout exists but no top-N candidate matches it - which is the definition of stale.
+    # So a holdout whose training fell out of the top-N after a sweep reshuffle survived
+    # `force=True`, and the new holdout was written beside it, two holdouts for one case
+    # study. Measured on nasdaq100_microstructure: bf76fac27013 (training b8add3b63794)
+    # coexisted with 6f95e10992fe and had to be deleted by hand.
+    if force:
+        n = delete_holdout_predictions(cs_id)
+        _log(f"  Deleted {n} existing holdout prediction(s)")
+    elif has_holdout_predictions(cs_id):
+        _log("  Holdout predictions exist - loading from registry")
+        return load_existing_holdout(cs_id)
 
+    # The restriction is applied inside the selection, not passed in here. Passing it
+    # made this call site look like the place the rule lives, and `has_holdout_predictions`
+    # - which calls the same selector without it - then ranked over a wider label set than
+    # the run it is reporting on.
     label_filter = LABEL_RESTRICTIONS.get(cs_id)
-    candidates = select_best_models(
-        cs_id,
-        top_n=max_fallback_attempts,
-        min_ic=None,
-        labels=list(label_filter) if label_filter else None,
-    )
+    candidates = select_best_models(cs_id, top_n=max_fallback_attempts, min_ic=None)
     if label_filter:
         _log(f"  Label filter active: {label_filter}")
     _log(

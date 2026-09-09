@@ -48,17 +48,12 @@
 # %%
 """US Firm Characteristics: Portfolio: Allocator Sweep."""
 
-import sqlite3
 import time
-import warnings
 from collections import Counter
 
 import polars as pl
 
-from utils.style import COLORS, add_message_title, show_with_alt
-
-warnings.filterwarnings("ignore")
-
+from case_studies.research import open_study, reuse_disclosure
 from case_studies.utils.backtest_loaders import get_backtest_config, load_backtest_prices_for
 from case_studies.utils.backtest_presets import build_backtest_spec
 from case_studies.utils.backtest_runner import run_backtest
@@ -75,12 +70,29 @@ from case_studies.utils.sweep_config import (
     get_top_n_predictions,
 )
 from utils.paths import get_case_study_dir
+from utils.style import COLORS, add_message_title, show_with_alt
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "us_firm_characteristics"
 LABEL = ""
 MAX_SYMBOLS = 0
 TOP_N_PREDICTIONS = None
+# Both names stay bound here although nothing below reads them: that is what makes the harness
+# force preview and supply a workspace - `_declares_tier_and_workspace` in `tests/pm_helpers.py`
+# looks for exactly this pair. Without them the canonical branch regenerates in place, which
+# needs symlinks a CI checkout does not have.
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
+
+# %% [markdown]
+# The study is opened before anything resolves a path or reads the registry. Under the preview
+# tier, opening it activates a workspace and rewrites `ML4T_OUTPUT_DIR` process-wide, and every
+# later `get_case_study_dir` call resolves against that. A `CASE_DIR`, a candidate index or a
+# `BacktestExplorer` built first would address the released registry while this notebook writes
+# to the preview one, and the two never meet.
+
+# %%
+study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None)
 
 # %%
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
@@ -217,6 +229,7 @@ for top_k in TOP_K_VALUES:
                 prediction_hash=pred_hash,
                 initial_cash=bt_config.initial_cash,
                 chapter="ch17",
+                label=LABEL,
                 signal={
                     "method": "equal_weight_top_k",
                     "top_k": top_k,
@@ -255,8 +268,8 @@ for top_k in TOP_K_VALUES:
 stage_total = len(load_existing_backtest_hashes(CASE_STUDY_ID, stage="allocation"))
 print(f"\nAllocation stage: {stage_total} backtests registered.")
 print(
-    f"This execution: {n_done - n_reused - n_failed} computed, {n_reused} reused, "
-    f"{n_failed} failed, over {n_done} cells attempted in "
+    f"This execution: {reuse_disclosure(n_done - n_reused - n_failed, n_reused, n_failed)}, "
+    f"over {n_done} cells attempted in "
     f"{(time.monotonic() - sweep_start) / 60:.1f} minutes."
 )
 for reason, count in failures.most_common():
@@ -294,24 +307,16 @@ from case_studies.utils.backtest_explorer import BacktestExplorer
 
 explorer = BacktestExplorer(CASE_STUDY_ID)
 
-with sqlite3.connect(str(CASE_DIR / "run_log" / "registry.db")) as conn:
-    grid = (
-        pl.DataFrame(
-            conn.execute(
-                "SELECT backtest_hash, stage, spec_json FROM backtest_runs "
-                "WHERE stage IN ('signal', 'allocation')"
-            ).fetchall(),
-            schema=["backtest_hash", "stage", "spec_json"],
-            orient="row",
-        )
-        .with_columns(
-            allocator=pl.col("spec_json").str.json_path_match("$.strategy.allocation.method"),
-            names_per_side=pl.col("spec_json")
-            .str.json_path_match("$.strategy.signal.top_k")
-            .cast(pl.Int64),
-        )
-        .drop("spec_json")
+grid = (
+    explorer.specs(["signal", "allocation"])
+    .with_columns(
+        allocator=pl.col("spec_json").str.json_path_match("$.strategy.allocation.method"),
+        names_per_side=pl.col("spec_json")
+        .str.json_path_match("$.strategy.signal.top_k")
+        .cast(pl.Int64),
     )
+    .drop("spec_json")
+)
 
 # %% [markdown]
 # Two frames carry every table below. The baseline is restricted to the concentrations
@@ -451,7 +456,6 @@ if not plottable.is_empty():
             "net of the declared commission and slippage"
         ),
     )
-    fig.tight_layout()
     show_with_alt(
         fig,
         "Horizontal bar chart of average validation Sharpe over the solvent runs, for "

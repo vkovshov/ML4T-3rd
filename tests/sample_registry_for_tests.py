@@ -30,6 +30,14 @@ import sqlite3
 import sys
 from pathlib import Path
 
+try:
+    from tests.fixture_registry import (
+        capture_backed_prediction_rows,
+        restore_backed_prediction_rows,
+    )
+except ModuleNotFoundError:  # standalone, like generate_intermediates.py
+    from fixture_registry import capture_backed_prediction_rows, restore_backed_prediction_rows
+
 REPO_ROOT = Path(__file__).parent.parent
 CODE_CS_DIR = REPO_ROOT / "case_studies"
 
@@ -125,6 +133,20 @@ SYMBOL_COLUMN_CANDIDATES = ("ticker", "symbol")
 PREDICTION_TARGET_COLUMN = "actual"
 
 
+def _has_table(connection, table: str) -> bool:
+    """Whether the registry carries this table at all.
+
+    The stub registries the unit tests build carry only the tables the case under
+    test needs, and a canonical registry predating a table has the same shape.
+    """
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        is not None
+    )
+
+
 def _copy_rows(src, dst, table: str, rows: list) -> int:
     """Insert rows into dst table with proper column quoting."""
     if not rows:
@@ -187,6 +209,13 @@ def sample_registry(cs_id: str, intermediates_dir: Path = DEFAULT_INTERMEDIATES_
     dst_dir.mkdir(parents=True, exist_ok=True)
     dst_db = dst_dir / "registry.db"
 
+    # The rows that name an artifact this fixture ships, read before the rewrite that
+    # would drop them. `run_log/predictions/` is deliberately not removed below - a
+    # generation writes those artifacts and nothing else does - so rebuilding the
+    # registry from production alone leaves each of them addressable by nothing: every
+    # reader resolves a prediction by hash out of the registry (ml4t/agent-workspace#1081).
+    backed = capture_backed_prediction_rows(dst_db, intermediates_dir / cs_id)
+
     # Remove old DB to start fresh. The artifact dirs go too: they are keyed by
     # backtest_hash, so a re-sample that changes hashes would otherwise leave the
     # previous generation's directories behind alongside the new ones.
@@ -203,6 +232,9 @@ def sample_registry(cs_id: str, intermediates_dir: Path = DEFAULT_INTERMEDIATES_
             dst.close()
     finally:
         src.close()
+
+    restored = restore_backed_prediction_rows(dst_db, backed)
+    stats["fixture_rows_restored"] = sum(restored.values())
 
     sampled = stats.pop("sampled_hashes", set())
     artifacts = _copy_backtest_artifacts(src_db.parent, dst_dir, sampled)
@@ -406,14 +438,8 @@ def _populate_sample_db(src, dst, dst_db) -> dict:
         # backtest_runs sample is. Filtering by leader_hash membership in the sample
         # is sufficient and correct: a row whose leader was not sampled would fail the
         # same JOIN downstream anyway, so it is dropped exactly like an FK would.
-        has_cohort_metrics = (
-            src.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cohort_metrics'"
-            ).fetchone()
-            is not None
-        )
         count = 0
-        if has_cohort_metrics:
+        if _has_table(src, "cohort_metrics"):
             for i in range(0, len(hash_list), batch_size):
                 batch = hash_list[i : i + batch_size]
                 placeholders = ",".join(["?"] * len(batch))
@@ -423,6 +449,46 @@ def _populate_sample_db(src, dst, dst_db) -> dict:
                 ).fetchall()
                 count += _copy_rows(src, dst, "cohort_metrics", rows)
         stats["cohort_metrics"] = count
+
+        # 3f. Copy backtest_paired_metrics for pairs both of whose sides survived.
+        # A challenger-versus-benchmark row is only readable when both backtests are
+        # in the fixture: challenger_hash carries an FK to backtest_runs and
+        # benchmark_hash is resolved the same way by every reader. The table got its
+        # schema and none of its rows, so a strategy-analysis notebook comparing a
+        # candidate against its benchmark found nothing and could not distinguish
+        # "not computed" from "not sampled".
+        count = 0
+        if _has_table(src, "backtest_paired_metrics"):
+            # benchmark_hash carries no FK, so the pair is filtered here rather than
+            # by SQLite: a row pointing at a benchmark the sample dropped reads as a
+            # comparison against a backtest that is not there.
+            benchmark_index = [
+                column[0]
+                for column in src.execute(
+                    "SELECT * FROM backtest_paired_metrics LIMIT 0"
+                ).description
+            ].index("benchmark_hash")
+            for i in range(0, len(hash_list), batch_size):
+                batch = hash_list[i : i + batch_size]
+                placeholders = ",".join(["?"] * len(batch))
+                rows = src.execute(
+                    "SELECT * FROM backtest_paired_metrics "
+                    f"WHERE challenger_hash IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                rows = [row for row in rows if row[benchmark_index] in sampled_bt_hashes]
+                count += _copy_rows(src, dst, "backtest_paired_metrics", rows)
+        stats["backtest_paired_metrics"] = count
+
+    # 4. Copy causal_runs in full. Its rows are keyed by causal_hash and depend on no
+    # sampled backtest or prediction, so there is nothing to filter them by; the table
+    # had schema and no rows, and 15_causal_estimation reads it. One row per causal
+    # notebook run, so full is also small.
+    count = 0
+    if _has_table(src, "causal_runs"):
+        rows = src.execute("SELECT * FROM causal_runs").fetchall()
+        count = _copy_rows(src, dst, "causal_runs", rows)
+    stats["causal_runs"] = count
 
     dst.commit()
 
@@ -965,9 +1031,12 @@ def main() -> int:
             "backtest_metrics",
             "backtest_fold_metrics",
             "cohort_metrics",
+            "backtest_paired_metrics",
+            "causal_runs",
         ]:
             print(f"  {table:30s} {stats.get(table, 0):>6}")
         print(f"  {'backtest artifact dirs':30s} {stats.get('backtest_artifact_dirs', 0):>6}")
+        print(f"  {'fixture rows restored':30s} {stats.get('fixture_rows_restored', 0):>6}")
         print(f"  {'file size (KB)':30s} {stats['file_size_kb']:>6}")
         missing_dir = stats.get("backtest_artifacts_missing_dir", 0)
         missing_returns = stats.get("backtest_artifacts_missing_returns", 0)

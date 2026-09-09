@@ -77,7 +77,7 @@ import polars as pl
 import torch  # cudart preload - required before ml4t.diagnostic imports # noqa: F401
 import yaml
 
-from case_studies.research import CausalResult, Study
+from case_studies.research import CausalResult, Study, open_study
 from case_studies.utils.latent_factors import load_fold_extras
 from case_studies.utils.model_analysis import (
     best_model_per_family_fast,
@@ -114,6 +114,8 @@ warnings.filterwarnings("ignore")
 
 # %% tags=["parameters"]
 CASE_STUDY = "sp500_equity_option_analytics"
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
 PRIMARY_LABEL = "fwd_ret_5d"
 DATE_COL = "timestamp"
 ENTITY_COL = "symbol"
@@ -141,22 +143,40 @@ POPULATION_FAMILY = {
 POPULATIONS = {model: f"{CASE_STUDY}-{model}-validation-v1" for model in POPULATION_FAMILY}
 
 # %% [markdown]
-# This notebook reads; it registers nothing, and that decides how it opens the registry. Every
-# route through `open_study` ends in `Study.activate()`, which rewrites `ML4T_OUTPUT_DIR` for the
-# rest of the process and clears the caches keyed on it, so every later `get_case_study_dir`
-# answers for a different directory than the one resolved here. On the canonical tier with no
-# workspace that route is `Study.regenerate`, which refuses outright unless `features`, `labels`
-# and `run_log` are symlinks - true in a maintainer worktree, false in every clean clone and
-# every CI run. On the preview tier it repoints the notebook at `.preview/<case>`, whose registry
-# `activate()` creates empty, and the comparison below then reports on nothing while reporting
-# success.
+# This notebook reads; it registers nothing, and that is what decides how it opens the registry.
+# Every route through `open_study` ends in `Study.activate()`, which rewrites `ML4T_OUTPUT_DIR`
+# for the rest of the process and clears the caches keyed on it, so every later
+# `get_case_study_dir` answers for a different directory than the one resolved before it. On the
+# canonical tier with no workspace that route is `Study.regenerate`, which refuses outright
+# unless `features`, `labels` and `run_log` are symlinks - true in a maintainer worktree, false
+# in every clean clone and every CI run. So canonical opens `Study.at`: the read-only form, one
+# root, no activation.
 #
-# `Study.at` is the read-only form: one root, no activation. `CASE_DIR` is that root, and every
-# question this notebook asks is answered from it.
+# A preview run is the case where that rewrite is the point. It reads and reports on the rows a
+# smoke chain registered in its own workspace, which live under `.preview/<case>` and nowhere
+# else, so the analysis has to follow `ML4T_OUTPUT_DIR` there rather than answer from the
+# canonical directory. `activate()` links `config`, `labels` and `features` into that directory,
+# and `CASE_DIR` below is whichever of the two roots the tier resolved.
+#
+# What a preview cannot have is a published population: `_refuse_preview_activation` stops a
+# reduced run from creating one, by design. The resolution below already distinguishes that from
+# a broken lineage and falls through to comparing every registered prediction set, so the preview
+# needs no branch of its own here - it takes the same path as a fixture or a clean clone.
 
 # %%
-CASE_DIR = get_case_study_dir(CASE_STUDY)
-study = Study.at(CASE_DIR, case_study=CASE_STUDY, entry_point="13_model_analysis")
+if EXECUTION_TIER == "preview":
+    if not WORKSPACE:
+        raise ValueError("preview execution requires WORKSPACE")
+    study = open_study(
+        CASE_STUDY,
+        execution_tier="preview",
+        workspace=WORKSPACE,
+        entry_point="13_model_analysis",
+    )
+    CASE_DIR = get_case_study_dir(CASE_STUDY)
+else:
+    CASE_DIR = get_case_study_dir(CASE_STUDY)
+    study = Study.at(CASE_DIR, case_study=CASE_STUDY, entry_point="13_model_analysis")
 
 with open(CASE_DIR / "config" / "setup.yaml") as f:
     setup = yaml.safe_load(f)
@@ -1595,22 +1615,34 @@ else:
 # ### Calibration: Do Prediction Intervals Reach Their Nominal Coverage?
 #
 # Point IC tells us whether the ranking is correct on average; it says
-# nothing about whether the model's *uncertainty* is well calibrated.
-# Inductive split-conformal prediction (Vovk et al., 2005; Lei et al.,
-# 2018) gives a distribution-free check: using the earliest validation
-# fold's absolute residuals as a calibration set, the symmetric quantile
-# $\hat{q}_{1-\alpha}$ defines an interval
-# $[\hat{y} - \hat{q}, \hat{y} + \hat{q}]$ that should cover the true
-# label at rate $1-\alpha$ on later folds.
-# Empirical coverage materially below the nominal level signals
-# overconfident residual scaling: the model misses more often
-# than its training-time spread suggests. Width is reported as a
-# fraction of the actuals' standard deviation so families with different
-# return scales are comparable; smaller width at matched coverage means
-# tighter, more useful intervals. See Ch12 §12.6 / `11_conformal_gbm`
-# for the full conformal toolkit (CQR, ACI). What we report here is the
-# minimal residual-calibration diagnostic on the highest-IC config per
-# family for the primary label.
+# nothing about whether the model's *uncertainty* is well calibrated. The
+# width measured here is the one the `conformal_weighted` allocator sizes
+# positions with: calibrated per symbol on every absolute residual known at
+# `t - h`, where `h` is this label's horizon in data steps, falling back to a
+# quantile pooled over every symbol where one has too few residuals of its
+# own. A decision is covered when its absolute residual falls inside that
+# half-width, and `n_uncalibrated` counts the decisions that cleared no
+# warm-up and that no coverage figure describes.
+#
+# Empirical coverage materially below the nominal level signals overconfident
+# residual scaling - the model is more wrong, more often, than its
+# training-time spread suggests. Width is reported as a fraction of the
+# standard deviation of the outcomes it was measured against, so families with
+# different return scales are comparable; smaller width at matched coverage
+# means tighter, more useful intervals.
+#
+# Read it as a diagnostic of residual dispersion rather than a guarantee.
+# Split conformal's finite-sample coverage (Vovk et al., 2005; Lei et al.,
+# 2018) requires the calibration and evaluation scores to be exchangeable and
+# return residuals are not, and nothing in the allocation path reads an
+# interval or a coverage level - the width stands in for a volatility
+# estimate. See Ch12 §12.6 / `11_conformal_gbm` for the full conformal toolkit
+# (CQR, ACI).
+#
+# Each row is the family's highest-IC configuration for the primary label.
+# That is a model-level ranking and not the funnel's - every selection stage
+# ranks on validation backtest Sharpe - and it is used here because this
+# diagnostic runs before any backtest exists to rank.
 
 # %%
 conformal_df = conformal_coverage_diagnostic(CASE_STUDY, label=PRIMARY_LABEL)
@@ -1628,21 +1660,26 @@ if conformal_df.height > 0:
 
 # %% [markdown]
 # **Read each family's empirical coverage against the nominal level in the same column, and the
-# width beside it.** Coverage below nominal means the interval is too narrow out of time:
-# residuals in the later fold are wider than the earliest fold's calibration set implied. Width
-# is in units of the actuals' standard deviation, so a family can only claim tighter intervals
-# if it reaches comparable coverage while showing a smaller width.
+# width beside it.** Coverage below nominal means the width is too narrow out of time: the
+# residuals a decision met are wider than everything known before it implied. Width is in units
+# of the standard deviation of the outcomes it was measured against, so a family can only claim
+# tighter intervals if it reaches comparable coverage while showing a smaller width.
 #
 # The shortfall to watch for is a systematic one - every family below nominal at every level -
 # rather than one family missing. A systematic shortfall is a statement about the sample, not
-# about the models: it says the calibration fold and the evaluation folds are not exchangeable,
-# which is what a split-conformal interval assumes and what a regime change breaks.
+# about the models: it says the residuals a width was calibrated on and the residuals it was
+# measured against are not exchangeable, which is what a conformal quantile assumes and what a
+# regime change breaks.
 #
-# **This is the section that matters for position sizing.** An interval that under-covers out of
-# time understates residual uncertainty, and a sleeve that froze the earliest fold's quantile
-# would sit larger than the risk it believed it was taking. Where the shortfall is systematic,
-# the online-updating extensions in Chapter 12, Section 12.6 are the next step before any of
-# these intervals is used to size anything.
+# **What a systematic shortfall does and does not establish.** `conformal_weighted` normalizes
+# `1/width` within each side at each timestamp, so a width scale that is uniformly too small
+# divides out and leaves every weight unchanged. Only the *differences* between symbols' widths
+# reach the portfolio, and this table does not measure those: it measures the scale of the
+# residuals against the widths, pooled over the decisions. So a shortfall says the uncertainty
+# estimate is optimistic and is a reason to look at the cross-section of widths before trusting
+# them to size - it is not, on its own, a finding that any position was too large. Where the
+# shortfall is systematic, the online-updating extensions in Chapter 12, Section 12.6 are what
+# to reach for.
 
 # %% [markdown]
 # ## 8. Pre-Backtest Judgment and Handoff
@@ -1764,9 +1801,12 @@ credible.select(
 # **The causal estimate is a separate framing and does not compete in this ranking.** It is a
 # conditional treatment effect for one declared treatment, not a cross-sectional ranking signal.
 #
-# **The calibration result in §7 constrains every tier.** Where intervals under-cover out of
-# time, no candidate should have its interval used for position sizing without the
-# online-updating correction, whatever its IC.
+# **The calibration result in §7 qualifies every tier.** §7 measures the widths
+# `conformal_weighted` would use, so it is about this allocator rather than about intervals in
+# general - but it measures their scale and not their cross-section, and the allocator consumes
+# only the cross-section. Where the widths under-cover out of time, that is a reason to check
+# the online-updating correction before sizing on them, not a disqualification of any candidate
+# on its own.
 #
 # ### Forecast Representation
 #
@@ -1778,8 +1818,8 @@ credible.select(
 #   above, rather than routing every family to the primary label.
 # - **Ensemble**: the pairwise rank correlations in §5 decide whether averaging helps. Low
 #   correlation among families whose intervals all cover zero is diversity among weak signals,
-#   and averaging weak signals does not produce a strong one. Weight by how tight an interval
-#   is rather than by how large a point estimate is.
+#   and averaging weak signals does not produce a strong one. Weight by how tight a conformal
+#   width is rather than by how large a point estimate is.
 
 # %% [markdown]
 # ### The Option Feature Question
@@ -1803,10 +1843,14 @@ credible.select(
 #
 # ### What This Analysis Does Not Tell Us
 #
-# - **Conformal-corrected sizing**: the §7 under-coverage gaps across
-#   all five families mean that static interval widths understate later-fold
-#   uncertainty; ACI-based online updates (Ch12 §12.6) would replace
-#   the frozen calibration quantile before sizing.
+# - **Conformal-corrected sizing**: the §7 under-coverage gaps across all five
+#   families say the widths understate residual scale out of time. The widths are
+#   already expanding rather than fixed - each recalibrates on every residual known
+#   at the decision it sizes - so what is open is not whether to unfreeze them but
+#   whether an adaptive rule that targets coverage directly (ACI, Ch12 §12.6) does
+#   better. And §7 measures scale, while `conformal_weighted` consumes only the
+#   cross-section of widths, so this is a reason to measure that cross-section
+#   before sizing on it rather than a finding about any candidate.
 # - **Transaction costs under weekly rebalancing**: decile spreads
 #   are small in absolute terms and must survive round-trip costs of
 #   6–20 bps for liquid S&P 500 names; with weekly rebalancing,

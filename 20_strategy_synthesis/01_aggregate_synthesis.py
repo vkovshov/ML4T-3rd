@@ -49,6 +49,7 @@ warnings.filterwarnings("ignore")
 from case_studies.utils.backtest_explorer import BacktestExplorer
 from case_studies.utils.benchmark import load_benchmark_returns
 from case_studies.utils.strategy_analysis import (
+    allocation_method_of,
     compute_cost_bps,
     training_run_fitted_for_the_holdout,
 )
@@ -302,10 +303,9 @@ def _apply_rung_restriction(df: pl.DataFrame, cs: str) -> pl.DataFrame:
     return df.filter(rung["predicate"])
 
 
-# Carrier pin: a validation-time a-priori tie-break, distinct from the rung restrictions
-# above. EMPTY, and that is the normal state. It held
-# `"us_firm_characteristics": pl.col("config_name") == "default_huber"` until 2026-08-25,
-# copied from case_studies.utils.strategy_analysis.CARRIER_PINS and translated into a
+# There is no carrier pin here, and there is no mechanism for one. `_CARRIER_PIN_PREDICATES`
+# held `"us_firm_characteristics": pl.col("config_name") == "default_huber"` until 2026-08-25,
+# copied from `case_studies.utils.strategy_analysis.CARRIER_PINS` and translated into a
 # config-name predicate, under a "keep in sync" comment doing the job a mechanism should.
 #
 # It had not been in sync for a rebuild. Against the current registry `default_huber` is the
@@ -314,29 +314,15 @@ def _apply_rung_restriction(df: pl.DataFrame, cs: str) -> pl.DataFrame:
 # (59 backtests, 3.116). So this restricted one case study to its worst advanced configuration
 # while every notebook inside that case study reported its best.
 #
-# Worse than the hash pin removed from CARRIER_PINS the same day, because a hash pin dies loudly:
-# every hash changes when a sweep is rebuilt, so it resolves to nothing and stops. A config-name
-# predicate survives the rebuild and keeps selecting, silently and wrongly.
+# Worse than the hash pin removed from `CARRIER_PINS` the same day, because a hash pin dies
+# loudly: every hash changes when a sweep is rebuilt, so it resolves to nothing and stops. A
+# config-name predicate survives the rebuild and keeps selecting, silently and wrongly.
 #
-# If a carrier restriction is ever needed here again, call `carrier_pins.carrier_config_name(cs)`,
-# which resolves a pin to its config through the registry - the thing this copy existed to avoid
-# and the thing that would have failed loudly instead of filtering to the wrong config.
-_CARRIER_PIN_PREDICATES: dict[str, pl.Expr] = {}
-
-
-def _apply_carrier_pin(df: pl.DataFrame, cs: str) -> pl.DataFrame:
-    """Restrict candidate rows to the pinned model carrier, if configured.
-
-    Applied alongside `_apply_rung_restriction` at every cross-stage
-    carrier-selection site (signal / allocation / cross-stage spine /
-    holdout-pairing walk). Deliberately NOT applied to the §20.3 rank-cluster
-    diagnostics, which measure the rank-cluster width across the full model
-    space and must stay carrier-agnostic.
-    """
-    pred = _CARRIER_PIN_PREDICATES.get(cs)
-    if pred is None or df.is_empty() or "config_name" not in df.columns:
-        return df
-    return df.filter(pred)
+# The mapping stayed empty behind an `_apply_carrier_pin` that could no longer fire, which is a
+# second implementation of a rule nothing applied. A carrier restriction needed here again is
+# `carrier_pins.carrier_config_name(cs)`, which resolves an owner's pin to its config through
+# the registry - the thing the copy existed to avoid, and the thing that would have failed
+# loudly rather than filtering to the wrong config.
 
 
 def _progression_for(
@@ -636,7 +622,6 @@ def build_backtest_rows():
                 pl.col("label").is_in(list(label_restriction))
             )
         signal_candidates = _apply_rung_restriction(signal_candidates, cs)
-        signal_candidates = _apply_carrier_pin(signal_candidates, cs)
         best_signal = signal_candidates.head(1)
         signal_sharpe = best_signal["sharpe"][0] if not best_signal.is_empty() else None
         best_source = best_signal["source"][0] if not best_signal.is_empty() else ""
@@ -670,22 +655,14 @@ def build_backtest_rows():
                     pl.col("label").is_in(list(label_restriction))
                 )
             alloc_candidates = _apply_rung_restriction(alloc_candidates, cs)
-            alloc_candidates = _apply_carrier_pin(alloc_candidates, cs)
             best_alloc = alloc_candidates.head(1)
             alloc_sharpe = best_alloc["sharpe"][0] if not best_alloc.is_empty() else None
-            # When a carrier pin is active, the allocator comparison must run on
-            # the pinned carrier's prediction so the reported best_allocator NAME
-            # matches the pinned alloc_sharpe. Without this, compare_allocators
-            # pools across every prediction (e.g. an experimental conformal run on
-            # a non-carrier model) and can return an allocator that was never run
-            # on the deployed carrier. Non-pinned CSes pass None (unchanged).
-            alloc_comp_pred = (
-                best_alloc["prediction_hash"][0]
-                if cs in _CARRIER_PIN_PREDICATES and not best_alloc.is_empty()
-                else None
+            # The allocator that produced `alloc_sharpe`, read from that row's own spec, so
+            # the name and the number describe one configuration. See
+            # `strategy_analysis.allocation_method_of`.
+            best_allocator = allocation_method_of(
+                cs, best_alloc["backtest_hash"][0] if not best_alloc.is_empty() else None
             )
-            alloc_comp = explorer.compare_allocators(prediction_hash=alloc_comp_pred)
-            best_allocator = alloc_comp["allocator"][0] if not alloc_comp.is_empty() else ""
         else:
             alloc_sharpe = None
             best_allocator = ""
@@ -722,7 +699,6 @@ def build_backtest_rows():
         if label_restriction and "label" in cross_stage.columns and not cross_stage.is_empty():
             cross_stage = cross_stage.filter(pl.col("label").is_in(list(label_restriction)))
         cross_stage = _apply_rung_restriction(cross_stage, cs)
-        cross_stage = _apply_carrier_pin(cross_stage, cs)
         if not cross_stage.is_empty():
             cross_stage = cross_stage.sort("sharpe", descending=True).unique(
                 subset=["prediction_hash"], keep="first", maintain_order=True
@@ -888,6 +864,7 @@ from case_studies.utils.uncertainty import (
     compute_independent_diff_uncertainty,
     compute_paired_uncertainty,
     descends_from,
+    joint_returns,
 )
 
 
@@ -905,27 +882,6 @@ def _min_paired_n(ppy: int) -> int:
     if ppy <= 52:  # weekly
         return 12
     return 21  # daily / 8h / intraday
-
-
-def _joint_coerce(c_arr, b_arr):
-    """Filter NaN/non-finite jointly across paired series and trim leading
-    rows where *either* is zero. Matches ``_coerce_returns`` semantics but
-    preserves index alignment so ``compute_paired_uncertainty``'s
-    equal-length precondition survives — the upstream helper trims leading
-    zeros independently per series, which can desynchronize a paired
-    bootstrap if one side has more leading inactive bars than the other.
-    """
-    c = np.asarray(c_arr, dtype=np.float64)
-    b = np.asarray(b_arr, dtype=np.float64)
-    finite = np.isfinite(c) & np.isfinite(b)
-    c, b = c[finite], b[finite]
-    if c.size == 0:
-        return c, b
-    nonzero = np.flatnonzero((c != 0.0) & (b != 0.0))
-    if nonzero.size == 0:
-        return c[:0], b[:0]
-    start = int(nonzero[0])
-    return c[start:], b[start:]
 
 
 # Distinguish skipped CSs from real failures so empty cross-dataset rollups
@@ -985,7 +941,9 @@ for cs, explorer in explorers.items():
             {"case_study": cs, "reason": f"insufficient_overlap:n={aligned.height}"}
         )
         continue
-    c_arr, b_arr = _joint_coerce(aligned["ret"].to_numpy(), aligned["ret_b"].to_numpy())
+    # A strategy against a benchmark: the leader's leading flat run is warmup before its
+    # first signal, not a position it held, so the sample starts where both are trading.
+    c_arr, b_arr = joint_returns(aligned["ret"].to_numpy(), aligned["ret_b"].to_numpy())
     if c_arr.size < min_n:
         paired_skips.append(
             {"case_study": cs, "reason": f"insufficient_after_coerce:n={c_arr.size}"}
@@ -1178,7 +1136,6 @@ def _val_rank1_carrier(cs: str) -> dict | None:
     if label_restriction and "label" in cand.columns:
         cand = cand.filter(pl.col("label").is_in(list(label_restriction)))
     cand = _apply_rung_restriction(cand, cs)
-    cand = _apply_carrier_pin(cand, cs)
     if cand.is_empty():
         return None
     # Do NOT dedup by prediction_hash here. The walk needs to surface every
@@ -1455,18 +1412,28 @@ def _populate_pair(
     label,
     *,
     disjoint_windows: bool = False,
+    challenger_overlays_baseline: bool = False,
     benchmark_label: str | None = None,
 ):
     """Compute one paired-metric row without mutating a case-study registry.
 
-    With ``disjoint_windows=True`` (val→holdout decay), each side is
-    bootstrapped independently over its full window and the difference
-    distribution is built from independent draws — no spurious head/tail
-    truncation. ``info_ratio`` columns will be NaN since there is no
-    aligned diff series to ratio.
+    With ``disjoint_windows=True`` (val→holdout decay), each side is bootstrapped
+    over its full window and the difference distribution is built from those draws,
+    because two windows sharing no timestamps leave no difference series to pair on.
+    ``info_ratio`` columns will be NaN for the same reason. See
+    :func:`case_studies.utils.uncertainty.compute_independent_diff_uncertainty` for
+    what that interval does and does not cover.
 
-    Otherwise, the streams are inner-joined on timestamp and a paired
-    stationary bootstrap runs on the aligned diff series.
+    Otherwise, the streams are inner-joined on timestamp and a paired stationary
+    bootstrap runs on the aligned diff series.
+
+    ``challenger_overlays_baseline`` says what a leading flat run on the challenger
+    means, and only the caller knows. Against a benchmark it is warmup before the
+    challenger's first signal and the sample starts where both are trading; for a risk
+    overlay against its own carrier it is a position the overlay chose to hold and is
+    the effect being measured, so the sample starts where either has traded. Every pair
+    this notebook builds is the first kind, and it says so rather than relying on a
+    default: see :func:`case_studies.utils.uncertainty.joint_returns`.
     """
     min_n = _min_paired_n(ppy)
     if disjoint_windows:
@@ -1507,8 +1474,14 @@ def _populate_pair(
             }
         c_arr = aligned["ret"].to_numpy()
         b_arr = aligned["ret_b"].to_numpy()
-        c_arr, b_arr = _joint_coerce(c_arr, b_arr)
-        n_overlap = c_arr.size
+        # Measured here, applied once inside `compute_paired_uncertainty`, which trims
+        # whatever it is handed. Handing it the already-trimmed pair silently undoes the
+        # overlay rule: the second trim runs under this function's own default, so an
+        # overlay pair would come back with the benchmark shape and no error. Same
+        # arrangement `paired_metrics._populate_pair` uses, because both write this table.
+        n_overlap = joint_returns(
+            c_arr, b_arr, challenger_overlays_baseline=challenger_overlays_baseline
+        )[0].size
         if n_overlap < min_n:
             return {
                 "cs": cs,
@@ -1525,6 +1498,7 @@ def _populate_pair(
             label=label,
             n_boot=2000,
             seed=42,
+            challenger_overlays_baseline=challenger_overlays_baseline,
         )
 
     if not paired:
@@ -1539,7 +1513,7 @@ def _populate_pair(
     # sizes); use min(n_c, n_b) so n_overlap reflects what the bootstrap
     # actually used, not the pre-coerce min from the populator. For the
     # paired path, paired has no n_c/n_b and n_overlap is already the
-    # post-_joint_coerce length.
+    # post-`joint_returns` length.
     n_actual = n_overlap
     n_c = paired.get("n_c")
     n_b = paired.get("n_b")
@@ -1585,7 +1559,6 @@ for cs, explorer in explorers.items():
     if label_restriction and "label" in cand.columns:
         cand = cand.filter(pl.col("label").is_in(list(label_restriction)))
     cand = _apply_rung_restriction(cand, cs)
-    cand = _apply_carrier_pin(cand, cs)
     if cand.is_empty():
         continue
     cand = cand.sort("sharpe", descending=True).unique(
@@ -1662,6 +1635,9 @@ for cs, explorer in explorers.items():
                 bench_ho_norm,
                 ppy,
                 ho_label,
+                # A strategy against a benchmark, so a flat opening run on the holdout
+                # challenger is warmup before its first signal rather than a held position.
+                challenger_overlays_baseline=False,
                 benchmark_label=bench_ho_label,
             )
         )
@@ -1758,6 +1734,11 @@ for cs, explorer in explorers.items():
                 prev_returns,
                 ppy,
                 leader_label,
+                # `champion_lineage` takes the best backtest at each stage independently, so
+                # two adjacent entries are not demonstrably parent and child and the later
+                # one can carry a genuine warmup. Same position `populate_paired_metrics`
+                # takes on the same transitions, because both write this table.
+                challenger_overlays_baseline=False,
             )
         )
 

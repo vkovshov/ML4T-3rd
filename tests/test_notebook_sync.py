@@ -260,7 +260,13 @@ def test_stamp_records_declared_overrides_as_test_mode(tmp_path, monkeypatch) ->
 
 
 def test_stamped_notebooks_are_current_and_production() -> None:
-    stale, testmode, contradicted, _unverified, _alt_only, hollow = check_all(strict=False)
+    result = check_all(strict=False)
+    stale, testmode, contradicted, hollow = (
+        result.stale,
+        result.testmode,
+        result.contradicted,
+        result.hollow,
+    )
     assert not stale and not testmode and not contradicted and not hollow, (
         "Committed notebooks are out of sync with their source .py:\n"
         + (
@@ -536,23 +542,91 @@ def test_prose_edit_beside_a_computed_alt_is_not_stale(tmp_path, monkeypatch) ->
     assert _drift(tmp_path, monkeypatch, old, new, _notebook([cell]))
 
 
-def test_editing_the_literal_part_of_a_computed_alt_is_stale(tmp_path, monkeypatch) -> None:
-    """A computed alt is not blanked, so its literal parts stay in the compared AST dump."""
-    old = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the leader is {leader}")\n'
-    new = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the winner is {leader}")\n'
-    cell = {
+def _computed_alt_cell(source_alt: str, carried: str) -> dict:
+    return {
         "cell_type": "code",
         "metadata": {},
-        "source": 'fig = build()\nshow_plotly_with_alt(fig, f"the winner is {leader}")\n',
+        "source": f"fig = build()\nshow_plotly_with_alt(fig, {source_alt})\n",
         "outputs": [
             {
                 "output_type": "display_data",
                 "data": {"image/png": "iVBORw0KGgo="},
-                "metadata": {"image/png": {"alt": "the winner is ridge"}},
+                "metadata": {"image/png": {"alt": carried}},
             }
         ],
     }
+
+
+def test_rewording_a_computed_alt_the_output_carries_is_allowed(tmp_path, monkeypatch) -> None:
+    """The case #867 was filed for.
+
+    Writing alt text against computed values is what stops a description drifting from
+    its figure, and it used to cost a full re-execution to reword: the f-string was left
+    whole in the compared dump, so any edit read as stale. The same reword to a plain
+    literal next door was accepted as a diff.
+
+    The bargain is the same as the literal branch's: accepted only because the output
+    metadata carries the reworded text too.
+    """
+    old = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the leader is {leader}")\n'
+    new = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the winner is {leader}")\n'
+    cell = _computed_alt_cell('f"the winner is {leader}"', "the winner is ridge")
+
+    assert _drift(tmp_path, monkeypatch, old, new, _notebook([cell]))
+
+
+def test_rewording_a_computed_alt_the_output_does_not_carry_is_stale(tmp_path, monkeypatch) -> None:
+    """Editing the .py and leaving the executed alt saying the old thing is stale.
+
+    Without this the loosening would forgive a notebook whose figure description and
+    whose source disagree, which is the state the whole gate exists to refuse.
+    """
+    old = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the leader is {leader}")\n'
+    new = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the winner is {leader}")\n'
+    cell = _computed_alt_cell('f"the winner is {leader}"', "the leader is ridge")
+
     assert not _drift(tmp_path, monkeypatch, old, new, _notebook([cell]))
+
+
+def test_changing_what_a_computed_alt_reads_is_stale(tmp_path, monkeypatch) -> None:
+    """Only the prose is forgiven; the interpolated expressions are not.
+
+    `{leader}` to `{runner_up}` changes what the alt asserts about the data, so it has
+    to force the re-run - and it does, because the expression parts stay in the dump.
+    """
+    old = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the winner is {leader}")\n'
+    new = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the winner is {runner_up}")\n'
+    cell = _computed_alt_cell('f"the winner is {runner_up}"', "the winner is ridge")
+
+    assert not _drift(tmp_path, monkeypatch, old, new, _notebook([cell]))
+
+
+def test_an_implicit_concatenation_of_a_literal_and_an_f_string_is_handled(
+    tmp_path, monkeypatch
+) -> None:
+    """The shape that broke the first attempt at this.
+
+    `"Boosting curve, " f"{n} below zero"` is one JoinedStr whose first constant is a
+    whole quoted literal and whose last is bare prose between the braces. Blanking them
+    textually needs a different placeholder for each, and guessing wrong writes source
+    that does not parse - which does not fail loudly, it makes the exception
+    unavailable for the notebook and reports it as stale. Eight notebooks in the tree
+    have this shape.
+    """
+    old = (
+        "# %%\nfig = build()\nshow_plotly_with_alt(\n    fig,\n"
+        '    "Boosting curve, "\n    f"{n} lines below zero.",\n)\n'
+    )
+    new = (
+        "# %%\nfig = build()\nshow_plotly_with_alt(\n    fig,\n"
+        '    "Boosting curves, "\n    f"{n} lines below zero.",\n)\n'
+    )
+    cell = _computed_alt_cell(
+        '"Boosting curves, " f"{n} lines below zero."',
+        "Boosting curves, 3 lines below zero.",
+    )
+
+    assert _drift(tmp_path, monkeypatch, old, new, _notebook([cell]))
 
 
 def test_a_computed_alt_the_output_does_not_carry_is_stale(tmp_path, monkeypatch) -> None:
@@ -610,6 +684,92 @@ def test_the_paired_py_selects_its_notebook() -> None:
 def test_an_empty_restriction_still_scans_everything() -> None:
     """`only=None` is the whole tree, which is what CI calls and must not change."""
     assert check_all(only=None) == check_all()
+
+
+def test_check_reports_and_fails_a_stamp_over_an_empty_output_set(tmp_path, monkeypatch) -> None:
+    """The corpus assertion above passes vacuously if the detection is broken.
+
+    `test_every_committed_notebook_is_its_current_py` asserts `not result.hollow` over the
+    real tree, which is exactly as green when nothing is hollow as when nothing can be
+    seen. ml4t/agent-workspace#301 is the failure that motivates it: two notebooks carried
+    `production: True` over zero outputs and `check` reported clean, because the gate that
+    exists to catch a render claiming a run it never made was not looking at the outputs.
+
+    So this builds that render deliberately and asserts both halves - the category names
+    it, and the CLI exits non-zero on it.
+    """
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    monkeypatch.setattr(notebook_provenance, "REPO_ROOT", tmp_path)
+    py = tmp_path / "nb.py"
+    py.write_text("# %%\nprint(1)\n", encoding="utf-8")
+    nb = tmp_path / "nb.ipynb"
+    nb.write_text(
+        json.dumps(
+            _notebook(
+                [_code("print(1)")],
+                metadata={
+                    notebook_provenance.STAMP_KEY: {
+                        "production": True,
+                        "parameters": {},
+                        "source_py_blob": notebook_provenance.git_blob(py),
+                        "outputs_digest": notebook_provenance.outputs_digest(
+                            _notebook([_code("print(1)")])
+                        ),
+                        "library_digest": notebook_provenance.library_digest(py),
+                    }
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(notebook_provenance, "iter_notebooks", lambda: [nb])
+
+    result = check_all()
+    assert result.hollow == ["nb.ipynb"], result
+    assert not result.stale and not result.testmode, result
+
+    args = __import__("argparse").Namespace(paths=[], strict=False, since=None, no_merge_base=False)
+    assert notebook_provenance._cmd_check(args) == 1
+
+
+def test_check_passes_the_same_notebook_once_it_has_an_output(tmp_path, monkeypatch) -> None:
+    """The control for the test above: only the empty output set makes it fail.
+
+    Without it, a `hollow` that fired on every stamped notebook would still turn that
+    test green while blocking the whole corpus.
+    """
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    monkeypatch.setattr(notebook_provenance, "REPO_ROOT", tmp_path)
+    py = tmp_path / "nb.py"
+    py.write_text("# %%\nprint(1)\n", encoding="utf-8")
+    executed = _notebook([_code("print(1)", [_stdout("1")])])
+    nb = tmp_path / "nb.ipynb"
+    nb.write_text(
+        json.dumps(
+            _notebook(
+                [_code("print(1)", [_stdout("1")])],
+                metadata={
+                    notebook_provenance.STAMP_KEY: {
+                        "production": True,
+                        "parameters": {},
+                        "source_py_blob": notebook_provenance.git_blob(py),
+                        "outputs_digest": notebook_provenance.outputs_digest(executed),
+                        "library_digest": notebook_provenance.library_digest(py),
+                    }
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(notebook_provenance, "iter_notebooks", lambda: [nb])
+
+    result = check_all()
+    assert not result.hollow, result
+    assert not result.stale and not result.outputs_changed, result
 
 
 # -----------------------------------------------------------------------------
@@ -748,3 +908,174 @@ def test_stamp_accepts_a_notebook_whose_cells_only_have_execution_counts(
     nb = tmp_path / "nb.ipynb"
     nb.write_text(json.dumps(_notebook([cell])), encoding="utf-8")
     assert stamp_notebook(nb, "local-uv", parameters={})["production"] is True
+
+
+# --- The merge gate's scope: what a change is answerable for ------------------
+#
+# `check --since <base>` is what CI runs, so these cover the diff parse the scope is
+# built from. They use a real git repo because the mechanism *is* a `git diff`
+# invocation - rename detection, -z quoting and --diff-filter are the behaviour under
+# test, and a mocked diff would only assert that the mock returns what it was told to.
+
+
+def _git(repo: Path, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout
+
+
+def _repo_with_a_paired_notebook(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    (repo / "chapter").mkdir(parents=True)
+    _git(repo.parent, "init", "-q", str(repo))
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    (repo / "chapter" / "demo.py").write_text("# %%\nX = 1\n")
+    (repo / "chapter" / "demo.ipynb").write_text(json.dumps({"cells": [], "metadata": {}}))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "paired notebook")
+    _git(repo, "branch", "-M", "main")
+    _git(repo, "checkout", "-qb", "topic")
+    return repo
+
+
+def test_deleting_the_source_and_keeping_the_notebook_is_reported(tmp_path, monkeypatch) -> None:
+    """check_all cannot see this by construction.
+
+    Its ``paired_py() is None`` branch cannot tell a notebook that was just orphaned
+    from one that was never paired, and tracked notebooks are deliberately unpaired,
+    so the distinction has to come from the diff.
+    """
+    repo = _repo_with_a_paired_notebook(tmp_path)
+    _git(repo, "rm", "-q", "chapter/demo.py")
+    _git(repo, "commit", "-qm", "drop the source, keep the render")
+    monkeypatch.setattr(notebook_provenance, "REPO_ROOT", repo)
+
+    orphaned = notebook_provenance.notebooks_orphaned_since("main")
+
+    assert len(orphaned) == 1
+    assert "chapter/demo.ipynb" in orphaned[0]
+    assert "chapter/demo.py" in orphaned[0]
+
+
+def test_moving_the_source_leaves_the_notebook_orphaned(tmp_path, monkeypatch) -> None:
+    """The case --no-renames exists for.
+
+    With rename detection on, git reports only the destination and the notebook
+    rendered from the old path goes unmentioned.
+    """
+    repo = _repo_with_a_paired_notebook(tmp_path)
+    _git(repo, "mv", "chapter/demo.py", "chapter/renamed.py")
+    _git(repo, "commit", "-qm", "move the source out from under the notebook")
+    monkeypatch.setattr(notebook_provenance, "REPO_ROOT", repo)
+
+    orphaned = notebook_provenance.notebooks_orphaned_since("main")
+
+    assert len(orphaned) == 1
+    assert "chapter/demo.ipynb" in orphaned[0]
+
+
+def test_deleting_both_halves_is_not_an_orphan(tmp_path, monkeypatch) -> None:
+    """Retiring a notebook properly must stay merge-able."""
+    repo = _repo_with_a_paired_notebook(tmp_path)
+    _git(repo, "rm", "-q", "chapter/demo.py", "chapter/demo.ipynb")
+    _git(repo, "commit", "-qm", "retire the notebook")
+    monkeypatch.setattr(notebook_provenance, "REPO_ROOT", repo)
+
+    assert notebook_provenance.notebooks_orphaned_since("main") == []
+
+
+def test_editing_a_paired_notebook_is_not_an_orphan(tmp_path, monkeypatch) -> None:
+    repo = _repo_with_a_paired_notebook(tmp_path)
+    (repo / "chapter" / "demo.py").write_text("# %%\nX = 2\n")
+    _git(repo, "commit", "-qam", "ordinary edit")
+    monkeypatch.setattr(notebook_provenance, "REPO_ROOT", repo)
+
+    assert notebook_provenance.notebooks_orphaned_since("main") == []
+
+
+def test_a_notebook_name_with_a_space_survives_the_diff_parse(tmp_path, monkeypatch) -> None:
+    """git quotes such a path under plain --name-only.
+
+    Splitting on whitespace then tears it into fragments matching no suffix - the
+    notebook leaves the gate's scope and passes unchecked, which is the one thing a
+    gate must never do.
+    """
+    repo = _repo_with_a_paired_notebook(tmp_path)
+    (repo / "chapter" / "my demo.py").write_text("# %%\nX = 1\n")
+    (repo / "chapter" / "my demo.ipynb").write_text(json.dumps({"cells": [], "metadata": {}}))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "a notebook with a space in its name")
+    monkeypatch.setattr(notebook_provenance, "REPO_ROOT", repo)
+
+    changed = [
+        str(p.relative_to(repo)) for p in notebook_provenance.notebooks_changed_since("main")
+    ]
+
+    assert "chapter/my demo.ipynb" in changed
+
+
+def test_editing_the_paired_py_puts_the_notebook_in_scope(tmp_path, monkeypatch) -> None:
+    """Changing the .py is exactly what makes the rendered notebook stale."""
+    repo = _repo_with_a_paired_notebook(tmp_path)
+    (repo / "chapter" / "demo.py").write_text("# %%\nX = 2\n")
+    _git(repo, "commit", "-qam", "edit the source only")
+    monkeypatch.setattr(notebook_provenance, "REPO_ROOT", repo)
+
+    changed = [
+        str(p.relative_to(repo)) for p in notebook_provenance.notebooks_changed_since("main")
+    ]
+
+    assert changed == ["chapter/demo.ipynb"]
+
+
+def test_a_notebook_nobody_touched_is_out_of_scope(tmp_path, monkeypatch) -> None:
+    """The whole point of scoping: one stale notebook elsewhere is somebody else's."""
+    repo = _repo_with_a_paired_notebook(tmp_path)
+    (repo / "unrelated.txt").write_text("hello\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "touch nothing paired")
+    monkeypatch.setattr(notebook_provenance, "REPO_ROOT", repo)
+
+    assert notebook_provenance.notebooks_changed_since("main") == []
+    assert notebook_provenance.notebooks_orphaned_since("main") == []
+
+
+def test_a_force_push_reverting_a_notebook_is_seen_only_against_the_previous_tip(
+    tmp_path, monkeypatch
+) -> None:
+    """The case ``--no-merge-base`` exists for.
+
+    A pull request asks what a branch adds on top of its base, so it diffs the merge
+    base. A push asks what the published tree *becomes*, and a force-push can revert a
+    notebook relative to the tip it replaces without the merge base ever seeing it: the
+    merge base of the new tip and the old one is their common ancestor, where the revert
+    has not happened yet.
+    """
+    repo = _repo_with_a_paired_notebook(tmp_path)
+    _git(repo, "checkout", "-q", "main")
+    fork = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "chapter" / "demo.py").write_text("# %%\nX = 2\n")
+    _git(repo, "commit", "-qam", "the edit that was published")
+    previous_tip = _git(repo, "rev-parse", "HEAD").strip()
+
+    # The force-push: main is rewound past the edit and re-grown, so the new tip does
+    # not descend from the old one and carries demo.py back at X = 1.
+    _git(repo, "reset", "-q", "--hard", fork)
+    (repo / "unrelated.txt").write_text("hello\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "rewrite main without the edit")
+    monkeypatch.setattr(notebook_provenance, "REPO_ROOT", repo)
+
+    merge_base_scope = [
+        str(p.relative_to(repo)) for p in notebook_provenance.notebooks_changed_since(previous_tip)
+    ]
+    assert merge_base_scope == [], "the revert is invisible from the common ancestor"
+
+    against_the_tip = [
+        str(p.relative_to(repo))
+        for p in notebook_provenance.notebooks_changed_since(previous_tip, merge_base=False)
+    ]
+    assert against_the_tip == ["chapter/demo.ipynb"]

@@ -27,6 +27,7 @@ from case_studies.research import (
     StateTransitionPolicy,
     Study,
     plan_backtests,
+    require_resolved_requests_cover_the_catalog,
     run_backtests,
     run_models,
 )
@@ -139,11 +140,10 @@ def open_study(
     """
     if execution_tier == "canonical":
         if workspace is None:
-            return Study.regenerate(CASE_STUDY, release_root=REPO_ROOT, entry_point=entry_point)
+            return Study.regenerate(CASE_STUDY, entry_point=entry_point)
         return Study.open(
             CASE_STUDY,
             workspace=Path(workspace).expanduser().resolve(),
-            release_root=REPO_ROOT,
             entry_point=entry_point,
         )
     if execution_tier != "preview":
@@ -155,7 +155,6 @@ def open_study(
         return Study.open(
             CASE_STUDY,
             workspace=workspace,
-            release_root=REPO_ROOT,
             entry_point=entry_point,
             execution_tier=ExecutionTier.PREVIEW,
         )
@@ -199,6 +198,11 @@ def model_request_catalog(
 ) -> pl.DataFrame:
     """Return the declared model population as visible Polars rows."""
     selected = set(config_names) if config_names is not None else None
+    if selected is not None and not selected:
+        # An empty selection is the caller's, so say so. Falling through left every row filtered
+        # out and the function reported "no declared requests for <family>", blaming the family's
+        # menu for a list the caller passed empty.
+        raise ValueError("config_names is empty; omit it to request every declared configuration")
     rows = []
     missing_by_label = {}
     for label in labels:
@@ -300,6 +304,7 @@ def run_official_model_catalog(
         resolved = resolve_model_requests(study, request_catalog, execution_tier="canonical")
     if any(request.spec["execution_tier"] != "canonical" for request in resolved):
         raise ValueError("official model populations require canonical requests")
+    require_resolved_requests_cover_the_catalog(request_catalog, resolved)
     expected = expected_prediction_hashes(resolved)
     population = OfficialPopulation.create(
         study,
@@ -805,6 +810,7 @@ def run_official_backtest_requests(
     requests: pl.DataFrame,
     *,
     population_name: str | None,
+    supersedes: str | None = None,
 ) -> FuturesBacktestExecution:
     """Resolve, snapshot, and execute visible futures strategy requests.
 
@@ -813,6 +819,13 @@ def run_official_backtest_requests(
     results are refused entry to an official population, and the workspace holding them is
     discarded afterwards. Everything else - the expected-identity snapshot before the engine
     runs, the order check, the per-request completeness - applies to both tiers.
+
+    ``supersedes`` names the generation of ``population_name`` this run retires. Anything that
+    moves a backtest identity - a corrected label, a changed accounting field, a re-run after a
+    registry reset - produces a different member list under the same name, and
+    ``OfficialPopulation.create`` refuses to write it without being told which snapshot it
+    replaces. The notebooks declare it as a parameter, so the sweep can be re-run without
+    editing this module.
     """
     required = {"request_name", "prediction_hash", "label", "signal"}
     missing = required - set(requests.columns)
@@ -884,6 +897,7 @@ def run_official_backtest_requests(
             name=population_name,
             member_kind="backtest",
             members=expected,
+            supersedes=supersedes,
         )
         if population_name is not None
         else None
@@ -1089,14 +1103,40 @@ def rank_by_validation_sharpe(
     The same rule `CandidateSet._ranked_validation_hashes` applies, so a preview ranking and a
     canonical one differ in which rows they see and in nothing else. A member with no Sharpe is
     refused rather than sorted to an end, which is what a null would otherwise do silently.
+
+    Unless it is bankrupt. A null Sharpe used to mean exactly one thing - the run was not
+    measured - and refusing was the whole of the right answer. Since ml4t/agent-workspace#920
+    it means two, because a path whose equity reaches zero stops compounding and registers
+    `sharpe`, `sortino`, `calmar`, `omega`, `stability` and `tail_ratio` as null on purpose:
+    ranking a bankrupt path is the thing that issue exists to prevent. The `ruin` column is what
+    separates the two, so this reads it rather than testing the Sharpe alone:
+
+    * ``ruin = 1.0`` - bankrupt. It sorts last, ahead of nothing, and is never selected. It does
+      not disqualify the set, because a sweep that produced one bankrupt member and eleven
+      solvent ones has a perfectly good ranking of the eleven.
+    * null Sharpe, no ruin flag - not measured. Refused, as before.
+
+    Sorting last rather than dropping is what `strategy_analysis.rank_returns_on_common_support`
+    already does for the same condition, so a reader comparing the two sees one rule.
+
+    A registry written before #920 has no `ruin` column at all, which is not the same as no
+    bankrupt member; there the check falls back to the null test that was the whole rule then.
     """
     members = {result.hash: result for result in results}
     if not members:
         raise ValueError("ranking by validation Sharpe requires at least one result")
+    table = study.backtests.table(include_preview=True)
+    ruined = (
+        (pl.col("ruin") == 1.0).fill_null(False) if "ruin" in table.columns else pl.lit(False)  # noqa: FBT003
+    )
     rows = (
-        study.backtests.table(include_preview=True)
-        .filter(pl.col("backtest_hash").is_in(list(members)) & pl.col("sharpe").is_not_null())
-        .sort("sharpe", "backtest_hash", descending=[True, False])
+        table.filter(
+            pl.col("backtest_hash").is_in(list(members)) & (pl.col("sharpe").is_not_null() | ruined)
+        )
+        .with_columns(ruined.alias("_ruined"))
+        .sort(
+            "_ruined", "sharpe", "backtest_hash", descending=[False, True, False], nulls_last=True
+        )
     )
     if rows.height != len(members):
         raise ValueError("a result being ranked has no validation Sharpe recorded")
@@ -1165,11 +1205,28 @@ def shortlist_signal_configurations(
     return tuple(selected)
 
 
+def _union_members(study: Study, *pools: Iterable[str]) -> list[Result]:
+    """The distinct results across several stage pools, in first-seen order.
+
+    A backtest is identified by its prediction and its strategy spec, and the funnel stage is
+    not part of either. So two stages register one row whenever the later stage changed nothing
+    about a configuration - an allocation that resolves to the same spec the signal stage
+    already ran is exactly that - and the stages' pools then overlap. `CandidateSet.create`
+    refuses a repeated member, so concatenating the pools produced a union that raised precisely
+    when two stages agreed, which is the case the union exists to describe.
+    """
+    seen: dict[str, None] = {}
+    for pool in pools:
+        for value in pool:
+            seen.setdefault(value, None)
+    return [Result.open(study, value) for value in seen]
+
+
 def pre_overlay_candidate_set(study: Study, *, label: str) -> CandidateSet:
     """Return the immutable union of signal and allocation validation results."""
     signal = CandidateSet.one(study, name=candidate_set_name("signal", label))
     allocation = CandidateSet.one(study, name=candidate_set_name("allocation", label))
-    members = [Result.open(study, value) for value in (*signal.members, *allocation.members)]
+    members = _union_members(study, signal.members, allocation.members)
     return _create_comparable_set(study, candidate_set_name("pre-overlay", label), members)
 
 
@@ -1177,7 +1234,7 @@ def final_validation_candidate_set(study: Study, *, label: str) -> CandidateSet:
     """Return the selection pool across signal, allocation, and risk-overlay stages."""
     pre_overlay = pre_overlay_candidate_set(study, label=label)
     risk = CandidateSet.one(study, name=candidate_set_name("risk", label))
-    members = [Result.open(study, value) for value in (*pre_overlay.members, *risk.members)]
+    members = _union_members(study, pre_overlay.members, risk.members)
     return _create_comparable_set(study, candidate_set_name("final-validation", label), members)
 
 

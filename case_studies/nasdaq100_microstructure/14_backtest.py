@@ -42,11 +42,8 @@
 
 import sqlite3
 import time
-import warnings
 
 import polars as pl
-
-warnings.filterwarnings("ignore")
 
 from case_studies.research import prediction_rows_at, superseded_members_at
 from case_studies.utils.backtest_loaders import get_backtest_config, load_backtest_prices_for
@@ -144,6 +141,9 @@ strategy_spec = build_backtest_spec(
     prediction_hash="plumbing_test",
     initial_cash=bt_config.initial_cash,
     chapter="ch16",
+    # The cadence is per-label here (setup.yaml::decision.cadence_by_label), so a spec
+    # built without one would be built against a default no run uses.
+    label=LABEL,
     signal={
         "method": "score_weighted_top_k",
         "top_k": TOP_K,
@@ -230,10 +230,9 @@ if pred_index.is_empty():
 # reports every backtest completed and zero failed, off a population that resolves empty.
 # That is not a late failure, it is a loud success on the wrong rows, and it costs the
 # full sweep to discover.
-# `complete` is the whole test: `catalog.py:309` already requires `identity_status ==
-# "current"` before a row can be complete, and the tier is decided by which registry the
-# rows were read from, not by a column comparison. Re-asserting either here would reject a
-# preview run's own rows - the mistake `8fc28044` fixed on the registry path.
+# `complete` is the whole test: the catalog already requires a current identity before a row
+# can be complete, and the tier is decided by which registry the rows were read from, not by
+# a column comparison. Re-asserting either here would reject a preview run's own rows.
 # The catalog is read off `CASE_DIR`, the directory `load_prediction_index` just read, and
 # not by opening a `Study`: every `Study.open` branch ends in `activate()`, which would both
 # answer for a different registry than the one being filtered and re-point the rest of the
@@ -347,6 +346,7 @@ for i, pred_row in enumerate(pred_index.iter_rows(named=True)):
             prediction_hash=pred_hash,
             initial_cash=bt_config.initial_cash,
             chapter="ch16",
+            label=LABEL,
             signal=signal,
         )
         backtest_hash = backtest_hash_from_parts(pred_hash, serializable_backtest_spec(spec))

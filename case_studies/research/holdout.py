@@ -46,7 +46,7 @@ def widest_label_buffer(case_study: str, setup: Mapping[str, Any]) -> tuple[str,
     :func:`utils.artifact_specs.resolve_label_buffer`, so a label carrying its own spec
     artifact still wins over the setup block.
     """
-    from utils.artifact_specs import resolve_label_buffer
+    from utils.artifact_specs import resolve_label_buffer, resolve_label_buffer_unit
     from utils.cv_splits import normalize_label_buffer
 
     labels = setup.get("labels") or {}
@@ -56,13 +56,31 @@ def widest_label_buffer(case_study: str, setup: Mapping[str, Any]) -> tuple[str,
         raise ValueError(f"{case_study} declares no labels, so no holdout buffer can be derived")
 
     widest: tuple[pd.Timedelta, str, str] | None = None
+    units: dict[str, str] = {}
     for name in names:
         buffer = resolve_label_buffer(case_study, name, setup)
         if not buffer:
             continue
+        units[name] = resolve_label_buffer_unit(case_study, name, setup)
         span = pd.Timedelta(normalize_label_buffer(buffer))
         if widest is None or span > widest[0]:
             widest = (span, str(buffer), name)
+    # "Widest" is decided by comparing the declared durations as timedeltas, which only
+    # answers the question when every label counts the same thing. 21 sessions and 21
+    # calendar days are not the same span, and reading both as timedeltas ranks them
+    # equal, so a mixed declaration would seal the holdout on whichever label happened to
+    # sort first. Refuse rather than pick: no case study declares a mix today, and the
+    # fix when one does is to compare on a common axis, not to keep guessing.
+    if len(set(units.values())) > 1:
+        by_unit = {
+            unit: sorted(n for n, u in units.items() if u == unit) for unit in set(units.values())
+        }
+        raise ValueError(
+            f"{case_study} declares buffers in more than one unit ({by_unit}), and the "
+            "widest buffer is chosen by comparing them as durations, which a session "
+            "count and a calendar span cannot be compared as. Declare one unit for the "
+            "case study, or give the holdout seal an explicit buffer."
+        )
     if widest is None:
         raise ValueError(
             f"{case_study} declares labels {names} and a buffer for none of them, so the gap "
@@ -122,11 +140,11 @@ def build_holdout_cv(
     :func:`case_studies.research.models.locked_holdout_split` checks it again at execution.
 
     The training interval is the whole history available before that window, which is
-    ``min(train_start)`` across the validation folds and never one fold's own start: the fold
-    list runs newest first, so ``folds[0]["train_start"]`` is the *latest* start in the set and
-    would hand the retrain the shortest window it could have had rather than the longest.
-    :func:`utils.cv_splits.earliest_train_start` is that read, and this calls it rather than
-    repeating it.
+    ``min(train_start)`` across the validation folds and never one fold's own start.
+    :func:`utils.cv_splits.earliest_train_start` reads it from the windows, and this calls
+    it rather than repeating it - a read that stays correct across the fold-order change in
+    ml4t-diagnostic 0.1.4, where indexing the list would have silently changed which fold it
+    landed on.
 
     ``train_start_floor`` bounds that below, and exists because "the whole history available"
     is a claim about the FEATURES, not about the calendar. A configuration fitted on fold-scoped

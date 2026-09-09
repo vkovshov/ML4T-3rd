@@ -62,7 +62,7 @@ import warnings
 import plotly.graph_objects as go
 import polars as pl
 
-from case_studies.research import open_study, split_unpublished_members
+from case_studies.research import open_study, reuse_disclosure, split_unpublished_members
 from case_studies.utils.backtest_explorer import BacktestExplorer
 from case_studies.utils.backtest_loaders import (
     VECTORIZED_CASE_STUDIES,
@@ -101,7 +101,8 @@ MAX_RISK_VARIANTS = 0
 # None defers to the case study's configured count; an int caps it.
 TOP_N_COMBOS = None
 # Both names stay bound here although nothing below reads them: that is what makes the harness
-# force preview and supply a workspace (`tests/pm_helpers.py:954`). Without them the canonical
+# force preview and supply a workspace - `_declares_tier_and_workspace` in `tests/pm_helpers.py`
+# looks for exactly this pair. Without them the canonical
 # branch regenerates in place, which needs symlinks a CI checkout does not have.
 EXECUTION_TIER = "canonical"
 WORKSPACE: str = ""
@@ -344,7 +345,7 @@ for index, combo_row in enumerate(top_combos.iter_rows(named=True)):
 
 print(
     f"\nRisk sweep in {(time.monotonic() - sweep_start) / 60:.1f} minutes: "
-    f"{n_done - served} computed, {served} served from the registry, {len(failures)} failed"
+    f"{reuse_disclosure(n_done - served, served, len(failures))}"
 )
 if failures:
     failure_frame = pl.DataFrame(failures)

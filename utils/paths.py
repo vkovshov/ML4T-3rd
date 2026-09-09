@@ -39,6 +39,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent.resolve()
 
+# The same root without following symlinks. A `--case-study` worktree wires its
+# heavy state (`run_log/`, `features/`, `labels/`) in by symlink, so a path that
+# lives inside the repo through one of those links resolves to the canonical
+# artifact store outside it. Relativizing has to be tried against the path as
+# written before anything is resolved.
+_REPO_ROOT_AS_WRITTEN = Path(os.path.abspath(Path(__file__).parent.parent))
+
 # =============================================================================
 # Chapter Registry (Single Source of Truth)
 # =============================================================================
@@ -125,24 +132,36 @@ def display_path(path: Path | str) -> str:
 
     Use in `print(...)` statements inside notebooks so the committed cell
     output never bakes in machine-specific absolute paths (e.g. `/home/<user>/...`).
-    """
-    p = Path(path).resolve()
-    try:
-        return str(p.relative_to(REPO_ROOT))
-    except ValueError:
-        pass
 
-    if p.is_absolute():
-        for variable in ("ML4T_CHAPTER_OUTPUT_DIR", "ML4T_OUTPUT_DIR", "ML4T_DATA_PATH"):
-            configured_root = os.environ.get(variable)
-            if not configured_root:
-                continue
+    A path inside the repository stays relative even when it is reached through a
+    symlink, which is the normal state of a `new-worktree.sh --case-study`
+    worktree: `run_log/`, `features/` and `labels/` are links into
+    `~/ml4t/artifacts/`, so resolving first would relativize against the wrong
+    root and print the absolute store path.
+    """
+    as_written = Path(os.path.abspath(path))
+    resolved = as_written.resolve()
+
+    for candidate in (as_written, resolved):
+        for root in (_REPO_ROOT_AS_WRITTEN, REPO_ROOT):
             try:
-                relative = p.relative_to(Path(configured_root).expanduser().resolve())
+                return str(candidate.relative_to(root))
             except ValueError:
                 continue
-            return str(Path(f"<{variable}>") / relative)
-    return str(p)
+
+    for variable in ("ML4T_CHAPTER_OUTPUT_DIR", "ML4T_OUTPUT_DIR", "ML4T_DATA_PATH"):
+        configured_root = os.environ.get(variable)
+        if not configured_root:
+            continue
+        configured = Path(configured_root).expanduser()
+        for candidate in (as_written, resolved):
+            for root in (Path(os.path.abspath(configured)), configured.resolve()):
+                try:
+                    relative = candidate.relative_to(root)
+                except ValueError:
+                    continue
+                return str(Path(f"<{variable}>") / relative)
+    return str(resolved)
 
 
 def get_chapter_dir(chapter: int | str) -> Path:
@@ -239,6 +258,37 @@ def get_output_dir(
         output_dir.mkdir(parents=True, exist_ok=True)
 
     return output_dir
+
+
+def require_chapter_inputs(inputs: dict[Path, str]) -> None:
+    """Refuse to continue when an input an earlier notebook produces is absent.
+
+    Chapter outputs are gitignored (`.gitignore`: `*/output/`), so a fresh clone or a
+    fresh worktree has none of them. A notebook that substitutes defaults instead runs
+    to completion, reports no error, and writes a page with no figures on it - the
+    provenance stamp applies and the commit hooks pass, so the empty page is
+    committable. Raising here is what turns that into a stop.
+
+    Args:
+        inputs: Each required path mapped to the notebook stem that produces it.
+
+    Raises:
+        FileNotFoundError: Naming every missing path and the notebook to run for it.
+    """
+    missing = [(path, producer) for path, producer in inputs.items() if not path.exists()]
+    if not missing:
+        return
+
+    print("\n  Missing inputs produced by earlier notebooks in this chapter:\n")
+    for path, producer in missing:
+        print(f"    {display_path(path)}  (run {producer} first)")
+    print("\n  These are chapter outputs, which are gitignored, so a fresh clone or")
+    print("  worktree has none of them until the producing notebooks have run.\n")
+
+    raise FileNotFoundError(
+        "Missing chapter inputs: "
+        + ", ".join(f"{display_path(path)} (from {producer})" for path, producer in missing)
+    )
 
 
 def get_case_study_source_dir(strategy_id: str) -> Path:

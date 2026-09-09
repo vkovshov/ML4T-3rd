@@ -29,6 +29,38 @@ if TYPE_CHECKING:
 _ACTIVE_OUTPUT_ROOT: Path | None = None
 
 
+def default_release_root() -> Path:
+    """The released tree a study reads when its caller names none.
+
+    ``REPO_ROOT`` for a reader and for production, and that is the whole answer for a
+    clean checkout, where ``case_studies/<case study>/run_log`` does not exist.
+
+    ``ML4T_RELEASE_ROOT`` overrides it, and the test harness is what sets it. In a
+    maintainer worktree that same path is a symlink into ``~/ml4t/artifacts``, so a
+    harness run resolving its canonical reads through ``REPO_ROOT`` overlays the
+    machine's published catalog onto an isolated workspace - measured on a freshly
+    seeded fx_pairs fixture as 749 catalog rows where the workspace held 23 - while a CI
+    runner, which has no such symlink, reads the seeded 23 and nothing else. Same code,
+    different rows, and the environment where the suite is actually exercised before a
+    push is the one that is not hermetic: a local pass is then not evidence of a CI pass
+    and a local failure is not evidence of a CI failure.
+
+    Pointing this at a checkout-shaped tree is what makes the two agree. It is not a
+    change to what "canonical" means - the released catalog is still overlaid onto a
+    workspace, which is the contract ``test_workspace_overlay_restarts_without_copying_release_run_log``
+    pins - only to which released tree an unqualified caller gets.
+    """
+    named = os.environ.get("ML4T_RELEASE_ROOT")
+    return Path(named).expanduser().resolve() if named else REPO_ROOT
+
+
+def _resolve_release_root(named: str | Path | None) -> Path:
+    """An explicit release root wins over the environment, which wins over REPO_ROOT."""
+    if named is None:
+        return default_release_root()
+    return Path(named).expanduser().resolve()
+
+
 def _release_manifest_digest(case_dir: Path) -> str:
     release_manifest = case_dir / "run_log" / ".release" / "SHA256SUMS"
     if release_manifest.exists():
@@ -196,12 +228,12 @@ class Study:
         case_study: str,
         workspace: str | Path | None = None,
         *,
-        release_root: str | Path = REPO_ROOT,
+        release_root: str | Path | None = None,
         entry_point: str | None = None,
         execution_tier: str | ExecutionTier = ExecutionTier.CANONICAL,
     ) -> Study:
         execution_tier = ExecutionTier(execution_tier)
-        release_root = Path(release_root).expanduser().resolve()
+        release_root = _resolve_release_root(release_root)
         release_case_dir = release_root / "case_studies" / case_study
         if not release_case_dir.is_dir():
             raise FileNotFoundError(f"Unknown released case study: {release_case_dir}")
@@ -288,11 +320,11 @@ class Study:
         cls,
         case_study: str,
         *,
-        release_root: str | Path = REPO_ROOT,
+        release_root: str | Path | None = None,
         entry_point: str | None = None,
     ) -> Study:
         """Open the canonical generated-artifact links for maintainer regeneration."""
-        release_root = Path(release_root).expanduser().resolve()
+        release_root = _resolve_release_root(release_root)
         case_dir = release_root / "case_studies" / case_study
         if not case_dir.is_dir():
             raise FileNotFoundError(f"Unknown released case study: {case_dir}")
@@ -357,7 +389,14 @@ class Study:
             shared_config = base_output_root / "config"
             if shared_config.exists():
                 _ensure_config_link(output_root / "config", shared_config)
-            for name in ("labels", "features"):
+            # `benchmark` joins labels and features because it is the same kind of thing: a
+            # committed, read-only input that no stage-06-and-later notebook writes. All nine
+            # case studies ship one. Without it `benchmark_dir` resolves into the preview root,
+            # `load_benchmark_metrics` returns None and `load_benchmark_returns` an empty frame,
+            # and `20_strategy_analysis` dies comparing the selected strategy against a baseline
+            # that is on disk a directory away. Linking it is what lets that notebook have a
+            # smoke run at all rather than a structural exemption.
+            for name in ("labels", "features", "benchmark"):
                 source = self.root / name
                 if source.exists():
                     _ensure_input_link(preview_case, source)
@@ -446,12 +485,32 @@ class Study:
         return CausalRequest.from_request(self, request)
 
 
+def _resolve_preview_workspace(workspace: str | Path) -> Path:
+    """Place a relative preview workspace outside the checkout.
+
+    A preview writes a registry, a `config` symlink and a `.preview/` tree under whatever it is
+    given. Notebooks run from the repo root, so resolving a bare name against the caller's cwd
+    puts all of that in the repo root: five absolute symlinks and a 268K registry reached a
+    branch that way on 2026-09-06. An absolute path is the caller's own choice and is taken as
+    given; a relative one is resolved against a root that is not the repository, so no
+    `.gitignore` rule has to be load-bearing for it.
+    """
+    path = Path(workspace).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    declared = os.environ.get("ML4T_PREVIEW_ROOT")
+    base = (
+        Path(declared).expanduser() if declared else Path.home() / "ml4t" / "artifacts" / "preview"
+    )
+    return (base / path).resolve()
+
+
 def open_study(
     case_study: str,
     *,
     execution_tier: str | ExecutionTier = ExecutionTier.CANONICAL,
     workspace: str | Path | None = None,
-    release_root: str | Path = REPO_ROOT,
+    release_root: str | Path | None = None,
     entry_point: str | None = None,
 ) -> Study:
     """Open the study a notebook should execute against for its tier.
@@ -463,7 +522,7 @@ def open_study(
     ``workspace``, and must declare the reductions that make it cheap.
     """
     tier = ExecutionTier(execution_tier)
-    release_root = Path(release_root).expanduser().resolve()
+    release_root = _resolve_release_root(release_root)
     if tier is ExecutionTier.CANONICAL:
         if workspace is None:
             return Study.regenerate(case_study, release_root=release_root, entry_point=entry_point)
@@ -476,10 +535,25 @@ def open_study(
 
     if workspace is None:
         raise ValueError("preview execution requires an explicit workspace")
-    workspace = Path(workspace).expanduser().resolve()
+    workspace = _resolve_preview_workspace(workspace)
     case_dir = release_root / "case_studies" / case_study
     generated = tuple(case_dir / name for name in ("features", "labels", "run_log"))
-    if not all(path.is_symlink() for path in generated):
+    linked = all(path.is_symlink() for path in generated)
+    # Say which branch this took. The two read their inputs from different places, and which
+    # one runs is decided by the checkout rather than by anything the caller asked for: a
+    # maintainer worktree symlinks its generated directories to shared artifacts and reads
+    # them in place, a CI checkout has real directories and adopts the workspace. Neither is
+    # wrong. A run that does not say which it took is, because the same notebook then reports
+    # different inputs on the two and nothing in the log tells them apart.
+    print(
+        f"open_study({case_study}): generated directories under {case_dir} are "
+        + (
+            "symlinks - reading inputs in place, writes redirected to the workspace"
+            if linked
+            else "real directories - the workspace is the study root"
+        )
+    )
+    if not linked:
         return Study.open(
             case_study,
             workspace=workspace,

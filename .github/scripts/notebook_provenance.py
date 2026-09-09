@@ -10,6 +10,8 @@ caught mechanically instead of by review.
 The stamp lives in ``nb.metadata["ml4t_provenance"]``::
 
     source_py_blob : git blob hash of the paired .py at execution time
+    outputs_digest : digest over the outputs the run left in the notebook
+    library_digest : digest over the repository code the paired .py imports
     executed_at    : ISO-8601 timestamp
     executor       : environment label (e.g. "ml4t-gpu", "local-uv")
     production     : bool — True iff overrides preserve the full production surface
@@ -48,10 +50,50 @@ refuses to write a stamp that contradicts it. Stamping also rewrites
 ``metadata.papermill.parameters`` to the declared set, so the fossil cannot
 outlive the stamp and disagree with it later.
 
+What the three digests each answer, because they are easy to confuse
+--------------------------------------------------------------------
+
+``source_py_blob`` answers "has the paired ``.py`` changed since somebody stamped
+this". For a long time that was the whole gate, and it left two ways for a
+superseded result to reach ``main`` with every check green.
+
+``outputs_digest`` answers "are these the outputs that run produced". A notebook
+whose ``.py`` is untouched passed the staleness check carrying outputs from any
+earlier run. Computed over the parsed structure with every ``execution_count`` and
+every figure ``alt`` removed, so re-running to the same values, reformatting the
+JSON, folding in a prose edit and correcting alt text do not move it - the last
+because ``alt_text_only_drift`` already forgives that edit, on the proven grounds
+that re-executing cannot change the image.
+
+The digest is written from whatever is on disk at stamp time, so it cannot by
+itself catch a run that never wrote the file - ``nbconvert --execute --inplace``
+under ``nohup ... &`` exits 0 and does exactly that, and the resulting stamp agrees
+with itself forever. ``unwritten_run`` catches it at the only moment the state is
+still visible: the ``.py`` moved and the outputs are byte-identical to what the
+previous stamp recorded. ``--allow-unchanged-outputs`` answers it for a notebook
+genuinely deterministic enough that the change altered nothing it prints.
+
+``library_digest`` answers "did this run use the code that is here now". The
+numbers in a case study are computed in ``case_studies/utils/*.py``, which
+``source_py_blob`` never covered: #606 changed ``causal.py`` under all nine case
+studies at once and the committed stamps went on claiming runs whose outputs
+described code no longer in the tree. It digests the repository files the paired
+``.py`` imports transitively, keyed by path as well as content.
+
 Gate (``check``): for every tracked ``.ipynb`` that HAS a stamp,
 
 * ``source_py_blob`` must equal ``git hash-object`` of the current paired ``.py``
   (else the ``.py`` changed since the notebook was executed — STALE),
+* ``outputs_digest``, where the stamp records one, must match the notebook's
+  current outputs (else the stored results are not the ones the stamped run
+  produced — OUTPUTS CHANGED),
+* ``library_digest``, where the stamp records one, is compared and *reported*
+  rather than failed (LIBRARY DRIFT). Failing it would block at least five
+  notebooks across three case studies on the day it lands, and that is a separate
+  decision from being able to see the drift at all,
+* a stamp carrying neither digest predates them both and is counted, not failed:
+  every stamp written before they existed lacks them, and none of those notebooks
+  has the defect the fields exist to catch,
 * ``production`` must be True (else a TEST-mode run was committed),
 * some code cell must show it ran - an output or an execution count (else the stamp
   is over a render nothing produced — HOLLOW), and
@@ -79,6 +121,13 @@ Notebooks WITHOUT a stamp are reported as "unverified" but do not fail unless
 as they are re-run through the canonical path, and the gate enforces only where
 provenance exists. Flip to ``--strict`` once the backfill is complete.
 
+**Where this gate runs.** In two places, asking two different questions. The pre-commit hook
+runs it over the *staged* files, so a notebook another session left dirty does not block an
+unrelated commit. CI runs it over the *change*: ``check --since <base>`` on a pull request,
+over the notebooks that pull request touches, and on a push to ``main`` against the previous
+tip. A stale render only reaches a reader through a merge, and until CI ran this the gate
+never covered a merge at all - it fired on every local commit and on nothing that publishes.
+
 Usage::
 
     uv run python .github/scripts/notebook_provenance.py stamp <nb.ipynb> --executor ml4t-gpu --production
@@ -87,12 +136,15 @@ Usage::
     uv run python .github/scripts/notebook_provenance.py clear <nb.ipynb>  # commit it unexecuted
     uv run python .github/scripts/notebook_provenance.py check          # gate (stamped-only)
     uv run python .github/scripts/notebook_provenance.py check --strict  # also fail on unverified
+    uv run python .github/scripts/notebook_provenance.py check --since origin/main  # this branch only
+    uv run python .github/scripts/notebook_provenance.py check --since <tip> --no-merge-base  # a push
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import re
 import subprocess
@@ -100,6 +152,7 @@ import sys
 from datetime import UTC, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKIP_PARTS = {"_reference", ".venv", ".git", ".ipynb_checkpoints"}
@@ -150,6 +203,14 @@ PRODUCTION_SAFE_PARAMETERS: dict[str, object] = {
     # cannot reduce the run, and register_causal_run refuses a hash that is not a
     # current canonical identity for the same label.
     "SUPERSEDES_CAUSAL": VALIDATED_BY_CONSUMER,
+    # Replaces a holdout evaluation the window already carries instead of adding a second
+    # one. It deletes rows, which is why it is worth saying why it belongs here: it cannot
+    # reduce what the run computes - the refit, the registration and every check still
+    # happen - and the row it removes is one the notebook has already established is a
+    # superseded generation of the same window. Without it a correction that moves every
+    # training identity could be computed but never carried through to the holdout, because
+    # the only route would be editing the notebook's source for one run and editing it back.
+    "REPLACE_HOLDOUT": True,
 }
 
 
@@ -320,6 +381,72 @@ def iter_notebooks() -> list[Path]:
     return sorted(out)
 
 
+def _changed_paths(ref: str, merge_base: bool, diff_filter: str | None = None) -> list[str]:
+    """Repo-relative paths changed relative to ``ref``, optionally by change type.
+
+    ``-z``, because the gate must not lose a notebook for having a space in its name.
+    Plain ``--name-only`` quotes such a path and ``.split()`` then tears it into
+    fragments that match no suffix, so the notebook drops out of scope and passes
+    unchecked - the one thing a gate must never do.
+
+    ``--no-renames`` for the same reason from the other side: rename detection reports
+    only the destination, so moving a ``.py`` would hide the source path whose notebook
+    is now stale, and a rename arrives here as a delete plus an add instead.
+    """
+    spec = f"{ref}...HEAD" if merge_base else f"{ref}..HEAD"
+    cmd = ["git", "diff", "--name-only", "-z", "--no-renames"]
+    if diff_filter:
+        cmd.append(f"--diff-filter={diff_filter}")
+    cmd.append(spec)
+    out = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout
+    return [name for name in out.split("\0") if name]
+
+
+def notebooks_orphaned_since(ref: str, merge_base: bool = True) -> list[str]:
+    """Notebooks this change left with no source: the ``.py`` deleted, the ``.ipynb`` kept.
+
+    This is the strongest form of the staleness the gate exists to catch - a render whose
+    source is gone can never be re-derived - and :func:`check_all` cannot see it, because
+    its ``paired_py() is None`` branch cannot tell a notebook that was just orphaned from
+    one that was never paired. Tracked notebooks are deliberately unpaired, so the
+    distinction has to come from the diff rather than from the tree.
+    """
+    orphaned: list[str] = []
+    for name in _changed_paths(ref, merge_base, diff_filter="D"):
+        if not name.endswith(".py"):
+            continue
+        nb = (REPO_ROOT / name).with_suffix(".ipynb")
+        if nb.exists() and not (SKIP_PARTS & set(nb.parts)):
+            orphaned.append(f"{nb.relative_to(REPO_ROOT)} (deleted source: {name})")
+    return sorted(orphaned)
+
+
+def notebooks_changed_since(ref: str, merge_base: bool = True) -> list[Path]:
+    """Notebooks this change is answerable for, relative to ``ref``.
+
+    A change owns a notebook if it edited the notebook OR edited the paired ``.py``,
+    since changing the ``.py`` is exactly what makes the rendered notebook stale.
+    Notebooks nobody touched are somebody else's.
+
+    ``merge_base`` picks which question is being asked. For a pull request it is "what
+    does this branch add on top of the base", so the diff runs from the merge base
+    (``ref...HEAD``) and commits that landed on the base meanwhile are not this branch's
+    problem. For a push it is "what does the published tree become", so the diff must run
+    against the previous tip itself (``ref..HEAD``) - a force-push can revert a notebook
+    relative to that tip without the merge base ever seeing it.
+    """
+    owned: set[Path] = set()
+    for name in _changed_paths(ref, merge_base):
+        path = REPO_ROOT / name
+        if path.suffix == ".ipynb":
+            owned.add(path)
+        elif path.suffix == ".py":
+            nb = path.with_suffix(".ipynb")
+            if nb.exists():
+                owned.add(nb)
+    return sorted(p for p in owned if p.exists() and not (SKIP_PARTS & set(p.parts)))
+
+
 def paired_py(nb_path: Path) -> Path | None:
     """The .py jupytext-paired to this notebook (same dir + stem). None if absent."""
     cand = nb_path.with_suffix(".py")
@@ -337,7 +464,182 @@ def git_blob(path: Path) -> str:
     ).stdout.strip()
 
 
+# Papermill's own cell, and it never survives to a commit: `nb-run.sh` stamps first, because
+# the stamper cross-checks its parameter declaration against this cell, and drops the cell
+# second, before `jupytext --sync` can bake the argument values into the paired `.py`. Both
+# orderings are deliberate and neither can move. What that leaves is a digest computed over
+# one more code cell than the committed notebook has, so every parameterized production run
+# reported OUTPUTS CHANGED on a notebook nothing had touched - etfs/18_holdout_predictions
+# on 2026-09-07, whose only override was the production-safe REPLACE_HOLDOUT. Excluding the
+# cell here means the digest describes the notebook as it is committed, which is the only
+# form anything ever reads it in.
+INJECTED_PARAMETERS_TAG = "injected-parameters"
+
+
+def outputs_digest(nb: dict) -> str:
+    """A digest over the outputs this notebook stores, in cell order.
+
+    ``source_py_blob`` answers "has the ``.py`` changed since somebody stamped
+    this", which is not the same question as "did these outputs come from that
+    run". A notebook whose ``.py`` is untouched passes the stale check carrying
+    outputs from any earlier run - including a superseded one - and that is a real
+    path a stale result took to ``main``: ``nbconvert --execute --inplace`` under
+    ``nohup ... &`` exits 0 without rewriting the notebook, so the agent stamps a
+    file that still holds the previous run's outputs.
+
+    Computed over the parsed structure rather than the file's bytes, so
+    reformatting, a re-indent or a different ``json.dumps`` cannot move it. Every
+    ``execution_count`` is dropped: the kernel renumbers those on each run and
+    ``strip_papermill_cell_metadata`` and friends may clear them, and neither
+    changes a single value the notebook reports.
+
+    Markdown cells are excluded for the same reason ``sync-prose`` exists: prose
+    carries no output, so folding a prose edit into an executed notebook must not
+    invalidate the record of the run.
+    """
+    payload = [
+        _normalized_outputs(c.get("outputs") or [])
+        for c in _code_cells(nb)
+        if INJECTED_PARAMETERS_TAG not in (c.get("metadata") or {}).get("tags", [])
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _code_cells(nb: dict) -> list[dict]:
+    return [c for c in nb.get("cells", []) if c.get("cell_type") == "code"]
+
+
+# Dropped before hashing. `execution_count` is the kernel's counter, renumbered by
+# every run and cleared by the metadata strippers, and it names no value the
+# notebook reports. `alt` is figure alt text, which `alt_text_only_drift` already
+# forgives in the `.py` on the proven grounds that re-executing cannot change the
+# image - and the workflow it forgives requires the matching output metadata to be
+# corrected too. Hashing the alt would make that documented correction read as a
+# changed result and price four rewritten sentences at a 90-minute re-run, which is
+# the cost the exception exists to remove.
+VOLATILE_OUTPUT_KEYS = frozenset({"execution_count", "alt"})
+
+
+def _normalized_outputs(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            k: _normalized_outputs(v) for k, v in value.items() if k not in VOLATILE_OUTPUT_KEYS
+        }
+    if isinstance(value, list):
+        return [_normalized_outputs(v) for v in value]
+    return value
+
+
+def _module_candidates(module: str, from_dir: Path) -> list[Path]:
+    """Where a repo-local ``module`` could live, most specific first.
+
+    Two roots, because the repository has two import mechanisms. Dotted names
+    resolve from the repo root (``case_studies.utils.causal``). A bare name also
+    resolves from the importing file's own directory, because ``sitecustomize``
+    appends every ``NN_*`` chapter directory to ``sys.path`` - which is the only
+    reason a chapter's ``async_utils`` is importable at all.
+    """
+    parts = module.split(".")
+    # Both roots for a dotted name too. `17_portfolio_construction/deepm/` is a real
+    # package inside a chapter directory, so `import deepm.model` resolves against
+    # the chapter, not the repo root - and searching only the root left the code
+    # that computes that chapter's allocations out of the digest entirely.
+    roots = [from_dir, REPO_ROOT]
+    out: list[Path] = []
+    for root in roots:
+        base = root.joinpath(*parts)
+        out += [base.with_suffix(".py"), base / "__init__.py"]
+    return out
+
+
+def _imported_modules(tree: ast.AST, py: Path) -> set[str]:
+    """Module names *py* imports, with relative imports resolved to dotted names."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                # `from . import x` inside case_studies/utils/ is case_studies.utils.x
+                package = py.resolve().parent
+                for _ in range(node.level - 1):
+                    package = package.parent
+                try:
+                    prefix = ".".join(package.relative_to(REPO_ROOT).parts)
+                except ValueError:
+                    continue
+                base = f"{prefix}.{node.module}" if node.module else prefix
+            else:
+                base = node.module or ""
+            if not base:
+                continue
+            names.add(base)
+            # `from case_studies.utils import causal` names the module in the alias,
+            # not in `node.module`, and that alias is the file that changed.
+            names.update(f"{base}.{a.name}" for a in node.names if a.name != "*")
+    return names
+
+
+def repo_local_sources(py: Path) -> list[Path]:
+    """Every repository file *py* imports, transitively, sorted repo-relative.
+
+    The numbers in a case-study notebook are computed in ``case_studies/utils/*.py``,
+    which ``source_py_blob`` does not cover. #606 changed ``causal.py`` under all
+    nine case studies at once, and the committed stamps went on claiming runs whose
+    outputs described code no longer in the tree - ``analysis_rows`` 88695 -> 88633
+    among them. Nothing in the repository could answer "did this run use the code
+    that is here now", and that absence was the finding.
+
+    Best effort by construction: a module reached through ``importlib``, a plugin
+    registry or a string name is invisible to ``ast``. It covers the import graph,
+    which is where the case-study helpers are.
+    """
+    seen: set[Path] = set()
+    queue = [py.resolve()]
+    while queue:
+        current = queue.pop()
+        if current in seen or not current.is_file():
+            continue
+        seen.add(current)
+        try:
+            tree = ast.parse(current.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError, OSError):
+            continue
+        for module in _imported_modules(tree, current):
+            for candidate in _module_candidates(module, current.parent):
+                if candidate.is_file():
+                    queue.append(candidate.resolve())
+                    break
+    return sorted(p for p in seen - {py.resolve()} if _within_repo(p))
+
+
+def _within_repo(path: Path) -> bool:
+    try:
+        path.relative_to(REPO_ROOT)
+    except ValueError:
+        return False
+    return SKIP_PARTS.isdisjoint(path.parts)
+
+
+def library_digest(py: Path) -> str:
+    """A digest over the repository code *py* imports, transitively.
+
+    Keyed by path as well as content, so moving a module is drift too. An empty
+    import graph still has a digest, which keeps "no repo-local imports" distinct
+    from "not recorded".
+    """
+    lines = [f"{p.relative_to(REPO_ROOT).as_posix()}:{git_blob(p)}" for p in repo_local_sources(py)]
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
 ALT_FUNCS = frozenset({"show_with_alt", "show_plotly_with_alt"})
+
+# What `_blank_alts` reports for one alt call. A plain literal is its text; a computed
+# alt is its prose segments in source order, because the rendered string is not knowable
+# from the source; anything else is unknowable and stays in the AST dump.
+_AltText = str | tuple[str, ...] | None
 
 
 def _alt_call_name(func: ast.expr) -> str | None:
@@ -379,58 +681,118 @@ def _percent_cells(src: str) -> list[tuple[str, str, str]]:
     return [(m, k, "".join(b)) for m, k, b in cells]
 
 
-def _blank_alts(code: str) -> tuple[str, list[str | None]] | None:
-    """(*code* with each alt literal replaced by a placeholder, the alts in source order).
+def _code_bodies(src: str) -> list[str]:
+    """Code-cell bodies of *src*, aligned one-to-one with a notebook's code cells.
 
-    None if *code* does not parse. Works in bytes because ``col_offset`` is a UTF-8
-    byte offset, and replaces from the end so earlier spans keep their offsets.
+    ``_percent_cells`` always emits a leading entry for whatever precedes the first
+    ``# %%`` marker - in a jupytext percent file that is the YAML header comment - and
+    labels it ``code`` because no marker said otherwise. It is not a cell and the notebook
+    has no counterpart for it, so anything zipping source bodies against notebook cells is
+    off by one and rejects every notebook. Dropping it is the only difference from
+    ``_percent_cells``, and it is the difference between a working alignment and one that
+    silently declines to do its job.
+    """
+    cells = _percent_cells(src)
+    # Marker-less AND codeless. A jupytext percent file opens with the YAML header comment
+    # before its first `# %%`, which is what this drops. A bare snippet with no markers at
+    # all also has an empty marker, and its body IS the first cell - dropping that one
+    # misaligns every later cell by one, which does not produce a wrong answer so much as
+    # a blanket refusal, and a blanket refusal here reads as "no notebook qualifies".
+    if cells and cells[0][0] == "":
+        body = cells[0][2]
+        if all(not ln.strip() or ln.lstrip().startswith("#") for ln in body.splitlines()):
+            cells = cells[1:]
+    return [body for _, kind, body in cells if kind == "code"]
 
-    An alt built with an f-string is reported as ``None`` rather than skipped. Its text
-    is not knowable from the source, so it cannot be compared against what the outputs
-    carry - but for the same reason it is not blanked either, so it stays in the AST dump
-    and any edit to it is caught as ordinary source drift. Dropping such a call from the
-    list instead would misalign every later position against the carried alts, and
-    omitting it entirely made the counts disagree and failed the whole notebook: eight
-    case studies write the leading configuration into their alt with an f-string, so the
-    carve-out never applied to the notebooks that read their figures off the frame.
+
+def _alt_literal_spans(arg: ast.expr) -> list[ast.Constant] | None:
+    """The string constants of an alt argument, each flagged standalone or in-f-string.
+
+    A plain literal is one constant that is the whole argument. An f-string - including
+    an implicit concatenation where any part is one - is an ``ast.JoinedStr`` whose
+    ``values`` interleave ``Constant`` prose with ``FormattedValue`` expressions, and
+    only the prose is safe to edit without re-executing. Changing
+    ``{leader['ic_mean']:+.3f}`` to ``{leader['ic_std']:+.3f}`` changes what the alt
+    asserts about the data, so the expression parts stay in the AST dump and moving one
+    is stale, exactly as it should be.
+
+    None for anything else - an alt passed as a variable, say - which the caller reports
+    as unknowable rather than guessing at.
+    """
+    if isinstance(arg, ast.Constant):
+        return [arg] if isinstance(arg.value, str) else None
+    if isinstance(arg, ast.JoinedStr):
+        parts: list[ast.Constant] = []
+        for value in arg.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value)
+            elif not isinstance(value, ast.FormattedValue):
+                return None
+        return parts
+    return None
+
+
+def _blank_alts(code: str) -> tuple[ast.Module, list[_AltText]] | None:
+    """(*code* parsed with every alt's prose neutralised, the alts in source order).
+
+    None if *code* does not parse. The blanking is done on the tree rather than on the
+    source: a prose segment inside an f-string and a quoted piece of an implicit
+    concatenation are the same kind of AST node in the same argument, and only their
+    source text tells them apart. Writing a placeholder over either one textually means
+    guessing which, and getting it wrong produces source that does not parse -
+    ``show_plotly_with_alt(fig, <alt> f"...")`` - which makes the whole exception
+    unavailable for that notebook. Setting the constant's value leaves the question
+    unasked, and it is what the caller wanted anyway: the tree is what gets dumped and
+    compared.
+
+    Both shapes of alt are blanked, and the difference is in what is reported back. A
+    plain literal reports its text, which the caller can require the outputs to carry
+    exactly. A computed alt reports its prose segments in order, because its rendered
+    text is not knowable from the source - the caller can only require that those
+    segments still appear, in order, inside whatever the outputs carry.
+
+    Blanking the computed ones is the point of this change. Writing alt text against
+    computed values is the right thing to do: it is what stops a description drifting
+    from its figure, and several push reviews have asked for it. Leaving those spans in
+    the compared dump priced a wording fix to `case_studies/fx_pairs/06_linear` or
+    `cme_futures/07_gbm` at a full re-execution, while the same fix to a plain-literal
+    alt next door was accepted as a diff - the opposite of what the exception exists
+    for, applied to exactly the notebooks that read their figures off the frame.
+
+    An alt that is neither shape - a variable, say - is reported as ``None`` and left
+    untouched in the tree, so any edit to it is caught as ordinary source drift. It is
+    reported rather than dropped because dropping it would misalign every later
+    position against the carried alts.
     """
     try:
         tree = ast.parse(code)
     except SyntaxError:
         return None
-    data = code.encode("utf-8")
-    line_start = [0]
-    for line in data.splitlines(keepends=True):
-        line_start.append(line_start[-1] + len(line))
 
-    found: list[tuple[int, int, str | None]] = []
+    found: list[tuple[tuple[int, int], _AltText]] = []
     for node in ast.walk(tree):
-        if (
+        if not (
             isinstance(node, ast.Call)
             and _alt_call_name(node.func) in ALT_FUNCS
             and len(node.args) >= 2
         ):
-            arg = node.args[1]
-            if arg.end_lineno is None or arg.end_col_offset is None:
-                return None
-            literal = (
-                arg.value if isinstance(arg, ast.Constant) and isinstance(arg.value, str) else None
-            )
-            found.append(
-                (
-                    line_start[arg.lineno - 1] + arg.col_offset,
-                    line_start[arg.end_lineno - 1] + arg.end_col_offset,
-                    literal,
-                )
-            )
+            continue
+        arg = node.args[1]
+        position = (arg.lineno, arg.col_offset)
+        parts = _alt_literal_spans(arg)
+        if parts is None:
+            found.append((position, None))
+            continue
+        alt: _AltText = (
+            parts[0].value if isinstance(arg, ast.Constant) else tuple(c.value for c in parts)
+        )
+        for const in parts:
+            const.value = "<alt>"
+        found.append((position, alt))
     # ast.walk is breadth-first, not source order; the outputs it is compared against
     # are in source order.
-    found.sort(key=lambda item: item[:2])
-    for begin, finish, literal in reversed(found):
-        if literal is None:
-            continue  # not blanked, so an edit to it stays visible in the AST dump
-        data = data[:begin] + b'"<alt>"' + data[finish:]
-    return data.decode("utf-8"), [alt for _, _, alt in found]
+    found.sort(key=lambda item: item[0])
+    return tree, [alt for _, alt in found]
 
 
 def _semicolon_flags(code: str, tree: ast.Module) -> tuple[bool, ...]:
@@ -499,14 +861,15 @@ def _comparable(
             blanked = _blank_alts(body)
             if blanked is None:
                 return None
-            source = blanked[0]
+            tree = blanked[0]
         else:
-            source = body
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
-            return None
-        out.append((marker, kind, ast.dump(tree), _semicolon_flags(source, tree)))
+            try:
+                tree = ast.parse(body)
+            except SyntaxError:
+                return None
+        # Semicolon flags read the ORIGINAL body: blanking now only changes a constant's
+        # value, so every position in the tree still describes the source it came from.
+        out.append((marker, kind, ast.dump(tree), _semicolon_flags(body, tree)))
     return out
 
 
@@ -534,7 +897,11 @@ def alt_text_only_drift(stamped_blob: str, py: Path, nb: dict) -> bool:
       executes changed. Only markdown bodies are free, because they are comments in the
       ``.py``, and
     * every alt in the notebook's output metadata already equals the literal in its own
-      cell, so the outputs on disk are the ones this source produces.
+      cell, so the outputs on disk are the ones this source produces. For an alt built
+      from an f-string the rendered text is not knowable from the source, so what is
+      required instead is that the source's prose still appears in the carried alt, in
+      order, with the interpolated values in the gaps. Same bargain, weaker only where
+      it has to be.
 
     Anything else - a changed constant, a reordered call, a trailing semicolon, a moved
     ``# %%``, an alt the outputs do not carry - is stale, which is what the stamp is for.
@@ -561,13 +928,30 @@ def alt_text_only_drift(stamped_blob: str, py: Path, nb: dict) -> bool:
     if old_cells is None or new_cells is None or old_cells != new_cells:
         return False
 
-    for cell in nb.get("cells", []):
-        if cell.get("cell_type") != "code":
-            continue
+    # The alts to require come from the NEW .py, not from the notebook's own cell source.
+    # Reading them off the notebook compared the executed source against the outputs that
+    # same execution produced - true of every executed notebook, and silent about the edit
+    # actually being adjudicated. Measured on 2026-09-08: appending a sentence to a plain
+    # literal alt in cme_futures/03_financial_features.py was reported ALT-TEXT ONLY and
+    # allowed, with the output metadata still carrying the old sentence, which is the exact
+    # thing the paragraph above says is stale. The first half of this function already
+    # establishes that the two sources have the same code cells in the same order once alts
+    # are blanked, so zipping them by order is safe.
+    new_code_bodies = _code_bodies(new_source)
+    nb_code_cells = [c for c in nb.get("cells", []) if c.get("cell_type") == "code"]
+    alt_bearing = [
+        c for c in nb_code_cells if any(fn in "".join(c.get("source", [])) for fn in ALT_FUNCS)
+    ]
+    # Only an alt-bearing notebook needs the two lined up. A notebook with no alt calls has
+    # nothing for this half to check, and requiring the counts to match there would reject
+    # the papermill-cleanup and markdown-only cases this function also serves.
+    if alt_bearing and len(new_code_bodies) != len(nb_code_cells):
+        return False
+    for cell, new_body in zip(nb_code_cells, new_code_bodies, strict=False):
         src = "".join(cell.get("source", []))
         if not any(fn in src for fn in ALT_FUNCS):
             continue
-        blanked = _blank_alts(src)
+        blanked = _blank_alts(new_body)
         if blanked is None:
             return False
         carried = [
@@ -579,14 +963,42 @@ def alt_text_only_drift(stamped_blob: str, py: Path, nb: dict) -> bool:
             return False
         for a, c in zip(blanked[1], carried, strict=True):
             if a is None:
-                # A computed alt. Its literal parts are in the AST dump the first half
-                # compared, so a change to them is already stale; what is left to require
-                # is that the output carries an alt at all, which is what catches an alt
-                # call added since the notebook was executed.
+                # An alt this cannot read - a variable, say. Its whole span stays in the
+                # AST dump the first half compared, so any edit to it is already stale;
+                # what is left to require is that the output carries an alt at all, which
+                # is what catches an alt call added since the notebook was executed.
                 if not c:
+                    return False
+            elif isinstance(a, tuple):
+                if not _carries_prose(a, c):
                     return False
             elif a != c:
                 return False
+    return True
+
+
+def _carries_prose(segments: tuple[str, ...], carried: str | None) -> bool:
+    """Whether *carried* is a rendering of an f-string with these prose *segments*.
+
+    The rendered text of a computed alt is not knowable from the source, so it cannot
+    be compared exactly the way a plain literal is. What can be required is that the
+    source's prose still appears in the output, in order, with the interpolated values
+    in the gaps - which holds exactly when the notebook's outputs were produced by, or
+    corrected to, this source.
+
+    That is the same bargain the plain-literal branch strikes: an alt correction is
+    accepted as a diff only when the output metadata carries the correction too.
+    Editing the ``.py`` and leaving the executed alt saying the old thing is stale, and
+    should be.
+    """
+    if carried is None:
+        return False
+    position = 0
+    for segment in segments:
+        found = carried.find(segment, position)
+        if found < 0:
+            return False
+        position = found + len(segment)
     return True
 
 
@@ -609,12 +1021,50 @@ def contradicts_injected_cell(nb: dict, parameters: dict[str, object]) -> str | 
     )
 
 
+def unwritten_run(nb: dict, py: Path) -> str | None:
+    """Why this stamp would record a run that never rewrote the notebook, or None.
+
+    The digests are computed from whatever is in the file at stamp time, so a run
+    that exited without writing leaves the previous run's outputs to be recorded as
+    the new ones - and every later check agrees with itself. That is the failure
+    that motivates the outputs digest, and only this refusal catches it, because
+    afterwards there is nothing left to disagree.
+
+    The signal is a source change with no corresponding output change: the previous
+    stamp says the notebook was executed from a different ``.py``, and the outputs
+    are byte-identical to what that older run produced. ``nbconvert --execute
+    --inplace`` under ``nohup ... &`` exits 0 and leaves exactly that state.
+
+    Silent when there is no previous stamp to compare against, and when the ``.py``
+    has not moved - re-running unchanged source to the same values is a normal
+    thing to do and says nothing about whether the file was written.
+    """
+    previous = nb.get("metadata", {}).get(STAMP_KEY) or {}
+    recorded = previous.get("outputs_digest")
+    if recorded is None:
+        return None
+    if previous.get("source_py_blob") == git_blob(py):
+        return None
+    if recorded != outputs_digest(nb):
+        return None
+    return (
+        "the .py has changed since the last stamp, but the outputs are exactly the "
+        "ones the previous run produced. A run that changed the source and changed "
+        "no output almost always means the execution never wrote this file - "
+        "`nbconvert --execute --inplace` in the background exits 0 and does that. "
+        "Re-execute and check the outputs moved. If this notebook really is "
+        "deterministic enough that the change altered nothing it prints, pass "
+        "--allow-unchanged-outputs to say so."
+    )
+
+
 def stamp_notebook(
     nb_path: Path,
     executor: str,
     notes: str | None = None,
     *,
     parameters: dict[str, object],
+    allow_unchanged_outputs: bool = False,
 ) -> dict:
     """Record how this notebook was executed.
 
@@ -642,8 +1092,17 @@ def stamp_notebook(
             "output or an execution count, so nothing in it was executed. A stamp on this "
             "would claim a run that left no trace. Execute it, or leave it cleared."
         )
+    if not allow_unchanged_outputs and (reason := unwritten_run(nb, py)):
+        raise SystemExit(f"refusing to stamp {nb_path.relative_to(REPO_ROOT)}: {reason}")
     stamp = {
         "source_py_blob": git_blob(py),
+        # What the run produced, and the repository code that produced it. Neither is
+        # covered by source_py_blob, and each was a way a superseded result reached
+        # main with every check green: outputs from an earlier run under an untouched
+        # .py, and outputs computed by a case_studies/utils module that has since
+        # moved. See outputs_digest and library_digest.
+        "outputs_digest": outputs_digest(nb),
+        "library_digest": library_digest(py),
         "executed_at": datetime.now(UTC).isoformat(),
         "executor": executor,
         "production": production_parameters(parameters),
@@ -699,6 +1158,25 @@ def stamp_reference(base_branch: str = "main") -> str:
         if merge_base.returncode == 0 and merge_base.stdout.strip():
             return merge_base.stdout.strip()
     return "HEAD"
+
+
+def _fork_point(ref: str) -> str:
+    """Where HEAD forked from *ref*, for the de-stamp comparison under ``--since``.
+
+    ``stamp_reference`` answers this for the default base branch. A pull request names
+    its own base, so the same question has to be asked against that ref rather than
+    against ``origin/main``, or a PR onto a release branch compares its stamps to a
+    commit neither side descends from. Falls back to *ref* itself when the two share no
+    history, which is the honest answer for an unrelated ref.
+    """
+    merge_base = subprocess.run(
+        ["git", "merge-base", "HEAD", ref],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return merge_base.stdout.strip() if merge_base.returncode == 0 else ref
 
 
 def was_executed(nb: dict) -> bool:
@@ -776,15 +1254,44 @@ def destamped(ref: str | None = None, only: set[str] | None = None) -> list[str]
     )
 
 
+class CheckResult(NamedTuple):
+    """The gate's verdicts, one list of repo-relative notebooks each.
+
+    A ``NamedTuple`` rather than a dataclass because callers iterate it - "no
+    category may name a notebook outside ``only``" is asserted by looping over the
+    result - and unpack it positionally.
+    """
+
+    stale: list[str]
+    testmode: list[str]
+    contradicted: list[str]
+    unverified: list[str]
+    alt_only: list[str]
+    hollow: list[str]
+    outputs_changed: list[str]
+    library_drift: list[str]
+    # Stamped before the two digests existed, so neither can be checked. Reported as
+    # a count rather than failed: every stamp predating them lacks both, and failing
+    # those would turn every branch red at once for a defect none of them has.
+    undigested: list[str]
+
+
 def check_all(
     strict: bool = False,
     only: set[str] | None = None,
-) -> tuple[list[str], list[str], list[str], list[str], list[str], list[str]]:
-    """Return (stale, testmode, contradicted, unverified, alt_only, hollow) rows.
+) -> CheckResult:
+    """Return the gate's verdicts over the tracked notebooks.
 
-    ``stale``, ``testmode``, ``contradicted`` and ``hollow`` fail. ``alt_only`` is reported so that forgiving a drift is
-    never silent: a notebook in that list has a ``.py`` that no longer matches its
-    stamp, and the reason it is allowed is printed rather than assumed.
+    ``stale``, ``testmode``, ``contradicted``, ``hollow`` and ``outputs_changed``
+    fail. ``alt_only``, ``library_drift`` and ``undigested`` are reported so that
+    forgiving a drift is never silent: a notebook in one of those lists has
+    something that no longer matches its stamp, and the reason it is allowed is
+    printed rather than assumed.
+
+    ``library_drift`` is deliberately not a failure yet. On the measurement in
+    ml4t/agent-workspace#917 it would immediately block at least five notebooks
+    across three case studies, and turning it into a hard failure is a separate
+    decision from being able to see it at all.
 
     ``only`` restricts the scan to the notebooks whose ``.ipynb`` or paired ``.py``
     is in that set of repo-relative paths. The pre-commit gate passes the staged
@@ -799,6 +1306,9 @@ def check_all(
     unverified: list[str] = []
     alt_only: list[str] = []
     hollow: list[str] = []
+    outputs_changed: list[str] = []
+    library_drift: list[str] = []
+    undigested: list[str] = []
     for nb_path in iter_notebooks():
         rel = str(nb_path.relative_to(REPO_ROOT))
         py = paired_py(nb_path)
@@ -827,7 +1337,26 @@ def check_all(
             contradicted.append(f"{rel} ({conflict})")
         if not was_executed(nb):
             hollow.append(rel)
-    return stale, testmode, contradicted, unverified, alt_only, hollow
+        stamped_outputs = stamp.get("outputs_digest")
+        stamped_library = stamp.get("library_digest")
+        if stamped_outputs is None and stamped_library is None:
+            undigested.append(rel)
+        else:
+            if stamped_outputs is not None and stamped_outputs != outputs_digest(nb):
+                outputs_changed.append(rel)
+            if stamped_library is not None and stamped_library != library_digest(py):
+                library_drift.append(rel)
+    return CheckResult(
+        stale,
+        testmode,
+        contradicted,
+        unverified,
+        alt_only,
+        hollow,
+        outputs_changed,
+        library_drift,
+        undigested,
+    )
 
 
 def code_cells_only(comparable: list[tuple] | None) -> list[tuple] | None:
@@ -1001,6 +1530,240 @@ def sync_prose(nb_path: Path) -> str:
     return stamp["source_py_blob"]
 
 
+def _splice_alt(
+    old_segments: tuple[str, ...], new_segments: tuple[str, ...], carried: str
+) -> str | None:
+    """*carried* with its prose replaced by *new_segments*, keeping the interpolated values.
+
+    A computed alt renders as ``seg0 + value0 + seg1 + value1 + ...`` and only the values
+    need a kernel to produce. They are already in the executed output, so a prose fix to an
+    f-string alt does not need one: recover the values from between the OLD segments, then
+    rebuild around the NEW ones.
+
+    Recovering them is where this can go wrong, and quietly. Scanning left to right for the
+    next segment takes the FIRST occurrence, which is not necessarily the delimiter: with
+    segments ``("IC ", ".")`` and carried ``"IC 0.031."``, the ``.`` matches inside the
+    number and the value is read as ``"0"``, leaving ``"031."`` to be appended after the new
+    prose. The output is corrupted and then stamped as current, which is worse than
+    refusing.
+
+    So the split is done by an anchored regex, both greedily and non-greedily, and accepted
+    only when the two agree. Anchoring the last segment to the end of the string is what
+    rejects the reading above; requiring the two passes to agree is what catches a genuinely
+    ambiguous alt, where more than one split is consistent with the source and there is no
+    way to tell which the notebook meant. Those need the run.
+
+    None whenever the values cannot be recovered unambiguously, or when the two sources
+    interpolate a different number of times - that is a change to what the alt asserts about
+    the data, not to its wording.
+    """
+    if len(old_segments) != len(new_segments):
+        return None
+    if len(old_segments) == 1:
+        # No interpolation to preserve: the whole alt is prose.
+        return new_segments[0] if carried == old_segments[0] else None
+    body = "(.*?)".join(re.escape(segment) for segment in old_segments)
+    lazy = re.fullmatch(body, carried, re.DOTALL)
+    greedy = re.fullmatch("(.*)".join(re.escape(s) for s in old_segments), carried, re.DOTALL)
+    if lazy is None or greedy is None or lazy.groups() != greedy.groups():
+        return None
+    values = lazy.groups()
+    rebuilt = new_segments[0]
+    for segment, value in zip(new_segments[1:], values, strict=True):
+        rebuilt += value + segment
+    return rebuilt
+
+
+def _image_outputs(cell: dict) -> list[dict]:
+    """The cell's image outputs, in the order the alt calls that produced them appear."""
+    return [out for out in cell.get("outputs", []) if "image/png" in (out.get("data") or {})]
+
+
+def sync_alt(nb_path: Path) -> str:
+    """Fold an alt-text correction into an executed notebook, without re-running it.
+
+    ``sync_prose`` deliberately refuses this: it keeps the outputs, so an alt the output
+    metadata does not carry would be stamped as current while the notebook still renders
+    the old sentence. ``alt_text_only_drift`` accepts a corrected alt, but only once the
+    outputs carry it - and nothing wrote it there. That left the cheap path documented and
+    unreachable: the band correcting an alt on a 40-second notebook just re-ran it, and the
+    band that would have needed it most, on a notebook priced in hours, had no way in.
+
+    This is the missing half. ``show_plotly_with_alt`` publishes the alt as
+    ``metadata["image/png"]["alt"]`` and takes the image from ``fig._repr_mimebundle_()``,
+    which never sees the string - so writing the corrected alt into the output metadata
+    produces exactly the bytes a re-run would, and the gate's claim stays true rather than
+    being talked around.
+
+    Refuses unless every code cell is identical once the alt literals are blanked, which is
+    the same test ``alt_text_only_drift`` applies, and unless every alt it must rewrite is
+    one it can rewrite: a plain literal is copied, a computed alt keeps the values already
+    in the output and takes the new prose around them, and an alt passed as a variable is
+    refused because its rendered text is not in the source at all.
+    """
+    py = paired_py(nb_path)
+    rel = nb_path.relative_to(REPO_ROOT)
+    if py is None:
+        raise SystemExit(f"no paired .py for {rel}")
+    nb = json.loads(nb_path.read_text(encoding="utf-8"))
+    stamp = nb.get("metadata", {}).get(STAMP_KEY)
+    if not stamp:
+        raise SystemExit(
+            f"{rel} carries no provenance stamp, so there is no executed state to preserve. Run it."
+        )
+    stamped_blob = stamp["source_py_blob"]
+    old = subprocess.run(
+        ["git", "cat-file", "blob", stamped_blob],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if old.returncode != 0:
+        raise SystemExit(
+            f"{rel} is stamped against blob {stamped_blob[:12]}, which is not in this repo, "
+            "so the code cells cannot be compared. Re-run it."
+        )
+    old_source = old.stdout
+    before = code_cells_only(_comparable(old_source, blank_alts=True))
+    after = code_cells_only(_comparable(py.read_text(encoding="utf-8"), blank_alts=True))
+    if before is None or after is None:
+        raise SystemExit(f"{rel}: could not parse one of the two sources - refusing")
+    if before != after:
+        where = next(
+            (i for i, (a, b) in enumerate(zip(before, after)) if a != b),
+            min(len(before), len(after)),
+        )
+        detail = f"code cell {where + 1} differs"
+        if len(before) != len(after):
+            detail = f"{len(before)} code cells in the executed source, {len(after)} now"
+        raise SystemExit(
+            f"{rel}: {detail} for something other than an alt literal, so the outputs on disk "
+            "are not the ones this source produces. Re-run the notebook."
+        )
+
+    # Plan every rewrite against the notebook AS EXECUTED before touching anything, so a
+    # cell this cannot rewrite refuses the whole command instead of leaving half a notebook
+    # updated - the failure the atomicity rule exists for.
+    old_bodies = _code_bodies(old_source)
+    new_bodies = _code_bodies(py.read_text(encoding="utf-8"))
+    nb_code_cells = [c for c in nb.get("cells", []) if c.get("cell_type") == "code"]
+    if not (len(old_bodies) == len(new_bodies) == len(nb_code_cells)):
+        raise SystemExit(
+            f"{rel}: {len(old_bodies)} code cells in the executed source, {len(new_bodies)} now, "
+            f"{len(nb_code_cells)} in the notebook. Cannot line them up - re-run the notebook."
+        )
+    plan: list[str] = []
+    for cell, old_body, new_body in zip(nb_code_cells, old_bodies, new_bodies, strict=True):
+        src = "".join(cell.get("source", []))
+        if not any(fn in src for fn in ALT_FUNCS):
+            continue
+        old_alts = _blank_alts(old_body)
+        new_alts = _blank_alts(new_body)
+        if old_alts is None or new_alts is None:
+            raise SystemExit(f"{rel}: an alt-bearing cell does not parse - refusing")
+        outputs = _image_outputs(cell)
+        if not (len(old_alts[1]) == len(new_alts[1]) == len(outputs)):
+            raise SystemExit(
+                f"{rel}: {len(new_alts[1])} alt call(s) in the source against {len(outputs)} "
+                "image output(s). The notebook is not the render of this source. Re-run it."
+            )
+        for old_alt, new_alt, output in zip(old_alts[1], new_alts[1], outputs, strict=True):
+            carried = ((output.get("metadata") or {}).get("image/png") or {}).get("alt")
+            if isinstance(new_alt, str):
+                plan.append(new_alt)
+            elif isinstance(new_alt, tuple) and isinstance(old_alt, tuple):
+                if carried is None:
+                    raise SystemExit(
+                        f"{rel}: a computed alt has no text in the executed output, so its "
+                        "interpolated values cannot be recovered. Re-run the notebook."
+                    )
+                spliced = _splice_alt(old_alt, new_alt, carried)
+                if spliced is None:
+                    raise SystemExit(
+                        f"{rel}: a computed alt interpolates a different number of values than "
+                        "the executed one, which changes what it asserts about the data rather "
+                        "than how it is worded. Re-run the notebook."
+                    )
+                plan.append(spliced)
+            else:
+                raise SystemExit(
+                    f"{rel}: an alt is passed as a variable, so its rendered text is not in the "
+                    "source and cannot be written into the output. Re-run the notebook."
+                )
+
+    if not plan:
+        raise SystemExit(
+            f"{rel}: no alt text to write. If the edit was markdown only, use sync-prose."
+        )
+
+    before_counts = _output_counts(nb)
+    result = subprocess.run(
+        [sys.executable, "-m", "jupytext", "--to", "ipynb", "--update", str(py)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        if "No module named jupytext" in result.stderr:
+            raise SystemExit(
+                f"{rel}: jupytext is not installed in {sys.executable}. Run this command through "
+                "the repository environment with `uv run python`."
+            )
+        raise SystemExit(f"{rel}: jupytext --update failed:\n{result.stderr}")
+
+    updated = json.loads(nb_path.read_text(encoding="utf-8"))
+    after_counts = _output_counts(updated)
+    if after_counts != before_counts:
+        raise SystemExit(
+            f"{rel}: the update changed the outputs, which is the one thing it exists to avoid. "
+            "The file has been left as jupytext wrote it; restore it with `git checkout`."
+        )
+
+    # Re-derive the plan's targets in the file jupytext just wrote: the plan holds objects
+    # from the notebook as it was read, and writing into those would be discarded.
+    written = 0
+    position = 0
+    for cell in updated.get("cells", []):
+        if cell.get("cell_type") != "code":
+            continue
+        src = "".join(cell.get("source", []))
+        if not any(fn in src for fn in ALT_FUNCS):
+            continue
+        for output in _image_outputs(cell):
+            output.setdefault("metadata", {}).setdefault("image/png", {})["alt"] = plan[position]
+            position += 1
+            written += 1
+    if written != len(plan):
+        raise SystemExit(
+            f"{rel}: planned {len(plan)} alt rewrite(s) but the updated notebook has {written} "
+            "image output(s) under alt calls. The file has been left as jupytext wrote it; "
+            "restore it with `git checkout`."
+        )
+
+    stamp = dict(stamp)
+    stamp["source_py_blob"] = git_blob(py)
+    stamp["notes"] = (
+        f"alt text synced from the .py at {datetime.now(UTC).isoformat()} without re-executing; "
+        f"every code cell is identical to blob {stamped_blob[:12]} once alt literals are blanked, "
+        f"and {written} output alt(s) were rewritten to match"
+    )
+    updated.setdefault("metadata", {})[STAMP_KEY] = stamp
+    nb_path.write_text(json.dumps(updated, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    return stamp["source_py_blob"]
+
+
+def _cmd_sync_alt(args: argparse.Namespace) -> int:
+    for name in args.notebooks:
+        path = Path(name).resolve()
+        if path.suffix == ".py":
+            path = path.with_suffix(".ipynb")
+        blob = sync_alt(path)
+        print(f"alt text synced {path.relative_to(REPO_ROOT)}: source_py_blob={blob[:12]}")
+    return 0
+
+
 def _cmd_sync_prose(args: argparse.Namespace) -> int:
     for name in args.notebooks:
         path = Path(name).resolve()
@@ -1022,7 +1785,11 @@ def _cmd_stamp(args: argparse.Namespace) -> int:
         if not isinstance(parameters, dict):
             raise SystemExit("--parameters must be a JSON object of override name to value")
     s = stamp_notebook(
-        Path(args.notebook).resolve(), args.executor, args.notes, parameters=parameters
+        Path(args.notebook).resolve(),
+        args.executor,
+        args.notes,
+        parameters=parameters,
+        allow_unchanged_outputs=args.allow_unchanged_outputs,
     )
     print(
         f"stamped {args.notebook}: source_py_blob={s['source_py_blob'][:12]} "
@@ -1069,13 +1836,42 @@ def _cmd_clear(args: argparse.Namespace) -> int:
 
 def _cmd_check(args: argparse.Namespace) -> int:
     only = {str(Path(p)) for p in args.paths} or None
-    stale, testmode, contradicted, unverified, alt_only, hollow = check_all(
-        strict=args.strict, only=only
-    )
-    lost = destamped(only=only)
-    fail = bool(stale or testmode or contradicted or lost or hollow) or (
-        args.strict and bool(unverified)
-    )
+    orphaned: list[str] = []
+    since_ref: str | None = None
+    if args.since:
+        if only is not None:
+            print("check: pass --since or paths, not both", file=sys.stderr)
+            return 2
+        merge_base = not args.no_merge_base
+        # Before the scope check returns early: an orphaned notebook is invisible to
+        # check_all by construction, and a change that deletes only a .py leaves nothing
+        # in scope to report it.
+        orphaned = notebooks_orphaned_since(args.since, merge_base=merge_base)
+        scope = notebooks_changed_since(args.since, merge_base=merge_base)
+        only = {str(nb.relative_to(REPO_ROOT)) for nb in scope}
+        since_ref = _fork_point(args.since) if merge_base else args.since
+        if not only and not orphaned:
+            print(f"notebook sync OK: no notebook is changed relative to {args.since}")
+            return 0
+        if scope:
+            print(f"checking {len(scope)} notebook(s) changed relative to {args.since}:")
+            for nb in scope:
+                print(f"  {nb.relative_to(REPO_ROOT)}")
+            print()
+    result = check_all(strict=args.strict, only=only)
+    stale, testmode, contradicted, unverified, alt_only, hollow = result[:6]
+    outputs_changed, library_drift, undigested = result[6:]
+    lost = destamped(ref=since_ref, only=only)
+    fail = bool(
+        stale or testmode or contradicted or lost or hollow or orphaned or outputs_changed
+    ) or (args.strict and bool(unverified))
+    if orphaned:
+        print(
+            "ORPHANED (the paired .py was deleted but the rendered .ipynb was kept — "
+            "restore the source or delete the notebook with it):"
+        )
+        for r in orphaned:
+            print(f"  {r}")
     if hollow:
         print(
             "HOLLOW (carries a provenance stamp over a notebook with no trace of a run — "
@@ -1129,12 +1925,28 @@ def _cmd_check(args: argparse.Namespace) -> int:
         )
         for r in contradicted:
             print(f"  {r}")
+    if outputs_changed:
+        print(
+            "OUTPUTS CHANGED (the stored outputs are not the ones the stamped run "
+            "produced — the notebook was edited, or a run exited without rewriting it; "
+            "re-execute and re-stamp, or clear it):"
+        )
+        for r in outputs_changed:
+            print(f"  {r}")
     if alt_only:
         print(
             "ALT-TEXT ONLY (the .py drifted from its stamp only in figure alt text the "
             "outputs already carry, so re-executing could not change them — allowed):"
         )
         for r in alt_only:
+            print(f"  {r}")
+    if library_drift:
+        print(
+            "LIBRARY DRIFT (repository code this notebook imports has moved since it "
+            "was executed, so its outputs may describe code no longer in the tree — "
+            "advisory, re-run when the numbers matter):"
+        )
+        for r in library_drift:
             print(f"  {r}")
     if unverified:
         verb = "UNVERIFIED (no provenance stamp"
@@ -1148,6 +1960,8 @@ def _cmd_check(args: argparse.Namespace) -> int:
         print(
             f"notebook sync OK: {len(stale)} stale, {len(testmode)} test-mode, "
             f"{len(contradicted)} contradicted, {len(alt_only)} alt-text-only, "
+            f"{len(outputs_changed)} outputs-changed, {len(library_drift)} library-drift "
+            f"(advisory), {len(undigested)} stamped before the digests existed, "
             f"{len(unverified)} unverified (advisory)"
         )
     return 1 if fail else 0
@@ -1163,6 +1977,14 @@ def main() -> int:
     sp.add_argument("notebook")
     sp.add_argument("--executor", required=True, help="environment label, e.g. ml4t-gpu / local-uv")
     sp.add_argument("--notes", default=None)
+    sp.add_argument(
+        "--allow-unchanged-outputs",
+        action="store_true",
+        help=(
+            "stamp even though the .py moved and the outputs did not - for a notebook "
+            "genuinely deterministic enough that the change altered nothing it prints"
+        ),
+    )
     # The executor states the parameters; the tool does not infer them from
     # notebook metadata written by a different process. See the module docstring.
     params = sp.add_mutually_exclusive_group(required=True)
@@ -1182,6 +2004,21 @@ def main() -> int:
         nargs="*",
         help="restrict the scan to these files (the pre-commit gate passes the staged ones); "
         "with none given, the whole tree is scanned",
+    )
+    cp.add_argument(
+        "--since",
+        default=None,
+        metavar="REF",
+        help="check only notebooks this change touched relative to REF (e.g. origin/main), "
+        "counting a notebook as touched when its paired .py changed. This is the merge "
+        "gate: CI passes the PR base here",
+    )
+    cp.add_argument(
+        "--no-merge-base",
+        action="store_true",
+        help="diff REF..HEAD instead of REF...HEAD — use for a push, where the question is "
+        "what the published tree becomes relative to the previous tip, not what a branch "
+        "adds on top of a base",
     )
     cp.set_defaults(func=_cmd_check)
 
@@ -1204,6 +2041,22 @@ def main() -> int:
     )
     yp.add_argument("notebooks", nargs="+", help=".ipynb or .py paths")
     yp.set_defaults(func=_cmd_sync_prose)
+
+    ap_alt = sub.add_parser(
+        "sync-alt",
+        help="fold an alt-text correction into the executed .ipynb, keeping its outputs",
+        description=(
+            "For a change that touches only figure alt text. Writes the corrected alt into "
+            "the output metadata as well as the source, which is what makes the notebook "
+            "genuinely current rather than merely re-stamped: the image bytes never depend "
+            "on the alt string, so the result is the file a re-run would produce. Refuses if "
+            "any code cell moved for any other reason, if an alt is passed as a variable, or "
+            "if a computed alt interpolates a different number of values than the executed "
+            "one. Use sync-prose for a markdown-only edit."
+        ),
+    )
+    ap_alt.add_argument("notebooks", nargs="+", help=".ipynb or .py paths")
+    ap_alt.set_defaults(func=_cmd_sync_alt)
 
     args = ap.parse_args()
     return args.func(args)

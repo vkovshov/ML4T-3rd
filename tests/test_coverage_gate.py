@@ -98,6 +98,68 @@ def test_a_dropped_fold_is_caught(case_dir):
     assert "5 of 5 declared sessions absent" in message
 
 
+def test_a_frame_with_no_prediction_column_is_not_a_prediction_set(case_dir):
+    """`check_prediction_coverage` read a row as a prediction, so a bare session axis passed."""
+    frame = _frame().drop("prediction")
+    with pytest.raises(CoverageError) as excinfo:
+        check_prediction_coverage(frame, "cs", LABEL, case_dir=case_dir)
+    assert "no prediction column" in str(excinfo.value)
+
+
+def test_a_backtest_input_frame_still_needs_no_score_column(case_dir):
+    """The requirement sits on the prediction entry point; `_coverage` is shared."""
+    report = check_backtest_input_coverage(
+        _frame().drop("prediction"), "cs", LABEL, case_dir=case_dir
+    )
+    assert report.complete
+
+
+def test_all_null_predictions_do_not_read_as_coverage(case_dir):
+    frame = _frame().with_columns(pl.lit(None, dtype=pl.Float64).alias("prediction"))
+    with pytest.raises(CoverageError) as excinfo:
+        check_prediction_coverage(frame, "cs", LABEL, case_dir=case_dir)
+    assert "no predictions" in str(excinfo.value)
+
+
+def test_non_finite_predictions_do_not_read_as_coverage(case_dir):
+    """NaN and infinity are non-null and rank against nothing; they are not decisions."""
+    for value in (float("nan"), float("inf"), float("-inf")):
+        frame = _frame().with_columns(pl.lit(value, dtype=pl.Float64).alias("prediction"))
+        with pytest.raises(CoverageError) as excinfo:
+            check_prediction_coverage(frame, "cs", LABEL, case_dir=case_dir)
+        assert "no finite value" in str(excinfo.value)
+
+
+def test_a_session_whose_predictions_are_all_nan_counts_as_missing(case_dir):
+    frame = _frame().with_columns(
+        pl.when(pl.col("timestamp").dt.day() == 8)
+        .then(float("nan"))
+        .otherwise(pl.col("prediction"))
+        .alias("prediction")
+    )
+    with pytest.raises(CoverageError) as excinfo:
+        check_prediction_coverage(frame, "cs", LABEL, case_dir=case_dir)
+    assert "1 of 5 declared sessions absent" in str(excinfo.value)
+
+
+def test_an_integer_score_column_needs_only_to_be_non_null(case_dir):
+    """`is_finite` is undefined off a float column, so the condition there is non-null."""
+    frame = _frame().with_columns(pl.col("prediction").cast(pl.Int64).alias("prediction"))
+    assert check_prediction_coverage(frame, "cs", LABEL, case_dir=case_dir).complete
+
+
+def test_a_session_whose_predictions_are_all_null_counts_as_missing(case_dir):
+    frame = _frame().with_columns(
+        pl.when(pl.col("timestamp").dt.day() == 8)
+        .then(None)
+        .otherwise(pl.col("prediction"))
+        .alias("prediction")
+    )
+    with pytest.raises(CoverageError) as excinfo:
+        check_prediction_coverage(frame, "cs", LABEL, case_dir=case_dir)
+    assert "1 of 5 declared sessions absent" in str(excinfo.value)
+
+
 def test_a_single_missing_interior_session_is_caught(case_dir):
     survivors = [ts for ts in SESSIONS if ts.day != 8]
     with pytest.raises(CoverageError) as excinfo:
@@ -431,3 +493,47 @@ def test_the_gap_between_folds_is_read_on_the_decision_axis_too(case_dir, monkey
         decision_axis=pl.Series("timestamp", SESSIONS),
     )
     assert report.expected_sessions == len(SESSIONS)
+
+
+def test_a_declared_fold_subset_passes_on_the_folds_it_names(case_dir):
+    """A preview reduced to one fold is complete on that fold, not incomplete on both.
+
+    The crypto smoke chain reduces its model notebooks to `folds: [0]`, so fold 1 has no
+    predictions by construction. Measured against both declared folds the gate reported
+    "1095 of 2189 declared sessions across 2 folds - INCOMPLETE", which is the reduction
+    itself rather than a gap in what the run undertook to produce.
+    """
+    fold_zero = [ts for ts in SESSIONS if ts.day > 10]
+    report = check_prediction_coverage(_frame(fold_zero), "cs", LABEL, case_dir=case_dir, folds=[0])
+    assert report.complete
+    assert report.declared_folds == 1
+    assert report.expected_sessions == 5
+
+
+def test_a_subset_still_catches_a_gap_inside_the_fold_it_names(case_dir):
+    """Narrowing must not become a way to pass. The named fold is checked as strictly as ever."""
+    fold_zero = [ts for ts in SESSIONS if ts.day > 10]
+    with pytest.raises(CoverageError) as excinfo:
+        check_prediction_coverage(_frame(fold_zero[:-1]), "cs", LABEL, case_dir=case_dir, folds=[0])
+    assert "missing_sessions" in str(excinfo.value)
+
+
+def test_a_subset_still_refuses_a_fold_it_did_not_name(case_dir):
+    """A frame carrying fold 1 while declaring only fold 0 is a stale fold, not a bonus."""
+    with pytest.raises(CoverageError) as excinfo:
+        check_prediction_coverage(_frame(), "cs", LABEL, case_dir=case_dir, folds=[0])
+    assert "undeclared_fold" in str(excinfo.value)
+
+
+def test_a_subset_cannot_name_a_fold_setup_yaml_does_not_declare(case_dir):
+    """The subset narrows the declaration; it cannot extend or replace it."""
+    with pytest.raises(CoverageError) as excinfo:
+        check_prediction_coverage(_frame(), "cs", LABEL, case_dir=case_dir, folds=[7])
+    assert "not declared in setup.yaml" in str(excinfo.value)
+
+
+def test_an_empty_subset_is_refused_rather_than_checking_nothing(case_dir):
+    """`folds=[]` would otherwise expect no sessions and pass on any frame at all."""
+    with pytest.raises(CoverageError) as excinfo:
+        check_prediction_coverage(_frame(), "cs", LABEL, case_dir=case_dir, folds=[])
+    assert "no coverage at all" in str(excinfo.value)

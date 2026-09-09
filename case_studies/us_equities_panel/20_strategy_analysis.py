@@ -56,8 +56,11 @@ from case_studies.utils.registry import (
     training_hash_from_spec,
 )
 from case_studies.utils.registry.specs import project_training_identity
-from case_studies.utils.strategy_analysis import select_holdout_self_backtest
-from utils.style import COLORS
+from case_studies.utils.strategy_analysis import (
+    resolve_solvent_carrier,
+    select_holdout_self_backtest,
+)
+from utils.style import COLORS, show_with_alt
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "us_equities_panel"
@@ -171,10 +174,14 @@ for candidate_hash in validation_set.members:
         raise ValueError(f"{candidate_hash} does not use canonical validation prices")
 
 # %% [markdown]
-# Apply the deterministic validation rule only after every member has passed the protocol checks.
+# Apply the selection rule only after every member has passed the protocol checks. The
+# candidate set says which backtests may be chosen from; `resolve_solvent_carrier` says which
+# one is chosen, and it is handed the set rather than the whole registry. It is the same
+# resolver the holdout notebooks use.
 
 # %% tags=["results"]
-selected_validation = validation_set.best_validation_sharpe()
+carrier = resolve_solvent_carrier(CASE_STUDY_ID, admitted=frozenset(validation_set.members))
+selected_validation = study.results.open(carrier["val_backtest_hash"])
 if not isinstance(selected_validation, BacktestResult) or not selected_validation.complete:
     raise ValueError("selected validation backtest is incomplete")
 if selected_validation.execution_tier != "canonical":
@@ -189,7 +196,6 @@ print(f"Selected validation backtest: {selected_validation.hash}")
 # carried in by hand.
 
 # %% tags=["results"]
-
 selected_record = selected_validation.registry_record()
 selected_prediction = study.results.open(selected_record["prediction_hash"])
 selected_prediction_record = selected_prediction.registry_record()
@@ -241,7 +247,6 @@ selection_evidence = candidate_catalog.join(
 # member.
 
 # %% tags=["results"]
-
 if selection_evidence.height != len(validation_set.members):
     raise ValueError("validation set contains incomplete selection evidence")
 if set(selection_evidence["backtest_hash"]) != set(validation_set.members):
@@ -260,8 +265,17 @@ if not required_selection_metrics <= set(selection_evidence.columns) or any(
     raise ValueError("validation set contains a non-finite selection metric")
 
 selection_evidence = selection_evidence.sort(["sharpe", "backtest_hash"], descending=[True, False])
+if selected_validation.hash not in selection_evidence["backtest_hash"].to_list():
+    raise ValueError("the selected configuration is not among the candidates this table describes")
+# The table is ordered by the stored Sharpe, which is descriptive. Where its first row is not the
+# selected configuration, the two orderings disagree and saying so is the point of showing the
+# table: the stored column compares configurations over whatever span each one priced, and the
+# selection compares them over the span they share.
 if selection_evidence["backtest_hash"][0] != selected_validation.hash:
-    raise ValueError("displayed selection evidence disagrees with the candidate-set rule")
+    print(
+        f"stored-Sharpe order leads with {selection_evidence['backtest_hash'][0]}; the selected configuration "
+        f"is {selected_validation.hash}, selected over the sessions every candidate prices"
+    )
 selection_evidence
 
 # %% [markdown]
@@ -301,7 +315,6 @@ if holdout_prediction.registry_record()["training_hash"] != holdout_training.has
 # a run that came back with the validation hash did not refit.
 
 # %% tags=["results"]
-
 selected_label = selected_training.spec()["label"]
 selected_checkpoint = (
     selected_prediction_record["checkpoint_kind"],
@@ -442,10 +455,13 @@ selected_performance
 # %% [markdown]
 # ## Required paired comparisons
 #
-# Validation and holdout windows are disjoint, so their difference uses independently resampled
-# windows registered under `val_rank1_self`. Benchmark evidence uses the equal-weight return artifact
-# for the selected label and window. Each comparison must resolve once and carry finite interval
-# bounds.
+# Validation and holdout windows share no observations, so there is no difference series to pair
+# on and each window is resampled over its own length, registered under `val_rank1_self`. That is
+# the absence of a pairing rather than independence: the two Sharpes are the same strategy in
+# adjacent periods and stay dependent. The interval is for the gap between these two windows, and
+# a regime that lands differently on each is outside what it covers. Benchmark evidence uses the
+# equal-weight return artifact for the selected label and window. Each comparison must resolve
+# once and carry finite interval bounds.
 
 # %% tags=["results"]
 holdout_pairs = load_paired_metrics(
@@ -480,7 +496,6 @@ validation_to_benchmark = validation_pairs.filter(
 # carry the label the selected configuration was fitted on.
 
 # %% tags=["results"]
-
 benchmark_prefix = f"side_ew:{CASE_STUDY_ID}:{selected_label}"
 if any(
     not frame["benchmark_hash"][0].startswith(benchmark_prefix)
@@ -561,14 +576,15 @@ for period, result in (
 # returns; the bottom row shows the decline from each window's running peak.
 
 # %% tags=["results"]
-
 fig, axes = plt.subplots(2, 2, figsize=(12, 7), sharex="col")
+summary = {}
 for column, period in enumerate(("validation", "holdout")):
     returns = return_frames[period]
     values = returns["daily_return"].to_numpy()
     wealth = np.cumprod(1.0 + values)
     running_peak = np.maximum.accumulate(np.concatenate(([1.0], wealth)))[1:]
     drawdown = wealth / running_peak - 1.0
+    summary[period] = (float(wealth[-1] - 1.0), float(drawdown.min()))
     axes[0, column].plot(returns["timestamp"], wealth - 1.0, color=COLORS["blue"])
     axes[0, column].axhline(0, color=COLORS["neutral"], linewidth=0.8, linestyle="--")
     axes[0, column].set_title(f"{period.title()} Cumulative Return")
@@ -584,7 +600,18 @@ axes[0, 0].set_ylabel("Cumulative return")
 axes[1, 0].set_ylabel("Drawdown")
 fig.suptitle("Locked Strategy Across Validation and Holdout Windows")
 fig.tight_layout()
-fig.show()
+# The alt text reads the two end points and the two troughs from the frames rather than describing
+# a shape, so a window described as ending ahead when it does not is a claim the data refutes.
+_read = "; ".join(
+    f"{period} ends at {total:+.1%} cumulative return with a worst drawdown of {worst:.1%}"
+    for period, (total, worst) in summary.items()
+)
+show_with_alt(
+    fig,
+    "Four panels in two columns, validation on the left and holdout on the right, each column "
+    "sharing a time axis. The top row traces cumulative return with a dashed line at zero; the "
+    f"bottom row shades the decline from each window's running peak. Read from the frames: {_read}.",
+)
 
 # %% [markdown]
 # ## Computed assessment

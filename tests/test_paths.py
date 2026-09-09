@@ -8,6 +8,8 @@ to avoid overwriting production artifacts during tests.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from utils.paths import (
@@ -18,6 +20,7 @@ from utils.paths import (
     get_case_study_dir,
     get_chapter_dir,
     get_output_dir,
+    require_chapter_inputs,
 )
 
 # -----------------------------------------------------------------------------
@@ -42,6 +45,32 @@ def test_display_path_preserves_unrelated_and_relative_paths(tmp_path, monkeypat
 
     assert display_path(unrelated) == str(unrelated)
     assert display_path("relative/artifact.txt") == "relative/artifact.txt"
+
+
+def test_display_path_stays_relative_through_a_symlinked_subdirectory(
+    tmp_path, monkeypatch
+) -> None:
+    """A `--case-study` worktree reaches run_log/ through a symlink into the artifact store.
+
+    Resolving before relativizing followed that link out of the repository and
+    printed the absolute store path into the committed notebook output.
+    """
+    import utils.paths as paths
+
+    fake_repo = tmp_path / "public-cs"
+    (fake_repo / "case_studies" / "etfs").mkdir(parents=True)
+    store = tmp_path / "artifacts" / "case_studies" / "etfs" / "run_log"
+    store.mkdir(parents=True)
+    (store / "registry.db").touch()
+    (fake_repo / "case_studies" / "etfs" / "run_log").symlink_to(store)
+
+    monkeypatch.setattr(paths, "REPO_ROOT", fake_repo.resolve())
+    monkeypatch.setattr(paths, "_REPO_ROOT_AS_WRITTEN", fake_repo)
+
+    assert (
+        paths.display_path(fake_repo / "case_studies" / "etfs" / "run_log" / "registry.db")
+        == "case_studies/etfs/run_log/registry.db"
+    )
 
 
 def test_chapters_registry_covers_1_through_27() -> None:
@@ -169,3 +198,69 @@ def test_get_case_study_dir_create_true_is_idempotent(tmp_path, monkeypatch) -> 
     second = get_case_study_dir("etfs", create=True)
     assert first == second
     assert first.exists()
+
+
+class TestRequireChapterInputs:
+    """A notebook whose chapter inputs are absent must stop, not substitute defaults.
+
+    Chapter outputs are gitignored, so a fresh clone or worktree has none of them.
+    06_itch_intraday_patterns used to fall back to well-known tickers, run to
+    completion, exit 0 and write a page with four figures reduced to none; the
+    provenance stamp applied and the commit hooks passed, so the empty page was
+    committable.
+    """
+
+    def test_present_inputs_pass_silently(self, tmp_path: Path) -> None:
+        present = tmp_path / "trades.parquet"
+        present.write_bytes(b"")
+
+        require_chapter_inputs({present: "05_itch_trading_activity"})
+
+    def test_a_missing_input_raises_and_names_its_producer(self, tmp_path: Path) -> None:
+        missing = tmp_path / "trade_summary.parquet"
+
+        with pytest.raises(FileNotFoundError) as excinfo:
+            require_chapter_inputs({missing: "05_itch_trading_activity"})
+
+        message = str(excinfo.value)
+        assert "trade_summary.parquet" in message
+        assert "05_itch_trading_activity" in message
+
+    def test_every_missing_input_is_reported_not_just_the_first(self, tmp_path: Path) -> None:
+        """A reader who fixes one and re-runs should not discover the next one by hand."""
+        first = tmp_path / "trade_summary.parquet"
+        second = tmp_path / "trades.parquet"
+        third = tmp_path / "messages"
+
+        with pytest.raises(FileNotFoundError) as excinfo:
+            require_chapter_inputs(
+                {
+                    first: "05_itch_trading_activity",
+                    second: "05_itch_trading_activity",
+                    third: "01_itch_parser",
+                }
+            )
+
+        message = str(excinfo.value)
+        assert "trade_summary.parquet" in message
+        assert "trades.parquet" in message
+        assert "01_itch_parser" in message
+
+    def test_a_present_input_is_not_reported_alongside_a_missing_one(self, tmp_path: Path) -> None:
+        present = tmp_path / "trades.parquet"
+        present.write_bytes(b"")
+        missing = tmp_path / "trade_summary.parquet"
+
+        with pytest.raises(FileNotFoundError) as excinfo:
+            require_chapter_inputs(
+                {present: "05_itch_trading_activity", missing: "05_itch_trading_activity"}
+            )
+
+        assert "trades.parquet" not in str(excinfo.value)
+
+    def test_a_directory_input_counts_as_present(self, tmp_path: Path) -> None:
+        """01_itch_parser produces a directory of per-message-type partitions."""
+        messages = tmp_path / "messages"
+        messages.mkdir()
+
+        require_chapter_inputs({messages: "01_itch_parser"})

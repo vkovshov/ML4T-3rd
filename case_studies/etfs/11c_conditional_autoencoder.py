@@ -201,6 +201,7 @@ requests = model_requests(
     execution_tier=EXECUTION_TIER,
     overrides={"device": device},
     preview_reductions=PREVIEW_REDUCTIONS,
+    notebook="11c_conditional_autoencoder",
 )
 resolved = tuple(request.resolve() for request in requests)
 
@@ -474,9 +475,18 @@ by_fold = {
 }
 for label in panel_labels:
     ic = by_fold[label].get_column("fold_ic")
+    # See 11b: polars returns None for the mean of an empty column and for the standard
+    # deviation of a single row, and a narrowed population produces both.
+    if ic.len() == 0:
+        print(f"{label} at epoch {last_checkpoint}: no fold scored, so there is no IC")
+        continue
+    spread = (
+        f"standard deviation across folds {ic.std():.4f}"
+        if ic.len() > 1
+        else "one fold only, so no spread across folds"
+    )
     print(
-        f"{label} at epoch {last_checkpoint}: mean {ic.mean():+.4f}, "
-        f"standard deviation across folds {ic.std():.4f}, "
+        f"{label} at epoch {last_checkpoint}: mean {ic.mean():+.4f}, {spread}, "
         f"{(ic < 0).sum()} of {ic.len()} folds negative"
     )
 
@@ -537,5 +547,8 @@ by_fold[panel_labels[0]]
 # **Next**: [`11d_stochastic_discount_factor`](11d_stochastic_discount_factor.ipynb) leaves the
 # two-stage shape behind entirely - it prices the cross-section rather than splitting the problem
 # into exposures and factor returns - and
-# [`11e_supervised_autoencoder`](11e_supervised_autoencoder.ipynb) keeps this notebook's network
-# and bottleneck while dropping the factor interpretation, which makes it the family's own control.
+# [`11e_supervised_autoencoder`](11e_supervised_autoencoder.ipynb) drops the factor
+# interpretation altogether and predicts the return from its bottleneck directly, which makes it
+# the one member fitted without the family's central assumption. Its network is not this one's -
+# it is deeper and wider, at a tenth of this learning rate - so the pair is not a controlled
+# comparison and that notebook does not read it as one.

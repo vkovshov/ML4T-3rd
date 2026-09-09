@@ -15,7 +15,6 @@ Usage:
 
 from __future__ import annotations
 
-import random
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -25,31 +24,65 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
+def top_entities(
+    data: pl.DataFrame | pl.LazyFrame,
+    max_entities: int,
+    entity_col: str = "symbol",
+) -> list:
+    """The ``max_entities`` entities with the most rows, ties broken by name.
+
+    **This is the one rule for reducing a panel's entity axis**, and every reduction
+    in the test and fixture path has to reach it, whether from a loader or from a
+    modelling helper. Two callers reducing the same panel to the same size have to
+    get the same universe or they are not measuring the same study: a symbol only
+    one side chose carries null features on the other, which runs clean and answers
+    wrongly.
+
+    Measured on nasdaq100_microstructure's CI fixture before the rules were unified:
+    ``02_labels`` and ``03_financial_features`` reduced through the loader to
+    {AAPL, AMD, CMCSA, CSCO, SIRI} - a seeded random sample - while
+    ``04_model_based_features`` took the five most-observed symbols,
+    {AAPL, AMD, AMZN, FB, TSLA}. Three of the five symbols the labels and financial
+    features covered therefore had no temporal features at all.
+
+    Row counts tie readily on these panels - five of the twelve fixture symbols sit
+    at exactly 136,140 bars - and a tie broken by frame order is not stable across
+    runs or across callers, so the entity name is the secondary key.
+
+    Production runs pass 0 and never reach this.
+    """
+    counts = (
+        data.lazy()
+        .group_by(entity_col)
+        .len()
+        .sort(["len", entity_col], descending=[True, False])
+        .head(max_entities)
+        .collect()
+    )
+    return counts[entity_col].to_list()
+
+
 def apply_max_symbols(
     data: pl.DataFrame | pl.LazyFrame,
     max_symbols: int,
     symbol_col: str = "symbol",
-    seed: int = 42,
 ) -> pl.DataFrame | pl.LazyFrame:
-    """Limit data to a random subset of symbols for fast-path testing.
+    """Limit data to the ``max_symbols`` most-observed symbols, for fast-path testing.
 
-    Selects a reproducible random sample of symbols using a fixed seed.
-    Returns data unchanged if max_symbols <= 0 or >= total symbols.
+    The loader-side entry point to :func:`top_entities`; ``utils.modeling`` reaches
+    the same rule from the modelling side. It used to be a seeded random sample of
+    the sorted symbol list, which disagreed with every consumer that reduced by
+    observation count and moved whenever the underlying symbol set changed.
+
+    Returns data unchanged if max_symbols <= 0.
     """
     if max_symbols <= 0:
         return data
 
-    if isinstance(data, pl.LazyFrame):
-        all_symbols = data.select(pl.col(symbol_col).unique()).collect()[symbol_col].to_list()
-    else:
-        all_symbols = data[symbol_col].unique().to_list()
-
-    if max_symbols >= len(all_symbols):
-        return data
-
-    rng = random.Random(seed)
-    selected = rng.sample(sorted(all_symbols), max_symbols)
-    return data.filter(pl.col(symbol_col).is_in(selected))
+    selected = top_entities(data, max_symbols, symbol_col)
+    # implode: is_in against a bare Series of the same dtype is deprecated in polars
+    # as ambiguous, and membership in the value set is what is meant.
+    return data.filter(pl.col(symbol_col).is_in(pl.Series(symbol_col, selected).implode()))
 
 
 def describe_coverage(
@@ -91,6 +124,21 @@ def print_coverage(
     print(f"  Unique times: {cov['unique_times']:,}")
 
 
+# An adjusted price panel applies one cumulative ratio to each OHLC field separately, and
+# the four multiplications do not round identically. A bar whose high IS its close then
+# stores two float64 values a bit or two apart, and a strict `high >= close` reports it as
+# a violation of an invariant the data does not actually break. Measured on the ETF panel
+# in 02_financial_data_universe/03_etfs_eda: 760 of 470,662 rows, largest breach 2.01e-16
+# of the close against a float64 epsilon of 2.22e-16.
+#
+# The tolerance is relative because the same panel spans closes from 5.60 to 862.50, so a
+# fixed absolute epsilon is two orders of magnitude too coarse at one end and too fine at
+# the other. Four epsilons covers the ~1 ulp that two independently rounded products can
+# differ by, with headroom, and is still ~11 orders of magnitude below the smallest
+# violation a real data defect produces: one cent on a $100 bar is 1e-4 relative.
+OHLC_RELATIVE_TOLERANCE = 4 * 2.220446049250313e-16
+
+
 def check_ohlc_invariants(
     df: pl.DataFrame,
     open_col: str = "open",
@@ -98,6 +146,7 @@ def check_ohlc_invariants(
     low_col: str = "low",
     close_col: str = "close",
     volume_col: str = "volume",
+    rtol: float = OHLC_RELATIVE_TOLERANCE,
 ) -> pl.DataFrame:
     """Check OHLC data quality invariants.
 
@@ -109,6 +158,14 @@ def check_ohlc_invariants(
     - low <= close
     - volume >= 0 (if volume column exists)
 
+    The ordering comparisons are inexact. Each is evaluated against a tolerance
+    proportional to the magnitudes being compared, because an adjusted price panel
+    stores a bar whose high IS its close as two float64 values a bit apart - the
+    cumulative adjustment ratio is applied to each field separately and the products
+    do not round identically. A strict comparison reports those bars as violations of
+    an invariant the data does not break. ``volume >= 0`` stays exact: zero has no
+    rounding neighbourhood to allow for.
+
     For each check, only rows where all relevant columns are non-null are
     considered. This prevents null comparisons from distorting percentages
     (important for TAQ data where trade columns may be null for no-trade bars).
@@ -117,6 +174,9 @@ def check_ohlc_invariants(
         df: DataFrame with OHLC columns
         open_col, high_col, low_col, close_col: Column names for OHLC
         volume_col: Column name for volume (optional)
+        rtol: Relative tolerance for the ordering comparisons. The default,
+            ``OHLC_RELATIVE_TOLERANCE``, admits float64 adjustment noise and nothing
+            a real data defect would produce. Pass 0.0 for exact comparisons.
 
     Returns:
         DataFrame with check names and valid_pct columns
@@ -124,6 +184,11 @@ def check_ohlc_invariants(
     results = []
     total_rows = df.height
     cols = set(df.columns)
+
+    def _at_least(greater: str, lesser: str) -> pl.Expr:
+        """``greater >= lesser`` allowing ``rtol`` scaled to the pair's magnitude."""
+        slack = rtol * pl.max_horizontal(pl.col(greater).abs(), pl.col(lesser).abs())
+        return pl.col(greater) >= pl.col(lesser) - slack
 
     def _check_invariant(name: str, condition: pl.Expr, required_cols: list[str]) -> None:
         """Check an invariant on rows where all required columns are non-null."""
@@ -149,35 +214,35 @@ def check_ohlc_invariants(
     if {high_col, low_col}.issubset(cols):
         _check_invariant(
             "high_gte_low",
-            pl.col(high_col) >= pl.col(low_col),
+            _at_least(high_col, low_col),
             [high_col, low_col],
         )
 
     if {high_col, open_col}.issubset(cols):
         _check_invariant(
             "high_gte_open",
-            pl.col(high_col) >= pl.col(open_col),
+            _at_least(high_col, open_col),
             [high_col, open_col],
         )
 
     if {high_col, close_col}.issubset(cols):
         _check_invariant(
             "high_gte_close",
-            pl.col(high_col) >= pl.col(close_col),
+            _at_least(high_col, close_col),
             [high_col, close_col],
         )
 
     if {low_col, open_col}.issubset(cols):
         _check_invariant(
             "low_lte_open",
-            pl.col(low_col) <= pl.col(open_col),
+            _at_least(open_col, low_col),
             [low_col, open_col],
         )
 
     if {low_col, close_col}.issubset(cols):
         _check_invariant(
             "low_lte_close",
-            pl.col(low_col) <= pl.col(close_col),
+            _at_least(close_col, low_col),
             [low_col, close_col],
         )
 

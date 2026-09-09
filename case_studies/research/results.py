@@ -4,6 +4,7 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -26,14 +27,14 @@ from .contracts import ExecutionTier
 _VERIFIED_ARTIFACT_DIGESTS: dict[tuple[str, int, int], str] = {}
 
 
-def _verified_digest(path: Path, load) -> str:
+def _verified_digest(path: Path, load, digest_fn=None) -> str:
     from case_studies.utils.artifact_digest import value_digest
 
     stat = path.stat()
     key = (str(path), stat.st_mtime_ns, stat.st_size)
     digest = _VERIFIED_ARTIFACT_DIGESTS.get(key)
     if digest is None:
-        digest = value_digest(load())
+        digest = (digest_fn or value_digest)(load())
         _VERIFIED_ARTIFACT_DIGESTS[key] = digest
     return digest
 
@@ -324,6 +325,47 @@ class Result:
         }
 
 
+def normalized_feature_artifacts(value: Any) -> Any:
+    """`computation.feature_artifacts` as the set of inputs it names, whatever its shape.
+
+    Seven producers write this field and six of them write `mds.input_lineage["artifacts"]` -
+    `{role: {"sha256": <hex>, "size": <int>}}` - while the latent adapter writes
+    `case.input_data_spec["files"]`, a list of `{"role": ..., "sha256": "sha256:<hex>"}`
+    (ml4t/agent-workspace#891). The two are the same statement in different words. Measured on
+    `etfs` 2026-09-07, one latent and one linear run at `fwd_ret_21d`: the same three roles -
+    financial, label, model_based - carrying the same three sha256 values, rendered one way
+    with a prefix and no size and the other way with a size and no prefix.
+
+    So a candidate set spanning both families refused on `feature_artifacts` for two members
+    that were fitted on identical files, and the only way past it was to declare the field
+    comparable - which silences the check for the members it could legitimately compare.
+
+    The comparison asks whether two members were fitted on the same inputs. That is a question
+    about which files, by content, and not about how a producer serialized the answer, so it is
+    asked over `{role: <content hash>}`. `size` is dropped because a file's length is decided
+    by its content and adds nothing a sha256 has not already said.
+
+    Anything this does not recognize is returned unchanged, so an unfamiliar shape still
+    compares exactly rather than silently comparing equal to everything.
+    """
+    if isinstance(value, dict) and all(isinstance(item, dict) for item in value.values()):
+        return {
+            str(role): _content_hash(record.get("sha256")) for role, record in sorted(value.items())
+        }
+    if isinstance(value, list) and all(
+        isinstance(item, dict) and "role" in item and "sha256" in item for item in value
+    ):
+        return {str(item["role"]): _content_hash(item["sha256"]) for item in value}
+    return value
+
+
+def _content_hash(value: Any) -> Any:
+    """A sha256 with or without its `sha256:` prefix, as the bare digest."""
+    if isinstance(value, str) and value.startswith("sha256:"):
+        return value[len("sha256:") :]
+    return value
+
+
 @dataclass(frozen=True)
 class TrainingResult(Result):
     def fitted_states(self) -> list[Any]:
@@ -444,7 +486,17 @@ class PredictionResult(Result):
         recorded_digest = coverage.get("artifact_digest")
         if recorded_digest:
             try:
-                if _verified_digest(prediction_file, self.load) != recorded_digest:
+                # The same digest `register_prediction_set` recorded: the frame's `label`
+                # column states which declaration a coverage check should apply to it and is
+                # not part of its content identity (ml4t/agent-workspace#887), so a labelled
+                # artifact and the unlabelled one written before the column existed digest
+                # alike and neither reports incomplete.
+                from case_studies.utils.artifact_digest import published_prediction_digest
+
+                if (
+                    _verified_digest(prediction_file, self.load, published_prediction_digest)
+                    != recorded_digest
+                ):
                     return f"{prediction_file} does not match its recorded digest"
             except (OSError, ValueError, pl.exceptions.PolarsError):
                 return f"{prediction_file} could not be read to verify its digest"
@@ -561,7 +613,25 @@ class ResultsCatalog:
         *,
         execution_tier: str | ExecutionTier = ExecutionTier.CANONICAL,
         runtime_provenance: dict[str, Any] | None = None,
+        started_at: str | None = None,
     ) -> TrainingResult:
+        """Register a training identity. ``started_at`` records when work on it began.
+
+        A training run is registered before it is fitted, because the identity has to exist
+        before anything can be written under it, and ``elapsed_s`` is filled in afterwards by
+        :func:`record_training_cost`. Between those two moments - which for one nasdaq
+        configuration has now been more than seven hours - the row says nothing about
+        whether the fit is running, finished or wedged.
+
+        ``started_at`` closes that. With it, a row whose ``elapsed_s`` is still NULL is
+        legible: a wall clock says how long this configuration has been going, and how that
+        compares to its siblings. Without it the only recoverable timing is
+        ``created_at - started_at`` after the fact, which is what
+        ml4t/agent-workspace#1026 found the whole corpus reduced to.
+
+        Like ``entry_point``, it is a **table column and not part of ``spec``**, so recording
+        it moves no training hash. Nothing here may touch ``computation``.
+        """
         self.study.require_writable()
         tier = ExecutionTier(execution_tier)
         resolved = dict(spec)
@@ -593,6 +663,10 @@ class ResultsCatalog:
             # (`case_studies.utils.linear`); this one names the notebook.
             entry_point=self.study.entry_point,
             runtime_provenance=runtime_provenance,
+            # Defaulted here rather than at every call site: a caller that forgets it should
+            # still leave a legible row, and "when the identity was registered" is within
+            # seconds of "when work on it began" on every path that registers before fitting.
+            started_at=started_at or datetime.now(UTC).isoformat(),
         )
         result = Result.open(
             self.study,

@@ -89,8 +89,12 @@
   skip_reason: "Requires 01_itch_parser output (raw ITCH binary pipeline) \u2014 tested locally"
   timeout: 300
 03_market_microstructure/06_itch_intraday_patterns:
+  skip: true
+  skip_reason: "Requires 05_itch_trading_activity's chapter outputs, and 05 is itself skipped \u2014 tested locally"
   timeout: 300
 03_market_microstructure/07_itch_stylized_facts:
+  skip: true
+  skip_reason: "Requires 05_itch_trading_activity's chapter outputs, and 05 is itself skipped \u2014 tested locally"
   timeout: 300
 03_market_microstructure/08_databento_lob_reconstruction:
   timeout: 300
@@ -463,8 +467,25 @@
     N_TRIALS: 2
   timeout: 600
 12_gradient_boosting/07_hpo_comparison:
-  gpu: true
+  # No `gpu:`, because nothing here asks for a device: the source holds no occurrence of cuda,
+  # device_type, torch or gpu. It fits lightgbm, xgboost and catboost through optuna on whatever
+  # the machine has, and the flag it carried had no relation to why it is slow.
+  #
+  # It cannot be per-commit yet, and the reason is a defect in the notebook rather than a budget.
+  # Measured 2026-09-08 with the card hidden: 2,411s at its declared settings, and it did not
+  # finish. Its parameters cell declares `N_GRID_POINTS = 50` and `N_OPTUNA_TRIALS = 50` and the
+  # notebook reads neither - `pm_helpers.unusable_parameters` names both, "the notebook never
+  # reads it below the parameters cell". What it actually reads is `N_GRID = len(grid)` at line
+  # 200, derived rather than declared, plus `trial_budgets = [10, 25, 50, 75, N_GRID]` at 326,
+  # which runs five more studies. So there is no knob to turn from here: setting the two declared
+  # names reduces nothing, and a run at 6 and 6 took 617s and still timed out.
+  #
+  # `long_running: true` was never what excluded it - no workflow deselects that marker, so the
+  # GPU flag was the whole of it, and removing the flag without this would turn the chapter job
+  # red. Per-commit coverage waits on ml4t/agent-workspace#1101 giving the search a knob the
+  # notebook reads.
   long_running: true
+  tier: on_demand
   timeout: 2400
 12_gradient_boosting/08_shap_analysis:
   env:
@@ -477,7 +498,9 @@
   gpu: true
   timeout: 300
 12_gradient_boosting/11_conformal_gbm:
-  gpu: true
+  # No `gpu:`. This one is stronger than stale: line 229 passes `"device_type": "cpu"`, and
+  # the prose above it says GPU training can be faster but that this uses a fixed thread
+  # count. The declaration contradicted the notebook's own code.
   timeout: 900
 12_gradient_boosting/12_case_study_insights:
   timeout: 300
@@ -845,18 +868,27 @@
 19_risk_management/04_factor_exposure:
   timeout: 300
 19_risk_management/05_trade_shap_diagnostics:
-  gpu: true
+  # `GPU_DEVICE = "cuda"` at line 80, passed as `device_type` at 222 and asserted at 231.
+  # That needs a LightGBM built with -DUSE_CUDA=1, which the PyPI wheel this repo's lockfile
+  # resolves is not; torch seeing a card says nothing about it. ml4t/agent-workspace#862.
+  gpu: lightgbm_cuda
   timeout: 300
 19_risk_management/06_stress_testing:
   timeout: 300
 19_risk_management/07_drift_detection:
-  gpu: true
+  # Both, and separately: `device_type="cuda"` at line 306 needs the CUDA LightGBM build,
+  # and lines 223-226 read `torch.cuda.get_device_name` directly. It runs only where both
+  # are present.
+  gpu: [torch, lightgbm_cuda]
   timeout: 300
 19_risk_management/08_ml_exit_signals:
-  gpu: true
+  # `LGB_DEVICE = "cuda"` at line 64, passed as `device_type` at 303 and read back at 449.
+  gpu: lightgbm_cuda
   timeout: 300
 19_risk_management/09_deep_hedging:
-  gpu: true
+  # torch alone: it refuses at line 105 unless CUDA is available and calls
+  # `torch.cuda.set_device(0)`. No LightGBM here.
+  gpu: torch
   parameters:
     BATCH_SIZE: 64
     N_EPOCHS: 5
@@ -868,7 +900,23 @@
 19_risk_management/11_systematic_risk_sweep:
   timeout: 900
 20_strategy_synthesis/00_holdout_predictions:
-  skip_reason: Requires trained model registry (not available in CI test data)
+  # No `skip: true` ever stood above the skip_reason this replaces, so the notebook has
+  # always run; the reason was describing a state that had stopped being true. It also
+  # carried no timeout, so it inherited the 300s default while 01 and 03 next to it carry
+  # 600 - it had never been priced, only kept under the default by work it was not doing.
+  #
+  # It is doing that work now. Until #746 the seeded fixtures gave cme_futures' two cohort
+  # leaders a fabricated entity grid (the RuntimeWarning naming b099266d758c and
+  # fbeb779467d5 is in the last green run's log), the holdout retrain found nothing real to
+  # fit, and the cell finished in about 135s while stepping over the case study. Seeding
+  # those leaders from the case study's own label parquet makes the retrain run: measured
+  # here at 350s for cme_futures and 60s for sp500_equity_option_analytics against 426s for
+  # the whole loop, with every other case study in single figures. Measured at 590s in the
+  # ml4t image with the wider fixture panels of #749 on top.
+  #
+  # 1800s is three times the widest of those against a runner slower than either machine,
+  # the same ratio 11d_conditional_autoencoder's cap carries, and it absorbs #749.
+  timeout: 1800
 20_strategy_synthesis/01_aggregate_synthesis:
   parameters:
     # Isolated test registry has no nasdaq out-of-band cost-feasible carrier,
@@ -1030,7 +1078,6 @@
   long_running: true
   parameters:
     MAX_COMPANIES: 3
-  skip_reason: Needs GPU + Neo4j
   timeout: 1200
 24_autonomous_agents/01_react_reasoning:
   parameters:
@@ -1191,18 +1238,24 @@ case_studies/cme_futures/04_model_based_features:
   # ten products carry the feature, so a fixture covering three of the thirty leaves the
   # temporal features under the coverage gate and scores nothing.
   #
-  # ARIMA_REFIT_FREQ is what bounds this notebook in CI. Neither of the other two levers
-  # is available: MAX_PRODUCTS is held at 0 by the coverage gate above, and MAX_FOLDS
-  # slices `splits` so a reduced artifact fails 06-09 and 11 at "artifact fold is
-  # missing". The job timed out here at the 1800s cell limit on 2026-08-10 (run
-  # 31353597681), in the walk-forward cell and not in the FFT one - FFT_WINDOW bounds the
-  # spectral features and never bounded this. Re-selecting the ARIMA order annually
-  # rather than monthly cuts the stepwise searches twelvefold and leaves the number of
-  # forecasts, and so the row count every downstream gate reads, exactly as it was.
+  # The refit cadence is what bounds this notebook in CI, and since the schedule moved to
+  # config/setup.yaml the lever is REFIT_EVERY_OVERRIDE rather than ARIMA_REFIT_FREQ. It
+  # replaces both declared cadences with 252: annual ARIMA order selection instead of
+  # monthly, and an annual rather than quarterly regime refit. Neither leaves the emitted
+  # rows or columns any different, which is the point of overriding a cadence rather than
+  # a burn-in.
+  #
+  # Neither of the other two levers is available: MAX_PRODUCTS is held at 0 by the coverage
+  # gate above, and MAX_FOLDS narrows only what section F screens over. The job timed out
+  # here at the 1800s cell limit on 2026-08-10 (run 31353597681), in the walk-forward cell
+  # and not in the FFT one - FFT_WINDOW bounds the spectral features and never bounded
+  # this. Re-selecting the ARIMA order annually rather than monthly cuts the stepwise
+  # searches twelvefold and leaves the number of forecasts, and so the row count every
+  # downstream gate reads, exactly as it was.
   parameters:
     FFT_WINDOW: 126
     MAX_PRODUCTS: 0
-    ARIMA_REFIT_FREQ: 252
+    REFIT_EVERY_OVERRIDE: 252
   timeout: 1800
 case_studies/cme_futures/05_evaluation:
   # No MAX_SYMBOLS. The cross-sectional IC in Section 4 keeps a date only when at least
@@ -1211,7 +1264,20 @@ case_studies/cme_futures/05_evaluation:
   # zero-row subplot. The fixture carries all 30 products, which is what production
   # evaluates, and the reduction bought nothing: the panel is 38k rows either way.
   timeout: 600
+# max_symbols is 10 rather than 5 for the reason case_studies/etfs/06_linear states, with
+# this case study's arithmetic: top_k_grid [5, 10] and long-short, so the smallest declared
+# concentration needs 2 x 5 = 10 names to hold a long and a short leg that do not overlap.
+# This also clears the fold-4 feature-column loss the header of this file records at 5.
+# Ten is reachable here: `intermediates/cme_futures/features/financial.parquet` carries 30
+# products, measured 2026-09-07 on ml4t/third-edition-test-data 63a9e4e.
 case_studies/cme_futures/06_linear:
+  # 120s is measured here, not copied. Slowest of 5 green `cs-cme_futures` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 15.1s, 13% of the budget, against
+  # 20.9s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
   parameters:
     # Restored after #560, same removal as 07_gbm below. This one has been passing on its 120s
     # budget rather than failing, which is the reason to fix it now: it is mispriced in exactly
@@ -1221,7 +1287,7 @@ case_studies/cme_futures/06_linear:
     # for the same reason as 07_gbm below: the reduction is what it was calibrated against.
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-      max_symbols: 5
+      max_symbols: 10
   timeout: 120
 case_studies/cme_futures/07_gbm:
   parameters:
@@ -1247,17 +1313,41 @@ case_studies/cme_futures/07_gbm:
       checkpoint_interval: 10
       folds: [0, 1]
       max_iterations: 20
-      max_symbols: 5
+      max_symbols: 10
   # Measured the same way and at the same load: 172.9 s end to end. Kept at 180 s.
   timeout: 180
 case_studies/cme_futures/08_tabular_dl:
-  gpu: true
-    # BATCH_SIZE, MAX_FOLDS, MAX_SYMBOLS, N_EPOCHS and LOOKBACK were the pre-migration knobs.
-    # This notebook plans through the shared catalog and reads none of them, so setting them
-    # reduced nothing while the override file said it had. The CI fixture is the reduction here.
+  # BATCH_SIZE, MAX_FOLDS, MAX_SYMBOLS, N_EPOCHS and LOOKBACK were the pre-migration knobs.
+  # This notebook plans through the shared catalog and reads none of them, so setting them
+  # reduced nothing while the override file said it had. The CI fixture is the reduction here.
+  # Runs on the CPU in CI (ml4t/agent-workspace#1064). `gpu: true` skipped it on every runner
+  # without a card, which is every CI runner, so this stage had no coverage at all.
+  #
+  # 29.6 s, measured 2026-09-07 on four cores (`taskset -c 0-3`) with CUDA hidden, against
+  # test-data 2c068b5a and the `max_symbols: 5` that `_collect_preview_reductions` injects when
+  # an entry declares no reduction. Four dedicated cores on this workstation are an
+  # approximation of a four-core runner and not the same machine, so 300 is kept as a budget
+  # with an order of magnitude of room rather than sized to the measurement. Re-base it on the
+  # first green `cs-cme_futures` runs, which is where the percentages elsewhere in this file
+  # come from.
+  # DEVICE and POPULATION_NAME travel together, as in the etfs DL blocks: the device is inside
+  # the training identity, so a CPU run declares a different member set and must name its own
+  # population rather than publish into the canonical one. Pairing them also keeps
+  # `tests/generate_intermediates.py --no-skip-dl` working, which reads this file with
+  # `research_preview=False` and so reaches the guard in canonical mode.
+  parameters:
+    DEVICE: cpu
+    POPULATION_NAME: cme_futures-tabular_dl-preview
   timeout: 300
 case_studies/cme_futures/09_dl_lstm:
-  gpu: true
+  # DEVICE and POPULATION_NAME travel together, as in the etfs DL blocks: the device is inside
+  # the training identity, so a CPU run declares a different member set and must name its own
+  # population rather than publish into the canonical one. Pairing them also keeps
+  # `tests/generate_intermediates.py --no-skip-dl` working, which reads this file with
+  # `research_preview=False` and so reaches the guard in canonical mode.
+  parameters:
+    DEVICE: cpu
+    POPULATION_NAME: cme_futures-deep_learning-preview
     # BATCH_SIZE, MAX_FOLDS, MAX_SYMBOLS, N_EPOCHS and LOOKBACK were the pre-migration knobs.
     # This notebook plans through the shared catalog and reads none of them, so setting them
     # reduced nothing while the override file said it had.
@@ -1284,9 +1374,43 @@ case_studies/cme_futures/09_dl_lstm:
     # parameters cell declares both EXECUTION_TIER and WORKSPACE, which this one does.
     # Enabling CPU coverage needs a DEVICE parameter and nothing else, and that is queued
     # behind the pending 09 refit rather than done here.
-  timeout: 300
+    #
+    # The DEVICE parameter now exists (ml4t/agent-workspace#1064) and this runs on the CPU.
+    # 90.1 s, measured 2026-09-07 on four cores (`taskset -c 0-3`) with CUDA hidden, against
+    # test-data 2c068b5a and the same `max_symbols: 5` the 542 s figure above was taken at.
+    # The two are the same work: 542/90 is 6.0, which is the contention factor the workstation
+    # was carrying when that run was timed, recorded in the `10a_pca` entry below. Neither is a
+    # CI number. 600 rather than 300 because the two measurements of this notebook differ by
+    # 6x for reasons outside it, and a budget that only clears the uncontended one is a budget
+    # sized to the luckier reading. Re-base on the first green `cs-cme_futures` runs.
+    #
+    # Re-measured at 137.7 s after #857 rebuilt the sequence windows on the calendar, which is
+    # the change a reader would suspect of slowing this down. It did not: 08_tabular_dl is
+    # tabular, never enters `sequence_dataset.py`, and moved 29.6 -> 45.7 s in the same run.
+    # Both ratios are 1.53, so the whole run was that much more contended and the sequence path
+    # costs what it did. The budget is unchanged.
+  timeout: 600
 case_studies/cme_futures/10_latent_factors:
   timeout: 180
+case_studies/cme_futures/10a_pca:
+  # No PREVIEW_REDUCTIONS, and that is a measurement rather than an omission. #942 listed this
+  # entry among ten declaring a reduction their overrides never set. True, and not the same as
+  # failing without one: run focused on its own seeded workspace against the regenerated
+  # fixture, 2026-09-06, it passed three times at 57s, 59s and 62s, peak 1.49 GB.
+  #
+  # Those seconds are an upper bound and not a CI figure. The workstation was carrying three
+  # production chains and a fixture regeneration at the time, measured at 22-26 runnable on 24
+  # cores - roughly a 6x contention factor that has nothing to do with this notebook. Treat them
+  # as "well inside 300 even at six times cost", which is the claim they support, and not as the
+  # runtime to size a budget from. The entries elsewhere in this file that quote a percentage of
+  # budget take theirs from green `cs-*` runs of .github/workflows/test.yml, which is the right
+  # source once this notebook has a few.
+  #
+  # 1.49 GB is not subject to that caveat: peak resident does not inflate under CPU contention.
+  #
+  # The budget is stated rather than left to the harness default so the number has somewhere to
+  # sit beside what it was measured against.
+  timeout: 300
 case_studies/cme_futures/10b_stochastic_discount_factor:
   skip: true
   skip_reason: 'TEMPORARY: case-study end-to-end pipeline times out or fails with trimmed test-data; needs full fixture rebuild'
@@ -1299,7 +1423,7 @@ case_studies/cme_futures/11_causal_dml:
     # carried across here, where they arrive.
     PREVIEW_REDUCTIONS:
       max_samples: 5000
-      max_symbols: 5
+      max_symbols: 10
       n_folds: 2
       n_placebo: 25
   timeout: 300
@@ -1367,58 +1491,137 @@ case_studies/crypto_perps_funding/01_feasibility_analysis:
   parameters:
     # No START_DATE: the notebook already declares 2020-01-01, which is the data start, so an
     # override there narrows nothing. MAX_SYMBOLS is read by the loader and stays live.
-    MAX_SYMBOLS: 5
+    MAX_SYMBOLS: 10
   timeout: 120
 case_studies/crypto_perps_funding/02_labels:
   parameters:
-    # No MAX_SYMBOLS: the CI fixture is already only 5 symbols, and the baseline IC needs a
-    # cross-section per settlement to rank at all. The fixture is the reduction. The notebook
-    # now reads both parameters, so a value set here takes effect.
+    # No MAX_SYMBOLS: the CI fixture is ten perpetuals against production's nineteen, and the
+    # baseline IC needs a cross-section per settlement to rank at all. The fixture is the
+    # reduction. The notebook now reads both parameters, so a value set here takes effect.
     START_DATE: '2000-01-01'
   timeout: 120
 case_studies/crypto_perps_funding/03_financial_features:
   timeout: 120
+# max_symbols is 10 here because the fixture is ten perpetuals, and the cap has to match it
+# rather than sit under it. It read 5 until 2026-09-07 and no value written here could have
+# helped: the whole crypto fixture was five names, so this case study's long-short
+# `top_k_grid [3, 5, 10]` had no member whose two disjoint legs fit, and
+# `cs-crypto_perps_funding` failed at 13_backtest with "no concentration declared ... can be
+# realized". That was ml4t/agent-workspace#1077, fixed by widening
+# `tests/create_test_data.py:CRYPTO_SYMBOLS` and regenerating
+# `intermediates/crypto_perps_funding` against it - the coupling create_test_data.py's crypto
+# header records, and the reason a cap here is set to the fixture's width and not below it.
+# Setting it below ten would reproduce the same refusal at whatever width it named.
 case_studies/crypto_perps_funding/04_model_based_features:
   parameters:
     HMM_N_RESTARTS: 1
-    MAX_SYMBOLS: 5
+    MAX_SYMBOLS: 10
     MIN_TRAIN_BARS: 10
   timeout: 300
 case_studies/crypto_perps_funding/05_evaluation:
   parameters:
-    MAX_SYMBOLS: 5
+    MAX_SYMBOLS: 10
   timeout: 300
 case_studies/crypto_perps_funding/06_linear:
+  # 120s is measured here, not copied. Slowest of 5 green `cs-crypto_perps_funding` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 19.8s, 17% of the budget, against
+  # 27.9s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
+  #
+  # max_symbols is stated here, and it is stated at the fixture's full width on purpose. A
+  # notebook that declares no reduction at all does not run unreduced: _collect_preview_reductions
+  # in tests/pm_helpers.py injects `max_symbols: 5` as the fallback, because a preview run that
+  # reduces nothing is a canonical run wearing the wrong tier. That fallback is what kept
+  # `cs-crypto_perps_funding` red after the fixture was widened to ten perpetuals - the price
+  # panel 13_backtest loads is uncapped, but the predictions it ranks came from this stage at
+  # five names, so `top_k_grid [3, 5, 10]` still had no member whose two disjoint legs fit
+  # (a long-short k drops when 2k exceeds the tradeable count). Widening the fixture without
+  # displacing the fallback fixes the panel and not the cross-section.
+  parameters:
+    PREVIEW_REDUCTIONS:
+      max_symbols: 10
   timeout: 120
 case_studies/crypto_perps_funding/07_gbm:
+  # Same fallback, same reason as 06_linear above: without an explicit reduction this stage
+  # registers five-name prediction sets and 13_backtest cannot realize any declared k.
+  parameters:
+    PREVIEW_REDUCTIONS:
+      max_symbols: 10
   timeout: 180
 case_studies/crypto_perps_funding/08_tabular_dl:
-  gpu: true
+# Runs on CPU in CI. This notebook and the two below pin `device: cuda` in their own parameters
+# cell and the runners have no card, so until now all three carried `gpu: true` and skipped -
+# which is why ml4t/agent-workspace#1064 counts them among the notebooks a green
+# `cs-crypto_perps_funding` never covered.
+#
+# `OVERRIDES` replaces the notebook's dict wholesale rather than merging into it
+# (`08_tabular_dl.py:148` passes `overrides=OVERRIDES` straight through), so every key the
+# notebook declares has to be restated here. This one declares `class_weight: balanced` beside
+# the device, and passing the device alone would quietly fit an unweighted model.
+#
+# The timeout is measured, then given room. At ten symbols across both folds with CUDA hidden,
+# these take 16.6s (08), 37.3s (09) and 34.3s (10) on an idle workstation. 600 is that figure with
+# an order of magnitude over it, and it is what every comparable CPU-running sequence notebook in
+# this file already carries; a runner is slower per core than this box but not sixteen times
+# slower. Tighten against the first green `cs-crypto_perps_funding` if it proves generous. If one
+# of them fails on something other than time, the CPU path has surfaced something real and a
+# bigger number is not the answer.
   parameters:
+    # Stated for the reason 06_linear records: LABELS is not a reduction, so without this the
+    # harness fallback would fit five names here too. Without it this would register a
+    # population narrower than the fixture and than its own siblings.
+    PREVIEW_REDUCTIONS:
+      max_symbols: 10
     # BATCH_SIZE, MAX_FOLDS, MAX_SYMBOLS and N_EPOCHS were the pre-migration knobs. This notebook
     # now plans through the shared catalog and reads none of them, so setting them reduced nothing
     # and CI ran the full population believing it had not. LABELS is what it reads.
     LABELS:
     - fwd_ret_8h
-  timeout: 180
+    OVERRIDES: {class_weight: balanced, device: cpu}
+  timeout: 600
 case_studies/crypto_perps_funding/09_dl_lstm:
-  gpu: true
+# Runs on CPU in CI, and the timeout is headroom rather than a measurement. Both are explained
+# once on `08_tabular_dl` above; this notebook declares `device` alone, so that is all `OVERRIDES`
+# restates.
   parameters:
+    # Stated for the reason 06_linear records: LABELS is not a reduction, so without this the
+    # harness fallback would fit five names here too. Without it this would register a
+    # population narrower than the fixture and than its own siblings.
+    PREVIEW_REDUCTIONS:
+      max_symbols: 10
     LABELS:
     - fwd_ret_8h
-  timeout: 180
+    OVERRIDES: {device: cpu}
+  timeout: 600
 case_studies/crypto_perps_funding/10_dl_tcn:
-  gpu: true
+# Runs on CPU in CI, and the timeout is headroom rather than a measurement. Both are explained
+# once on `08_tabular_dl` above; this notebook declares `device` alone, so that is all `OVERRIDES`
+# restates.
   parameters:
+    # Stated for the reason 06_linear records: LABELS is not a reduction, so without this the
+    # harness fallback would fit five names here too. Without it this would register a
+    # population narrower than the fixture and than its own siblings.
+    PREVIEW_REDUCTIONS:
+      max_symbols: 10
     LABELS:
     - fwd_ret_8h
-  timeout: 180
+    OVERRIDES: {device: cpu}
+  timeout: 600
 case_studies/crypto_perps_funding/11_causal_dml:
   parameters:
     # The DML resolver requires every one of its four preview fields, not merely a non-empty
     # mapping: omitting max_samples would resolve the full population under a preview tier. The
     # pre-migration names CV_FOLDS, MAX_SAMPLES, MAX_SYMBOLS and N_PLACEBO reached nothing once
     # this notebook moved to PREVIEW_REDUCTIONS; their values are carried across here.
+    #
+    # max_symbols stays 5 while the fixture is 10, and unlike the caps on 01, 04 and 05 that is
+    # correct rather than stale. Those three cap a loader that feeds a ranked selection, so a cap
+    # under the fixture's width re-creates the concentration refusal ml4t/agent-workspace#1077
+    # fixed. This is a pooled DML fit and nothing downstream ranks it into a concentration, so
+    # halving the panel is a cost reduction that changes no feasibility question.
     LABEL: fwd_ret_8h
     PREVIEW_REDUCTIONS:
       max_samples: 5000
@@ -1429,8 +1632,23 @@ case_studies/crypto_perps_funding/11_causal_dml:
 case_studies/crypto_perps_funding/12_model_analysis:
   timeout: 300
 case_studies/crypto_perps_funding/13_backtest:
+  # Same shape as 14 below, one level up: it selects complete preview validation
+  # predictions, and only the model notebooks put those in this workspace. 06_linear is
+  # named because it registers all four declared labels on its own, so it is the minimum
+  # that satisfies the selection rather than an arbitrary pick from the family.
+  requires_stage: 06_linear
   timeout: 600
 case_studies/crypto_perps_funding/14_portfolio_management:
+  # Its inputs are the preview-tier signal backtests 13_backtest registers into this
+  # workspace. The seeded registry holds no preview rows and tests/conftest.py records the
+  # measurement behind that: seeding the preview root put rows in the same coverage group
+  # as the predictions a preview run fits, which they cannot win, so 14_backtest refused to
+  # rank anything at all. Declaring the dependency is the alternative to that.
+  #
+  # A full in-order run satisfies it. `pytest -k 14_portfolio_management` on its own now
+  # skips naming 13_backtest, where it used to fail six cells in on "no preview signal
+  # backtests in this workspace".
+  requires_stage: 13_backtest
   parameters:
     # MAX_SYMBOLS was the pre-migration knob and this notebook no longer reads it - the
     # cross-section comes from the frozen candidate set 13_backtest published, not from a
@@ -1471,15 +1689,16 @@ case_studies/etfs/01_feasibility_analysis:
   timeout: 120
 case_studies/etfs/02_labels:
   parameters:
-    # No MAX_SYMBOLS: the CI fixture is already only 24 ETFs, and stage 03 needs at least
-    # 10 non-null labels per date to accumulate an IC series at all. Reducing here starves
-    # it. The fixture is the reduction; MIN_SYMBOLS_FOR_DISPERSION keeps its production 10.
+    # No MAX_SYMBOLS: the fixture is itself the reduction, and stage 03 needs at least 10
+    # non-null labels per date to accumulate an IC series at all, so reducing here starves
+    # it. MIN_SYMBOLS_FOR_DISPERSION keeps its production 10. The fixture carries 56 ETFs
+    # (ml4t/third-edition-test-data 2a6833f6), not the 24 this comment claimed.
     START_DATE: '2000-01-01'
   timeout: 120
 case_studies/etfs/03_financial_features:
   timeout: 300
 case_studies/etfs/04_model_based_features:
-  # No MAX_SYMBOLS, for the reason 02_labels gives: the CI fixture is already only 24
+  # No MAX_SYMBOLS, for the reason 02_labels gives: the CI fixture is already only 56
   # ETFs, so it IS the reduction. Cutting to 5 on top of it made every downstream
   # backtest degenerate rather than fast. etfs declares top_k_grid [5, 10, 20] against a
   # 24-fund price panel, so all three schemes pass the feasibility filter - but the
@@ -1487,15 +1706,38 @@ case_studies/etfs/04_model_based_features:
   # whole cross-section, the basket never changed, and 12 of 12 backtests recorded
   # num_trades=0. Four notebooks (14, 15, 17, 18) were blocked on that as
   # ml4t/agent-workspace#989. The selection has to have something to reject.
+  #
+  # The estimation schedule is NOT reduced. The fixture carries the full 2006-2025 session
+  # history, so every declared burn-in is payable and every refit boundary falls where it
+  # falls in production - which is the code path worth exercising, since the schedule is what
+  # this stage now is. Only the restart count comes down: it multiplies the regime model's
+  # fits by ten and changes which local optimum is kept, not whether the walk is causal.
   parameters:
-    GARCH_MIN_OBS: 50
-    N_RESTARTS: 1
+    HMM_RESTARTS: 1
   timeout: 900
 case_studies/etfs/05_evaluation:
   # Same reason as 04 above: this stage feeds the same predictions, so reducing it
   # re-narrows the cross-section that 04 was widened to preserve.
   timeout: 900
+# max_symbols is 6 rather than 5 across this case study's model stages, and the number is
+# derived rather than chosen. `get_entry_schemes_for` drops any declared `top_k` at or above
+# the universe the signal ranks, because holding k of k is the equal-weight benchmark rather
+# than a selection. etfs declares top_k_grid [5, 10, 20] and is long-only, so 6 is the
+# smallest cross-section at which the smallest declared concentration is realizable - at 5
+# every scheme is dropped and the sweep registers nothing, which is the zero-trade state
+# ml4t/agent-workspace#989 recorded and #1003 makes loud. Six rather than something rounder
+# because cs-etfs is already the longest case-study job on main at 43m and the model cost
+# scales with the cross-section. Six is reachable: the fixture carries 56 funds
+# (`intermediates/etfs/features/financial.parquet`, measured 2026-09-07 on
+# ml4t/third-edition-test-data 63a9e4e), not the 24 the 02_labels entry above still says.
 case_studies/etfs/06_linear:
+  # 120s is measured here, not copied. Slowest of 5 green `cs-etfs` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 16.1s, 13% of the budget, against
+  # 22.9s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
   # #560 moved this notebook onto the shared boundary and removed `MAX_FOLDS: 2` /
   # `MAX_SYMBOLS: 5` without replacing them, leaving a timeout that had been measured
   # against them. `_collect_preview_reductions` defaults `max_symbols: 5` when nothing is
@@ -1506,7 +1748,7 @@ case_studies/etfs/06_linear:
   parameters:
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-      max_symbols: 5
+      max_symbols: 6
   timeout: 120
 case_studies/etfs/07_gbm:
   # As 06_linear. The iteration and checkpoint axes are left at their declared values: a
@@ -1515,7 +1757,7 @@ case_studies/etfs/07_gbm:
   parameters:
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-      max_symbols: 5
+      max_symbols: 6
   timeout: 180
 case_studies/etfs/08_tabular_dl:
   # DEVICE and POPULATION_NAME travel together. The runner refuses to substitute a CPU
@@ -1531,7 +1773,7 @@ case_studies/etfs/08_tabular_dl:
     POPULATION_NAME: etfs-tabular_dl-preview
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-      max_symbols: 5
+      max_symbols: 6
   timeout: 300
 case_studies/etfs/09_dl_lstm:
   # Converted onto the research boundary, so the notebook no longer binds BATCH_SIZE, LOOKBACK or
@@ -1542,15 +1784,19 @@ case_studies/etfs/09_dl_lstm:
   # DEVICE and POPULATION_NAME travel together, as in 08_tabular_dl: the device is inside the
   # training identity, so a CPU run declares a different member set and must name its own
   # population rather than publish into the canonical one.
-  # max_symbols is 5 to match 04_model_based_features for the reason 11a_pca states below: the
-  # boundary validates the fold-specific temporal artifact against the CV splits, and the 6 the
-  # pre-conversion block carried put fold 0 validation at 93.5%, under the 95% floor.
+  # max_symbols is 6 for the reason the case-study header above derives: at 5 every declared
+  # entry scheme is dropped and the sweep registers nothing. The block used to say 5 "to match
+  # 04_model_based_features" and to blame a 93.5% fold 0 coverage on the 6 - both wrong.
+  # 04 declares no max_symbols at all, so there is nothing to match, and 11a_pca records that
+  # the 93.5% came from running the FULL fixture universe against an artifact built at 5, not
+  # from any value of this cap. The boundary still validates the temporal artifact against the
+  # CV splits, and 6 clears the 95% MIN_TEMPORAL_DATE_COVERAGE floor on green cs-etfs runs.
   parameters:
     DEVICE: cpu
     POPULATION_NAME: etfs-lstm-preview
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-      max_symbols: 5
+      max_symbols: 6
   timeout: 180
 case_studies/etfs/10_dl_tsmixer:
   # Converted onto the research boundary alongside 09_dl_lstm, so the same three names are gone:
@@ -1563,7 +1809,7 @@ case_studies/etfs/10_dl_tsmixer:
   # No max_symbols, and that is the fix for ml4t/agent-workspace#988. This block carried
   # `max_symbols: 5` "to match 04_model_based_features" - a justification that stopped holding
   # when 04's own cap was removed, so the reduction went on cutting the cross-section to five
-  # while the temporal artifact it fits against covered the fixture's twenty-four. Darts TSMixer
+  # while the temporal artifact it fits against covered the whole fixture. Darts TSMixer
   # diverged on the mismatch: the registration guard refused predictions at a per-fold dispersion
   # ratio of 286 (score std 10.588 against a target std of 0.037), and #988 measured that
   # restoring the pre-conversion LOOKBACK of 22 made it four times worse at 1285. Neither the
@@ -1572,15 +1818,22 @@ case_studies/etfs/10_dl_tsmixer:
   # takes the chain green: measured 2026-08-31 in the container, stages 01-10, 10 passed in
   # 288.70s, with this notebook inside its 180s cap.
   #
-  # 09_dl_lstm, 11a_pca and 11b_ipca keep max_symbols: 5 and pass with it. Their blocks state the
-  # same "must match 04" rule, which is no longer true of any of them; it is left in place there
-  # because what those three need is a coverage floor they currently clear, not agreement with 04.
+  # 09_dl_lstm, 11a_pca and 11b_ipca declare max_symbols: 6 and pass with it. Their blocks used to
+  # state the same "must match 04" rule; 04 declares no cap, so it was corrected in place rather
+  # than left standing. What those three need is a coverage floor they currently clear.
   parameters:
     DEVICE: cpu
     POPULATION_NAME: etfs-tsmixer-preview
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-  timeout: 180
+  # Budget raised from 180 on a CI measurement, not on another notebook's number.
+  # Slowest of 5 green `cs-etfs` runs of .github/workflows/test.yml sampled 2026-09-04:
+  # 103.1s, 57% of the old budget. A budget a green run already fills is one
+  # contention band away from a timeout that reads as a notebook defect. The line is a
+  # third, because the only measurement anyone has of that band is the
+  # us_equities_panel/06_linear timeout this rule comes from: a notebook that fit in 120s
+  # idle, did not fit in 120s loaded, and passed at 300.
+  timeout: 360
 case_studies/etfs/10a_dl_nlinear:
   # Without a block here the notebook runs as a preview that declares no reduction, which
   # `run_model_population` refuses outright, so an absent entry is a failed job rather than a
@@ -1598,24 +1851,28 @@ case_studies/etfs/10a_dl_nlinear:
       folds: [0, 1]
   timeout: 180
 case_studies/etfs/11a_pca:
-  # max_symbols must match 04_model_based_features, which builds the temporal
-  # artifact these notebooks validate against. With no reduction they ran on the
-  # full fixture universe while the artifact covered 5 symbols, so the CV splits
-  # spanned dates the artifact never saw and fold 0 validation came out at 93.5%,
-  # just under the 95% floor in MIN_TEMPORAL_DATE_COVERAGE.
+  # max_symbols has to clear the MIN_TEMPORAL_DATE_COVERAGE floor against the temporal
+  # artifact 04_model_based_features builds. With no reduction at all these notebooks ran
+  # on the full fixture universe while the artifact covered 5 symbols, so the CV splits
+  # spanned dates the artifact never saw and fold 0 validation came out at 93.5%, just
+  # under the 95% floor. This used to read "must match 04_model_based_features"; 04
+  # declares no max_symbols, so there is nothing to match, and the value is the 6 the
+  # case-study header derives.
   # A reduced run declares a different member set than the canonical population,
   # so it names its own.
   parameters:
     POPULATION_NAME: etfs-pca-preview
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-      max_symbols: 5
+      max_symbols: 6
   timeout: 300
 case_studies/etfs/11b_ipca:
-  # max_symbols must match 04_model_based_features for the same reason as 11a,
-  # which leaves IPCA five funds to fit a 71-characteristic Gamma on. At the
-  # production n_factors=5 that is 355 parameters against five assets a date and
-  # the ALS does not identify. Measured on this fixture at the declared
+  # max_symbols clears the coverage floor for the same reason as 11a, and at 6 leaves
+  # IPCA six funds to fit a 71-characteristic Gamma on. At the production n_factors=5
+  # that is 355 parameters against a handful of assets a date and the ALS does not
+  # identify. The per-fold K measurements below were taken when this block declared 5;
+  # they are what chose n_factors=1 and have not been re-measured at 6. Measured at the
+  # declared
   # max_iter=100, per fold: K=5 fails on both folds (110.0s, 113.6s), K=3 fails
   # on both (55.7s, 57.0s), K=2 converges on fold 0 in 21.8s and fails on fold 1
   # at 42.0s, K=1 converges on both in 0.6s and 0.8s. The times are the tell -
@@ -1634,21 +1891,112 @@ case_studies/etfs/11b_ipca:
     POPULATION_NAME: etfs-ipca-preview
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-      max_symbols: 5
+      max_symbols: 6
       n_factors: 1
-  timeout: 300
+  # Budget raised from 300 on a CI measurement, not on another notebook's number.
+  # Slowest of 5 green `cs-etfs` runs of .github/workflows/test.yml sampled 2026-09-04:
+  # 251.9s, 84% of the old budget. A budget a green run already fills is one
+  # contention band away from a timeout that reads as a notebook defect. The line is a
+  # third, because the only measurement anyone has of that band is the
+  # us_equities_panel/06_linear timeout this rule comes from: a notebook that fit in 120s
+  # idle, did not fit in 120s loaded, and passed at 300.
+  timeout: 780
 case_studies/etfs/11_latent_factors:
-  gpu: true
-  timeout: 900
+  # No `gpu: true`. This notebook fits nothing: it reads the family's declared labels and its
+  # model menu and prints who publishes what, and its own header says so - "What it writes:
+  # nothing. This notebook fits no model, registers no run and opens no holdout." It imports
+  # ast, re, yaml and polars, and no torch. The flag was costing coverage for a card the
+  # notebook never asks for (ml4t/agent-workspace#1064).
+  #
+  # 5.7 s with CUDA hidden, measured 2026-09-07 against test-data 2c068b5a. The 900 s it carried
+  # was sized for a fit this notebook does not do; 180 is thirty times the measurement and still
+  # leaves the number somewhere to move. Re-base on the first green `cs-etfs` runs.
+  timeout: 180
 case_studies/etfs/11c_conditional_autoencoder:
-  skip: true
-  skip_reason: 'TEMPORARY: DL training (CAE) 300s timeout under trimmed test-data'
+  # Un-skipped when 11e moved onto the research boundary (ml4t/agent-workspace#991).
+  # The skip_reason these three carried - "TEMPORARY: DL training 300s timeout under
+  # trimmed test-data" - was never what failed them, and a TEMPORARY skip whose stated
+  # cost is runtime never gets revisited because the notebook getting faster cannot help.
+  # What fails them is ml4t/agent-workspace#926: features/model_based.parquet carries ONE
+  # fold geometry, the primary label's, and a variant label's fold-0 validation window
+  # runs 16 sessions past the artifact's last fold-0 date. validate_temporal_alignment
+  # then measures 231/247 = 93.5% against a 0.95 floor and raises.
+  #
+  # LABELS pins each run to the primary label, whose geometry IS the artifact's, so the
+  # notebook is exercised here instead of not at all. It is a scheduling restriction and
+  # not a fix: when #926 lands and the artifact carries per-label geometry, delete the
+  # LABELS line and these fit both declared labels in CI. POPULATION_NAME travels with it
+  # because a narrowed run declares a different member set and cannot publish the
+  # canonical population. DEVICE is cpu because config/setup.yaml declares this family on
+  # cuda and the library refuses to substitute; the device is inside the training identity,
+  # so the CPU fit publishes under its own name. n_epochs stays out - preset_patches.py
+  # already reduces these presets and declaring it here would replace that patch.
+  parameters:
+    DEVICE: cpu
+    LABELS: ['fwd_ret_21d']
+    POPULATION_NAME: etfs-cae-preview
+    PREVIEW_REDUCTIONS:
+      max_symbols: 6
+  timeout: 900
 case_studies/etfs/11d_stochastic_discount_factor:
-  skip: true
-  skip_reason: 'TEMPORARY: DL training (SDF) 300s timeout under trimmed test-data'
+  # Un-skipped. It is the only latent member that loads the initial-release macro panel
+  # config/setup.yaml declares (modeling.latent_factors.macro_context.source:
+  # alfred_initial_release), and that fixture did not exist - data/macro/ shipped
+  # fred_macro{,_raw,_dictionary,_raw_dictionary,_metadata}.parquet and no
+  # fred_macro_initial_release.parquet, never built rather than gitignored. Built by
+  # `data/macro/download_alfred.py` and committed to the test-data repo
+  # (ml4t/agent-workspace#1035). The panel starts 2010-11-22, which is where ALFRED's
+  # VIXCLS vintages start; the etfs fixture reaches back to 2007, so the macro context
+  # covers the later part of that window and not the whole of it.
+  #
+  # Reading fred_macro.parquet instead would be a look-ahead: that file is the finalized
+  # revised series, and this member is declared against the point-in-time vintage.
+  #
+  # LABELS, POPULATION_NAME and DEVICE for the same reasons as 11c and 11e above:
+  # ml4t/agent-workspace#926 leaves features/model_based.parquet carrying one fold
+  # geometry, a narrowed run cannot publish the canonical population, and the family is
+  # declared on cuda where the library refuses to substitute a device. The three epoch
+  # budgets are stated because preset_patches.py patches `n_epochs`, which this model does
+  # not read - its budgets are n_epochs_unc, n_epochs_moment and n_epochs_cond, so an
+  # unreduced run trains 256 + 64 + 1024 epochs.
+  #
+  # A fold reduction is what the seoa entry does not need and this one does. The two
+  # fixtures are not the same length: seoa spans 2017-2021 and etfs spans 2007-2025, so at
+  # the same width and the same epoch budgets this notebook walks about four times as many
+  # sessions, and it timed out at 1800s with all eight folds where seoa measures 537s. Two
+  # folds brings the walk back to seoa's size without touching the width, which the SDF
+  # conditioning network needs.
+  #
+  # Stated as `folds` inside PREVIEW_REDUCTIONS rather than as MAX_FOLDS. The translation
+  # from MAX_FOLDS runs on the preview path only, so the name reaches the canonical path
+  # untranslated, where papermill drops it and logs "Passed unknown parameter" - which is
+  # what `unusable_parameters` reports and what a silently unreduced run looks like.
+  parameters:
+    DEVICE: cpu
+    LABELS: ['fwd_ret_21d']
+    POPULATION_NAME: etfs-sdf-preview
+    PREVIEW_REDUCTIONS:
+      folds: [0, 1]
+      max_symbols: 6
+      n_epochs_unc: 2
+      n_epochs_moment: 2
+      n_epochs_cond: 4
+  # Measured on this workstation at load 33-55 of 24 cores, which is where every number
+  # available for this notebook was taken: 1,167s with the two folds above, against a run
+  # that hit the 1800s cap with all eight. That is the loaded figure, not the idle one -
+  # the us_equities_panel/06_linear entry records the same shape, a notebook that fit in
+  # 120s idle, did not fit in 120s loaded, and passed at 300 - so the cap is the one-third
+  # line against the loaded measurement rather than against a quiet-machine guess.
+  timeout: 3600
 case_studies/etfs/11e_supervised_autoencoder:
-  skip: true
-  skip_reason: 'TEMPORARY: DL training (SAE) 300s timeout under trimmed test-data'
+  # Same restriction and the same reason as 11c above.
+  parameters:
+    DEVICE: cpu
+    LABELS: ['fwd_ret_21d']
+    POPULATION_NAME: etfs-sae-preview
+    PREVIEW_REDUCTIONS:
+      max_symbols: 6
+  timeout: 900
 case_studies/etfs/12_causal_dml:
   parameters:
     CV_FOLDS: 2
@@ -1688,24 +2036,72 @@ case_studies/etfs/13_model_analysis:
 # Timeouts are raised across the block rather than kept: every stage below now sees 24 funds
 # where it saw 5, and the previous budgets were measured against the narrower panel.
 case_studies/etfs/14_backtest:
+  # Two invocations, one per label this case study declares in
+  # backtest.sweep.top_k_grid, and the same two on each of the four stages that
+  # take LABEL as a parameter: 14_backtest, 15_portfolio_management,
+  # 16_risk_management and 17_costs.
+  #
+  # The notebook falls back to bt_config.primary_label when LABEL is empty, so before
+  # this it ran once and the second was never exercised - while
+  # 17_costs and 20_strategy_analysis assert that every declared label carries rankable
+  # validation backtests. A chain that runs one label of two does not test that
+  # claim; it passes or fails on whether the fixture happens to carry rows from an
+  # earlier generation.
+  #
+  # The primary label is first, so the first run is what this entry did before.
+  invocations:
+    - id: fwd_ret_21d
+      parameters:
+        LABEL: fwd_ret_21d
+    - id: fwd_ret_5d
+      parameters:
+        LABEL: fwd_ret_5d
   timeout: 900
 case_studies/etfs/15_portfolio_management:
-  parameters:
-    TOP_N_PREDICTIONS: 2
+  # The same two labels as 14_backtest above, because this stage takes LABEL
+  # too and reads what the previous one registered for that label.
+  invocations:
+    - id: fwd_ret_21d
+      parameters:
+        LABEL: fwd_ret_21d
+        TOP_N_PREDICTIONS: 2
+    - id: fwd_ret_5d
+      parameters:
+        LABEL: fwd_ret_5d
+        TOP_N_PREDICTIONS: 2
   timeout: 600
 case_studies/etfs/16_risk_management:
+  # The same two labels as 14_backtest above, because this stage takes LABEL
+  # too and reads what the previous one registered for that label.
+  invocations:
+    - id: fwd_ret_21d
+      parameters:
+        LABEL: fwd_ret_21d
+        MAX_RISK_VARIANTS: 2
+        TOP_N_COMBOS: 2
+    - id: fwd_ret_5d
+      parameters:
+        LABEL: fwd_ret_5d
+        MAX_RISK_VARIANTS: 2
+        TOP_N_COMBOS: 2
   # MAX_RISK_VARIANTS bounds the overlay sweep, which is the cell that dominates this notebook,
   # and it bounds work rather than the cross-section - which is why it stays while MAX_SYMBOLS
   # goes. Scoping the baselines to live prediction sets had already put that cell over the
   # per-cell cap once: measured at loads 34-41, the unbounded sweep passed 4/4 before the
   # scoping and 1/3 after.
-  parameters:
-    MAX_RISK_VARIANTS: 2
-    TOP_N_COMBOS: 2
   timeout: 600
 case_studies/etfs/17_costs:
-  parameters:
-    TOP_N_COMBOS: 2
+  # The same two labels as 14_backtest above, because this stage takes LABEL
+  # too and reads what the previous one registered for that label.
+  invocations:
+    - id: fwd_ret_21d
+      parameters:
+        LABEL: fwd_ret_21d
+        TOP_N_COMBOS: 2
+    - id: fwd_ret_5d
+      parameters:
+        LABEL: fwd_ret_5d
+        TOP_N_COMBOS: 2
   timeout: 600
 case_studies/etfs/18_holdout_predictions:
   # Canonical, not preview. `reconstruct_locked_model_request` refuses any spec whose
@@ -1739,16 +2135,34 @@ case_studies/fx_pairs/02_labels:
 case_studies/fx_pairs/03_financial_features:
   timeout: 300
 case_studies/fx_pairs/04_model_based_features:
+  # The three models now walk their series on the cadence `config/setup.yaml` declares
+  # rather than fitting once per fold, so what bounds this notebook in CI is the number of
+  # estimates, not the number of pairs. `REFIT_EVERY_OVERRIDE` replaces all three cadences
+  # for this run: 504 sessions instead of 63 and 21, which takes the state-space walk from
+  # about 58 estimates per pair to 7 and leaves every emitted row and column where it was.
+  # The burn-ins are deliberately not overridable - a shorter one would move which sessions
+  # carry a value, and the notebook asserts on exactly that.
+  #
+  # The other two bound how hard a single estimate searches, and carry the values this
+  # entry has always used.
   parameters:
-    KALMAN_MAXITER: 50
+    KALMAN_MAXITER_OVERRIDE: 50
     MAX_SYMBOLS: 5
-    N_HMM_RESTARTS: 3
+    N_HMM_RESTARTS_OVERRIDE: 3
+    REFIT_EVERY_OVERRIDE: 504
   timeout: 900
 case_studies/fx_pairs/05_evaluation:
   parameters:
     MAX_SYMBOLS: 5
   timeout: 300
 case_studies/fx_pairs/06_linear:
+  # 120s is measured here, not copied. Slowest of 5 green `cs-fx_pairs` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 17.2s, 14% of the budget, against
+  # 22.7s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
   # Restores the reduction #560 removed. It dropped MAX_FOLDS: 2 / MAX_SYMBOLS: 5 when the
   # stage moved onto the shared boundary and left the timeout priced for them, so since
   # 2026-08-20 this has run all 8 folds over all 20 pairs on a budget measured against 2 and 5.
@@ -1780,7 +2194,14 @@ case_studies/fx_pairs/09_dl_tcn:
     MAX_FOLDS: 2
     MAX_SYMBOLS: 5
     N_EPOCHS: 1
-  timeout: 180
+  # Budget raised from 180 on a CI measurement, not on another notebook's number.
+  # Slowest of 5 green `cs-fx_pairs` runs of .github/workflows/test.yml sampled 2026-09-04:
+  # 104.7s, 58% of the old budget. A budget a green run already fills is one
+  # contention band away from a timeout that reads as a notebook defect. The line is a
+  # third, because the only measurement anyone has of that band is the
+  # us_equities_panel/06_linear timeout this rule comes from: a notebook that fit in 120s
+  # idle, did not fit in 120s loaded, and passed at 300.
+  timeout: 360
 case_studies/fx_pairs/10_dl_nlinear:
   parameters:
     BATCH_SIZE: 256
@@ -1865,6 +2286,26 @@ case_studies/fx_pairs/19_strategy_analysis:
   skip_reason: "Reads back the holdout lineage 17 and 18 produce; with those skipped there is
     nothing for it to resolve."
   timeout: 300
+# max_symbols stays 5 here. The arithmetic asks for 10 - top_k_grid [5, 10, 20] and
+# long-short, so the smallest declared concentration needs 2 x 5 = 10 disjoint names - and the
+# raw fixture could supply it: `data/equities/market/nasdaq100/minute_bars` carries 12 symbols,
+# all with quotes. What binds is one step further in. The model stages fit from the fold
+# artifacts, and `intermediates/nasdaq100_microstructure/folds/*/fold_*_meta.parquet` carries
+# 5 symbols on ml4t/third-edition-test-data 63a9e4e, measured 2026-09-07. `max_symbols` at a
+# model stage selects from the fold universe and cannot widen past it, so a cap of 10 over
+# 5-symbol folds still registers 5-symbol predictions - which is what CI measured on
+# 34157373964, where every stage ran and 14_backtest still refused at a ranked cross-section
+# of 5. Raising 01-05 without the folds also re-creates the ml4t/agent-workspace#988
+# divergence the 04 entry below warns about: features over 10 names, folds over 5.
+#
+# etfs and cme_futures are raised in this same file because their seeded folds are already
+# wide - 55-56 and 30 - so a model-stage cap selects from them. nasdaq and
+# crypto_perps_funding were the two whose folds were generated at 5, and both needed the
+# fixture regenerated rather than an override (ml4t/agent-workspace#1077). crypto is done:
+# CRYPTO_SYMBOLS carries ten and `intermediates/crypto_perps_funding` was regenerated against
+# them. nasdaq is not, and its widening is blocked on ml4t/agent-workspace#1019 - its feature
+# panel is already 98.8 MB against GitHub's 100 MB per-file limit, so widening the panel has
+# to answer that first.
 case_studies/nasdaq100_microstructure/01_feasibility_analysis:
   parameters:
     MAX_SYMBOLS: 5
@@ -1876,6 +2317,7 @@ case_studies/nasdaq100_microstructure/02_labels:
   timeout: 120
 case_studies/nasdaq100_microstructure/03_financial_features:
   parameters:
+    MAX_SYMBOLS: 5
     START_DATE: '2000-01-01'
   timeout: 120
 case_studies/nasdaq100_microstructure/04_model_based_features:
@@ -1922,50 +2364,86 @@ case_studies/nasdaq100_microstructure/07_gbm:
   tier: weekly
   timeout: 900
 case_studies/nasdaq100_microstructure/08_dl_nlinear:
-  # The CPU CI image has no CUDA and this case study declares gpu for production. DEVICE
-  # is passed so the run is registered as the CPU run it is, rather than skipped.
+  # Converted onto the research boundary, so BATCH_SIZE, LOOKBACK, MAX_FOLDS, MAX_SYMBOLS and
+  # N_EPOCHS name nothing this notebook binds any more: the window and the batch come from the
+  # preset, the epoch budget from tests/preset_patches.py (two epochs at checkpoint_interval
+  # one), and a sample reduction reaches the notebook only under PREVIEW_REDUCTIONS.
+  # DEVICE and POPULATION_NAME travel together: the device is inside the training identity, so
+  # a CPU run declares a different member set and must name its own population rather than
+  # publish into the canonical one. The CPU CI image has no CUDA and this case study declares
+  # gpu for production.
+  # max_train_sequences is what keeps this affordable on a minute panel, where five symbols of
+  # a fold still hold six figures of overlapping windows. It is a reduction below the declared
+  # `modeling.dl.max_train_sequences`, which a preview may lower and cannot raise.
   parameters:
-    BATCH_SIZE: 32
     DEVICE: cpu
-    LOOKBACK: 5
-    MAX_FOLDS: 2
-    MAX_SYMBOLS: 5
-    N_EPOCHS: 1
+    POPULATION_NAME: nasdaq100_microstructure-nlinear-preview
+    PREVIEW_REDUCTIONS:
+      folds: [0, 1]
+      max_symbols: 5
+      max_train_sequences: 2000
   timeout: 600
 case_studies/nasdaq100_microstructure/09_dl_lstm:
-  # The CPU CI image has no CUDA and this case study declares gpu for production. DEVICE
-  # is passed so the run is registered as the CPU run it is, rather than skipped.
+  # Converted onto the research boundary, so BATCH_SIZE, LOOKBACK, MAX_FOLDS, MAX_SYMBOLS and
+  # N_EPOCHS name nothing this notebook binds any more: the window and the batch come from the
+  # preset, the epoch budget from tests/preset_patches.py (two epochs at checkpoint_interval
+  # one), and a sample reduction reaches the notebook only under PREVIEW_REDUCTIONS.
+  # DEVICE and POPULATION_NAME travel together: the device is inside the training identity, so
+  # a CPU run declares a different member set and must name its own population rather than
+  # publish into the canonical one. The CPU CI image has no CUDA and this case study declares
+  # gpu for production.
+  # max_train_sequences is what keeps this affordable on a minute panel, where five symbols of
+  # a fold still hold six figures of overlapping windows. It is a reduction below the declared
+  # `modeling.dl.max_train_sequences`, which a preview may lower and cannot raise.
   parameters:
-    BATCH_SIZE: 32
     DEVICE: cpu
-    LOOKBACK: 5
-    MAX_FOLDS: 2
-    MAX_SYMBOLS: 5
-    N_EPOCHS: 1
+    POPULATION_NAME: nasdaq100_microstructure-lstm_h64-preview
+    PREVIEW_REDUCTIONS:
+      folds: [0, 1]
+      max_symbols: 5
+      max_train_sequences: 2000
   timeout: 600
 case_studies/nasdaq100_microstructure/10_dl_tcn:
-  # The CPU CI image has no CUDA and this case study declares gpu for production. DEVICE
-  # is passed so the run is registered as the CPU run it is, rather than skipped.
+  # Converted onto the research boundary, so BATCH_SIZE, LOOKBACK, MAX_FOLDS, MAX_SYMBOLS and
+  # N_EPOCHS name nothing this notebook binds any more: the window and the batch come from the
+  # preset, the epoch budget from tests/preset_patches.py (two epochs at checkpoint_interval
+  # one), and a sample reduction reaches the notebook only under PREVIEW_REDUCTIONS.
+  # DEVICE and POPULATION_NAME travel together: the device is inside the training identity, so
+  # a CPU run declares a different member set and must name its own population rather than
+  # publish into the canonical one. The CPU CI image has no CUDA and this case study declares
+  # gpu for production.
+  # max_train_sequences is what keeps this affordable on a minute panel, where five symbols of
+  # a fold still hold six figures of overlapping windows. It is a reduction below the declared
+  # `modeling.dl.max_train_sequences`, which a preview may lower and cannot raise.
   parameters:
-    BATCH_SIZE: 32
     DEVICE: cpu
-    LOOKBACK: 5
-    MAX_FOLDS: 2
-    MAX_SYMBOLS: 5
-    N_EPOCHS: 1
+    POPULATION_NAME: nasdaq100_microstructure-tcn-preview
+    PREVIEW_REDUCTIONS:
+      folds: [0, 1]
+      max_symbols: 5
+      max_train_sequences: 2000
   timeout: 600
 case_studies/nasdaq100_microstructure/11_dl_patchtst:
-  # Needs CUDA: MAX_SYMBOLS=5 of a 15-minute panel is ~26x the rows of the
-  # daily-frequency patchtst notebooks, which share these parameters and
-  # finish in under 180s. On CPU this overruns any sane cell timeout (measured
-  # 625s against a 600s budget); on GPU it completes in 155s.
-  gpu: true
+  # Converted onto the research boundary alongside 08 through 10, so the same five names are
+  # gone for the same reasons; see 08_dl_nlinear above.
+  # `gpu: true` is dropped with them. It was there because CPU overran a 600s budget at 625s
+  # with LOOKBACK=24 and no sequence cap, and what it did in exchange was skip this test on
+  # every runner without a card - which is all of them - so the attention architecture had no
+  # coverage at all. The declared cap is what makes CPU affordable: the run is bounded by
+  # max_train_sequences rather than by the panel, so it no longer scales with the fixture.
   parameters:
-    BATCH_SIZE: 32
-    LOOKBACK: 24
-    MAX_FOLDS: 2
-    MAX_SYMBOLS: 5
-    N_EPOCHS: 1
+    DEVICE: cpu
+    POPULATION_NAME: nasdaq100_microstructure-patchtst-preview
+    PREVIEW_REDUCTIONS:
+      folds: [0, 1]
+      max_symbols: 5
+      max_train_sequences: 2000
+      # The training cap bounded the fit and left the forward pass over validation
+      # scaling with the panel, which is why this cell sat at its 600s budget while
+      # nlinear, lstm and tcn finished in 92-94s: patchtst pays the most per window
+      # and was scoring every one of them. Matched to the training cap, three orders
+      # below the panel, and above the symbol count so the cross-section is intact.
+      max_predict_sequences: 2000
   timeout: 600
 case_studies/nasdaq100_microstructure/12_causal_dml:
   parameters:
@@ -1989,39 +2467,78 @@ case_studies/nasdaq100_microstructure/13_model_analysis:
     # are here, makes the notebook refuse a family it cannot check.
     LINEAR_POPULATION: nasdaq100_microstructure-fixture-linear-validation-v1
     GBM_POPULATION: nasdaq100_microstructure-fixture-gbm-validation-v1
+    # The four sequence populations, added when 08 through 11 converted onto the research
+    # boundary and began publishing one population each. Same prefix and the same reason.
+    NLINEAR_POPULATION: nasdaq100_microstructure-fixture-nlinear-validation-v1
+    LSTM_POPULATION: nasdaq100_microstructure-fixture-lstm_h64-validation-v1
+    TCN_POPULATION: nasdaq100_microstructure-fixture-tcn-validation-v1
+    PATCHTST_POPULATION: nasdaq100_microstructure-fixture-patchtst-validation-v1
   timeout: 300
 case_studies/nasdaq100_microstructure/14_backtest:
   parameters:
-    # Test data has 6 nasdaq symbols; the slot grid's smallest max_slots (5)
-    # needs n_assets > 5, so cap at 6 (not 5) or every scheme is filtered out.
-    MAX_SYMBOLS: 6
+    # The whole fixture universe, which is 12 nasdaq symbols since
+    # ml4t/third-edition-test-data fb2da57 widened it from 6. Only the symbol axis moved -
+    # the fixture is the same 43 days of 2020 and 99 of 2021 - so fold geometry and every
+    # date-derived artifact are unchanged and the rows exactly double. At 6 the slot grid's
+    # smallest max_slots (5) only just cleared n_assets > 5; at 12 it clears comfortably.
+    MAX_SYMBOLS: 12
     TOP_K: 2
     TOP_N_PREDICTIONS: 2
-  timeout: 180
+  # Doubled with the universe. The slot grid does not widen with the ceiling, so this run
+  # prices twice the names over the same number of schemes.
+  # Budget raised from 360 on a CI measurement, not on another notebook's number.
+  # Slowest of 6 green `cs-nasdaq100_microstructure` runs of .github/workflows/test.yml sampled 2026-09-04:
+  # 354.1s, 98% of the old budget. A budget a green run already fills is one
+  # contention band away from a timeout that reads as a notebook defect. The line is a
+  # third, because the only measurement anyone has of that band is the
+  # us_equities_panel/06_linear timeout this rule comes from: a notebook that fit in 120s
+  # idle, did not fit in 120s loaded, and passed at 300.
+  timeout: 1080
 case_studies/nasdaq100_microstructure/15_portfolio_management:
   parameters:
-    # Same constraint as 14_backtest above: the test data has 6 nasdaq symbols and
-    # the smallest top_k in the grid is 5, so a cap of 5 filters the whole grid out
-    # and the allocation sweep registers nothing. 6 is the whole fixture universe and
-    # is still not enough to realize top_k=5 long-short - signals.py caps each side at
-    # n_assets // 2, so these rows trade 3 names per side under a top_k=5 label. That
-    # is a limit of a 6-symbol fixture, not of the sweep: measured against the
-    # production universes the cap never binds (nasdaq100 115 symbols at top_k=20,
-    # cme_futures 30 at 10, fx_pairs 20 at 10, crypto_perps_funding 19 at 5).
-    MAX_SYMBOLS: 6
+    # Same constraint as 14_backtest above, and the widened fixture relaxes it.
+    # `signals.py:219` takes `eff_k = min(top_k, n_assets // 2)` on a long-short label, so at
+    # 6 symbols the ceiling was 3: a `top_k=5` row traded 3 names a side and registered under
+    # a k it had not run. At 12 the ceiling is 6 and `top_k=5` binds first, so the sweep
+    # trades the 5 a side it declares. The ceiling never bound in production (nasdaq100 115
+    # symbols at top_k=20, cme_futures 30 at 10, fx_pairs 20 at 10, crypto 19 at 5); it was
+    # a property of a 6-symbol fixture.
+    MAX_SYMBOLS: 12
     TOP_N_PREDICTIONS: 2
   timeout: 300
-case_studies/nasdaq100_microstructure/16_costs:
-  timeout: 600
-case_studies/nasdaq100_microstructure/17_risk_management:
+case_studies/nasdaq100_microstructure/16_risk_management:
   parameters:
     MAX_RISK_VARIANTS: 3
     # Matches 15_portfolio_management: the overlays are applied to that notebook's
     # allocation rows, so both must price the same cross-section.
-    MAX_SYMBOLS: 6
+    MAX_SYMBOLS: 12
     TOP_N_COMBOS: 1
   timeout: 600
-case_studies/nasdaq100_microstructure/18_strategy_analysis:
+case_studies/nasdaq100_microstructure/17_costs:
+  timeout: 600
+case_studies/nasdaq100_microstructure/18_holdout_predictions:
+  # Canonical, not preview. `reconstruct_locked_model_request` refuses any spec whose
+  # execution_tier is not canonical, and the harness injects EXECUTION_TIER="preview" for any
+  # notebook that declares it - so the default routing fails this notebook on its first fit.
+  # 19 and 20 follow it, because a holdout resolved in one tier and read in another is two
+  # registries. Kept although all three are skipped, so that whenever the fixture can support
+  # them they run as one tier rather than being wired up again from scratch.
+  research_preview: false
+  # Refits the selected configuration over the holdout fold - one training run, no sweep. The
+  # budget is one fit over the full minute panel before 2021-07-01, which is the expensive part
+  # here rather than the number of configurations.
+  timeout: 900
+  skip: true
+  skip_reason: "The seeded fixture carries no resolved training specification, so the holdout fold cannot be derived. `tests/fixtures/seed_results.py:578` writes each training run's spec as {family, config_name, label} with no `computation` block, and `build_holdout_training_spec` re-keys the validation CV onto the holdout fold by reading `computation.cv` - so it refuses with 'holdout CV derivation requires a current resolved training specification'. That refusal is correct and the notebook is correct: a holdout refit is defined by the CV interval it covers, and a spec that records none cannot produce one. Identical to the etfs 18/19 skip, because the limitation is the shared fixture rather than anything about this case study. Remove this skip when the fixture seeds a resolved computation, not before - a fabricated CV block would let the job report a holdout derived from fold boundaries no model was ever fitted on."
+case_studies/nasdaq100_microstructure/19_holdout_backtest:
+  research_preview: false
+  # One backtest over the six-month holdout window. The engine runs on the minute grid and
+  # aggregates to daily before it computes anything, so the budget tracks the window's bars
+  # rather than its sessions.
+  timeout: 600
+  skip: true
+  skip_reason: "Reads the holdout prediction set 18_holdout_predictions registers, and derives which one through the same `build_holdout_training_spec` call - so it refuses for the same reason and one step earlier than 18 does. The seeded fixture carries no resolved training specification, so the holdout fold cannot be derived. Remove this skip when the fixture seeds a resolved computation, not before."
+case_studies/nasdaq100_microstructure/20_strategy_analysis:
   skip: true
   skip_reason: "Analyzes the cost-feasible ensemble carrier, which is registered out-of-band (session_6/7 drivers) and is not reproduced by the in-notebook test sweep, so an isolated test registry has no carrier rows. Runs clean in production."
   timeout: 180
@@ -2041,8 +2558,35 @@ case_studies/sp500_equity_option_analytics/05_evaluation:
     MAX_SYMBOLS: 5
   timeout: 300
 case_studies/sp500_equity_option_analytics/06_linear:
+  # 120s is measured here, not copied. Slowest of 5 green `cs-sp500_equity_option_analytics` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 20.0s, 17% of the budget, against
+  # 31.9s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
+  #
+  # The reduction is stated rather than left to the max_symbols: 5 that
+  # `_collect_preview_reductions` applies when an entry declares none, for the reason
+  # 08_tabular_dl gives below: a preview that reduces by default reduces invisibly, and the
+  # next reader of this entry cannot tell a deliberate universe cut from an absent one.
+  # Stating it changes nothing about what runs.
+  #
+  # Only the universe is cut, matching 08_tabular_dl. #560 removed a `MAX_FOLDS: 2` here and
+  # ml4t/agent-workspace#942 reads its absence as this preview running every fold on a budget
+  # priced for two. Measured on run 34271885198, the whole stage takes 26s of its 180s, so the
+  # fold axis is not what this budget is short of and a fold cut is not restored blind.
+  parameters:
+    PREVIEW_REDUCTIONS:
+      max_symbols: 5
   timeout: 120
 case_studies/sp500_equity_option_analytics/07_gbm:
+  # As 06_linear: the universe cut is stated rather than defaulted, and no fold reduction is
+  # invented for a case study whose sibling entries declare none. 26s of 180s on run
+  # 34271885198.
+  parameters:
+    PREVIEW_REDUCTIONS:
+      max_symbols: 5
   timeout: 180
 case_studies/sp500_equity_option_analytics/08_tabular_dl:
   # DEVICE and POPULATION_NAME travel together. The runner refuses to substitute a CPU
@@ -2241,28 +2785,182 @@ case_studies/sp500_equity_option_analytics/12_causal_dml:
 case_studies/sp500_equity_option_analytics/13_model_analysis:
   timeout: 300
 case_studies/sp500_equity_option_analytics/14_backtest:
-  parameters:
-    MAX_SYMBOLS: 3
-    TOP_K: 1
+  # Five invocations, one per label this case study declares in
+  # backtest.sweep.top_k_grid, and the same five on each of the four stages that
+  # take LABEL as a parameter: 14_backtest, 15_portfolio_management,
+  # 16_risk_management and 17_costs.
+  #
+  # The notebook falls back to bt_config.primary_label when LABEL is empty, so before
+  # this it ran once and the other four were never exercised at all - while
+  # 17_costs and 20_strategy_analysis assert that every declared label carries rankable
+  # validation backtests. A chain that runs one label of five does not test that
+  # claim; it passes or fails on whether the fixture happens to carry rows from an
+  # earlier generation.
+  #
+  # The primary label is first, so the first run is what this entry did before.
+  #
+  # MAX_SYMBOLS is 21 on every one of them, from #850: backtest.sweep.top_k_grid
+  # declares [5, 10, 20] for every label here and the case study is long-only, so a
+  # scheme survives when k < n_assets. Three symbols realized none of them and the
+  # sweep ran a `6 predictions x 0 schemes` grid; six realizes only ew_top5.
+  # Twenty-one realizes all three, which is what the fixture declares, and the seeded
+  # predictions carry 27 symbols so the panel has the names
+  # (ml4t/agent-workspace#1084).
+  invocations:
+    - id: fwd_ret_5d
+      parameters:
+        LABEL: fwd_ret_5d
+        MAX_SYMBOLS: 21
+        TOP_K: 1
+    - id: fwd_dir_5d
+      parameters:
+        LABEL: fwd_dir_5d
+        MAX_SYMBOLS: 21
+        TOP_K: 1
+    - id: fwd_dir_10d
+      parameters:
+        LABEL: fwd_dir_10d
+        MAX_SYMBOLS: 21
+        TOP_K: 1
+    - id: fwd_ret_10d
+      parameters:
+        LABEL: fwd_ret_10d
+        MAX_SYMBOLS: 21
+        TOP_K: 1
+    - id: fwd_ret_risk_adj_5d
+      parameters:
+        LABEL: fwd_ret_risk_adj_5d
+        MAX_SYMBOLS: 21
+        TOP_K: 1
   timeout: 600
 case_studies/sp500_equity_option_analytics/15_portfolio_management:
-  parameters:
-    # top_k_grid starts at 5, so a cap of 5 empties the grid and the sweep registers
-    # nothing; the fixture's seeded allocation rows then hide it downstream. This case
-    # study is long-only, so 6 realizes top_k=5 in full.
-    MAX_SYMBOLS: 6
-    TOP_N_PREDICTIONS: 2
+  # 21, matching 14_backtest, so one chain reads one universe. Before this the four
+  # label-taking stages read 21, 6, 5 and 5: the sweep backtested 21 symbols and the
+  # pricing and risk stages then read a 5-symbol panel, which is not the panel the
+  # backtests were run on. That is accretion rather than a considered set - #850 raised
+  # exactly one of the four.
+  #
+  # 21 is #850's number and the reason is its own: top_k_grid declares [5, 10, 20] for
+  # every label and the case study is long-only, so a scheme survives when k < n_assets.
+  # 21 realizes all three; 6 realizes only ew_top5.
+  #
+  # **Raising the chain alone realizes nothing here, and that is now measured rather
+  # than predicted.** This case study's model stages inject max_symbols 5 (06_linear and
+  # 07_gbm take the harness default), and the sweep ranks the predictions those stages
+  # produced, so the ranked cross-section stays 5 however wide the price panel is.
+  # 14_backtest fails on all five labels with "top_k_grid[...] = [5, 10, 20] is empty
+  # after filtering against 5 tradeable names (price panel 21, ranked cross-section 5)",
+  # identically on main at 92ce81b2 and on this branch at c14ffeb9. The panel moved; the
+  # cross-section did not.
+  #
+  # So 15, 16 and 17 do not run at all - they fail downstream of 14 - and the 21 here is
+  # a declaration lining the chain up with 14_backtest rather than something CI
+  # exercises. It stays because a chain reading two universes is wrong whether or not
+  # the first stage gets far enough to show it.
+  #
+  # Raising the model stages is not the answer 41 was in us_firm_characteristics:
+  # 11d_stochastic_discount_factor measured 673.0s at 5 symbols on this branch's run
+  # (649.8s on main at the same commit range), which is 43% of the whole job, so four
+  # times the universe is a job of its own. The finding belongs with
+  # ml4t/agent-workspace#1084 and is not chased with a wider number here.
+  # The same five labels as 14_backtest above, because this stage takes LABEL
+  # too and reads what the previous one registered for that label.
+  invocations:
+    - id: fwd_ret_5d
+      parameters:
+        LABEL: fwd_ret_5d
+        # top_k_grid starts at 5, so a cap of 5 empties the grid and the sweep registers
+        # nothing; the fixture's seeded allocation rows then hide it downstream. This case
+        # study is long-only, so 6 realizes top_k=5 in full.
+        MAX_SYMBOLS: 21
+        TOP_N_PREDICTIONS: 2
+    - id: fwd_dir_5d
+      parameters:
+        LABEL: fwd_dir_5d
+        # top_k_grid starts at 5, so a cap of 5 empties the grid and the sweep registers
+        # nothing; the fixture's seeded allocation rows then hide it downstream. This case
+        # study is long-only, so 6 realizes top_k=5 in full.
+        MAX_SYMBOLS: 21
+        TOP_N_PREDICTIONS: 2
+    - id: fwd_dir_10d
+      parameters:
+        LABEL: fwd_dir_10d
+        # top_k_grid starts at 5, so a cap of 5 empties the grid and the sweep registers
+        # nothing; the fixture's seeded allocation rows then hide it downstream. This case
+        # study is long-only, so 6 realizes top_k=5 in full.
+        MAX_SYMBOLS: 21
+        TOP_N_PREDICTIONS: 2
+    - id: fwd_ret_10d
+      parameters:
+        LABEL: fwd_ret_10d
+        # top_k_grid starts at 5, so a cap of 5 empties the grid and the sweep registers
+        # nothing; the fixture's seeded allocation rows then hide it downstream. This case
+        # study is long-only, so 6 realizes top_k=5 in full.
+        MAX_SYMBOLS: 21
+        TOP_N_PREDICTIONS: 2
+    - id: fwd_ret_risk_adj_5d
+      parameters:
+        LABEL: fwd_ret_risk_adj_5d
+        # top_k_grid starts at 5, so a cap of 5 empties the grid and the sweep registers
+        # nothing; the fixture's seeded allocation rows then hide it downstream. This case
+        # study is long-only, so 6 realizes top_k=5 in full.
+        MAX_SYMBOLS: 21
+        TOP_N_PREDICTIONS: 2
   timeout: 300
 case_studies/sp500_equity_option_analytics/17_costs:
+  # One run, and no LABEL, unlike the three stages above it. This is the first stage
+  # after the selection: it opens the candidate set 16_risk_management froze, and prices
+  # the single configuration that set carries. That configuration is on one label, so the
+  # notebook treats an injected LABEL as a request and raises when it disagrees -
+  # "Costs price the configuration the selection names; running it under another label's
+  # contract would report a different strategy" (17_costs.py, the REQUESTED_LABEL guard).
+  #
+  # Fanning it out over the five labels 14/15/16 run is therefore four guaranteed
+  # failures and one pass, which is what #851 did and what CI run 34174124145 showed on
+  # main. The stages before the selection sweep every label; this one prices the winner.
+  #
+  # 21, matching the three stages above and #850's number, is the reason this entry is in
+  # this PR at all: it prices the configuration the sweep selected, so it has to load the
+  # panel that sweep ran on. At 5 it read a five-symbol panel and priced a strategy that
+  # was ranked on twenty-one.
   parameters:
-    MAX_SYMBOLS: 5
+    MAX_SYMBOLS: 21
     TOP_N_COMBOS: 1
   timeout: 600
 case_studies/sp500_equity_option_analytics/16_risk_management:
-  parameters:
-    MAX_RISK_VARIANTS: 3
-    MAX_SYMBOLS: 5
-    TOP_N_COMBOS: 1
+  # The same five labels as 14_backtest above, because this stage takes LABEL
+  # too and reads what the previous one registered for that label.
+  invocations:
+    - id: fwd_ret_5d
+      parameters:
+        LABEL: fwd_ret_5d
+        MAX_RISK_VARIANTS: 3
+        MAX_SYMBOLS: 21
+        TOP_N_COMBOS: 1
+    - id: fwd_dir_5d
+      parameters:
+        LABEL: fwd_dir_5d
+        MAX_RISK_VARIANTS: 3
+        MAX_SYMBOLS: 21
+        TOP_N_COMBOS: 1
+    - id: fwd_dir_10d
+      parameters:
+        LABEL: fwd_dir_10d
+        MAX_RISK_VARIANTS: 3
+        MAX_SYMBOLS: 21
+        TOP_N_COMBOS: 1
+    - id: fwd_ret_10d
+      parameters:
+        LABEL: fwd_ret_10d
+        MAX_RISK_VARIANTS: 3
+        MAX_SYMBOLS: 21
+        TOP_N_COMBOS: 1
+    - id: fwd_ret_risk_adj_5d
+      parameters:
+        LABEL: fwd_ret_risk_adj_5d
+        MAX_RISK_VARIANTS: 3
+        MAX_SYMBOLS: 21
+        TOP_N_COMBOS: 1
   timeout: 600
 case_studies/sp500_equity_option_analytics/18_holdout_predictions:
   # Not reducible. `reconstruct_locked_request` refuses anything but the canonical tier at
@@ -2285,7 +2983,13 @@ case_studies/sp500_options/02_labels:
 case_studies/sp500_options/03_financial_features:
   timeout: 120
 case_studies/sp500_options/04_model_based_features:
-  # Skipped in CI (gpu: true), so this timeout bounds only fixture generation via
+  # This entry has no `gpu` key and the notebook is NOT skipped: cs-sp500_options
+  # runs it, and it passes by executing about nine minutes of MCMC. The comment
+  # here said "Skipped in CI (gpu: true)" long after that stopped being true,
+  # which is the kind of note that makes a green job look like it proves less
+  # than it does.
+  #
+  # The timeout therefore bounds the CI run as well as fixture generation via
   # tests/generate_intermediates.py, where 300s was not enough to finish even on a
   # GPU. The stage silently failed there, which is why the committed temporal
   # artifact had no `fold` column and 05_evaluation, 07_gbm and 09_deep_learning
@@ -2308,12 +3012,58 @@ case_studies/sp500_options/04_model_based_features:
   parameters:
     SV_N_PARTICLES: 100
     SV_POOL_SIZE: 2
-  timeout: 1800
+    # sigma_eta is now estimated on a refit schedule rather than once per fold, and the
+    # number of sampler runs is what that changed: at the production cadence of 63 sessions
+    # this fixture's calendar gives about eleven refits before the holdout where the per-fold
+    # design gave three. The pool and particle reductions above do not touch that term. 252
+    # puts the count back to three, so the budget below still describes the job.
+    #
+    # The GARCH cadence is deliberately NOT reduced: it is maximum likelihood on a few
+    # thousand observations, so CI exercises the production schedule for the model whose
+    # schedule this change is really about.
+    SV_REFIT_EVERY_OVERRIDE: 252
+    # MAX_SYMBOLS is back, and this time the notebook defines it. The note above records that it
+    # was passed once and silently ignored - papermill logged "Passed unknown parameter" and the
+    # full universe ran anyway - which is the defect tests/pm_helpers.py::unusable_parameters now
+    # catches. The parameters cell declares it, and it reduces through `top_entities`, the same
+    # rule and tie-break 05_evaluation uses, so a reduced 04 and a reduced 05 see one universe.
+    #
+    # 0 - no reduction - and that is a measurement, not an omission. The production straddle panel
+    # carries 627 symbols and the parameter matters there. This fixture carries 22, and section F's
+    # cross-sectional IC does not survive cutting them.
+    #
+    # Measured on this fixture, stages 03 and 04 in one session: 5 symbols raises "No temporal
+    # feature had enough non-null observations for IC", 14 raises the same, 22 passes. Two
+    # explanations were checked and eliminated before settling on this - 980 dates still carry the
+    # 10 symbols MIN_SYMBOLS_PER_DATE wants at a cap of 14, and all 14 selected segments clear the
+    # 252-session GARCH burn-in - so the binding constraint is below those, in the straddle-derived
+    # VRP columns rather than in the GARCH column or the date count. Anyone cutting this further
+    # should first establish which feature loses its IC, rather than lowering the number again.
+    #
+    # The cheap lever on this notebook is cadence, not universe: SV_REFIT_EVERY_OVERRIDE above
+    # already takes the sampler from about eleven refits to three, and the GARCH cadence is left
+    # at production deliberately, per the note above it.
+    MAX_SYMBOLS: 0
+  # Budget raised from 1800 on a CI measurement, not on another notebook's number.
+  # Slowest of 5 green `cs-sp500_options` runs of .github/workflows/test.yml sampled 2026-09-04:
+  # 903.5s, 50% of the old budget. A budget a green run already fills is one
+  # contention band away from a timeout that reads as a notebook defect. The line is a
+  # third, because the only measurement anyone has of that band is the
+  # us_equities_panel/06_linear timeout this rule comes from: a notebook that fit in 120s
+  # idle, did not fit in 120s loaded, and passed at 300.
+  timeout: 2760
 case_studies/sp500_options/05_evaluation:
   parameters:
     MAX_SYMBOLS: 5
   timeout: 300
 case_studies/sp500_options/06_linear:
+  # 120s is measured here, not copied. Slowest of 5 green `cs-sp500_options` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 22.8s, 19% of the budget, against
+  # 33.1s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
   # The reductions these budgets were measured against, restored. #446 removed
   # NUM_BOOST_ROUND and #560 removed MAX_FOLDS and MAX_SYMBOLS from both entries, in each case
   # because the notebook could no longer receive that parameter - and left the timeouts, which
@@ -2441,28 +3191,58 @@ case_studies/sp500_options/11_model_analysis:
 case_studies/sp500_options/12_backtest:
   # MAX_SYMBOLS and TOP_K are gone: the notebook takes its concentration grid from
   # setup.yaml and its universe from the signal, and neither name is bound any more.
-  # A preview run needs WORKSPACE plus the exact PREVIEW_PREDICTION_HASHES of a preview
-  # model run, because a backtest population is defined by the prediction sets it names
-  # and never by registry presence. The fixture has no preview model run to name, so
-  # there is nothing for this notebook to resolve until one exists.
-  awaiting_rebuild:
-    needs: {of: sp500_options, backtest_stage: signal}
-    issue: 499
+  #
+  # This entry used to be an `awaiting_rebuild` declaration, and it was the wrong shape.
+  # The condition it declared was measured against ML4T_ARTIFACT_ROOT, which is the
+  # maintainer's registry and not the seeded one this job runs against, so it read as unmet
+  # on a runner and as satisfied on any workstation that had run the models - skipping in CI
+  # and failing `test_awaiting_rebuild` locally at the same time. What was actually missing
+  # was a way to name a preview run's prediction sets: the notebook took literal
+  # PREVIEW_PREDICTION_HASHES, and a hash is a property of the run that produced it, so
+  # nothing could declare one ahead of time.
+  #
+  # The notebook now selects them declaratively, the same way cme_futures/13_backtest does,
+  # and the preview stages above register the predictions it selects from. So there is
+  # nothing to skip: the notebook runs.
+  #
+  # PREVIEW_MAX_PREDICTIONS is the preview's own width. The canonical run trades every
+  # member of four named populations; the preview trades four prediction sets of the one
+  # declared label, which is enough for the shortlist the next stage takes from it.
+  parameters:
+    PREVIEW_LABELS: [ret_to_expiry]
+    PREVIEW_MAX_PREDICTIONS: 4
+  timeout: 900
 case_studies/sp500_options/13_portfolio_management:
-  awaiting_rebuild:
-    needs: {of: sp500_options, backtest_stage: signal}
-    issue: 500
+  # PREVIEW_MAX_BASELINE_CONFIGS is the preview's own shortlist width, and it counts model
+  # configurations rather than backtest rows: the baseline stage registers one row per
+  # concentration, so a row limit would spend the whole budget inside the first
+  # configuration's k grid and hand this notebook a shortlist with one model in it. The
+  # canonical width is setup.yaml's top_n_predictions.allocation and is 10, which a preview
+  # baseline stage capped at four prediction sets cannot supply.
+  parameters:
+    PREVIEW_LABELS: [ret_to_expiry]
+    PREVIEW_MAX_BASELINE_CONFIGS: 2
+  timeout: 900
 case_studies/sp500_options/14_risk_management:
-  awaiting_rebuild:
-    needs: {of: sp500_options, backtest_stage: allocation}
-    issue: 502
+  # Not `awaiting_rebuild`, and not runnable as a preview either. The notebook opens the
+  # canonical candidate set `sp500-options-strategy-candidates-v1` and refuses any other
+  # tier on its first cell, because what it validates is the boundary the *finalized* pool
+  # passes through. `13_portfolio_management` creates that set only in a canonical run -
+  # `CandidateSet.create` refuses a preview member - so a preview of this notebook has
+  # nothing to open. Same shape as `11_model_analysis` above and stated the same way: the
+  # condition is a property of the seeded fixture, and `awaiting_rebuild` can only express
+  # conditions over the maintainer's registry.
+  skip: true
+  skip_reason: "Opens the canonical candidate set `sp500-options-strategy-candidates-v1` and refuses a preview tier, and a preview run of 13_portfolio_management cannot create one (`CandidateSet.create` refuses a preview member). Runnable when the fixture registry ships that candidate set."
 case_studies/sp500_options/15_costs:
-  # An empty entry between two skipped siblings, which read as deliberate and did nothing. A
-  # preview run needs WORKSPACE plus the exact PREVIEW_BASELINE_HASHES of preview backtests, and
-  # those are 12_backtest's output - the same dependency 13 and 14 declare, one stage further on.
-  awaiting_rebuild:
-    needs: {of: sp500_options, backtest_stage: signal}
-    issue: 501
+  # The same conversion as 13 above, one stage further on: this notebook read literal
+  # PREVIEW_BASELINE_HASHES and now selects the preview baselines by label. One
+  # representative per family is what the canonical run prices, and two configurations is
+  # what the preview baseline stage above can supply.
+  parameters:
+    PREVIEW_LABELS: [ret_to_expiry]
+    PREVIEW_MAX_BASELINE_CONFIGS: 2
+  timeout: 900
 case_studies/sp500_options/16_holdout_predictions:
   # Canonical, not preview. `reconstruct_locked_model_request` refuses any spec whose
   # execution_tier is not canonical, and the harness injects EXECUTION_TIER="preview" for any
@@ -2483,9 +3263,16 @@ case_studies/sp500_options/17_holdout_backtest:
   skip: true
   skip_reason: "Derives which holdout prediction set to trade through the same `build_holdout_training_spec` call 16 makes, so it refuses for the same reason and one step earlier. The seeded fixture carries no resolved training specification, so the holdout fold cannot be derived. It would refuse a second time even if that were fixed: the option path resolves short straddles against the raw AlgoSeek chain and replays that resolution in a fresh interpreter, and the fixture carries neither. Remove this skip when the fixture seeds a resolved computation and an option chain, not before."
 case_studies/sp500_options/18_strategy_analysis:
-  awaiting_rebuild:
-    needs: {of: sp500_options, backtest_stage: allocation}
-    issue: 503
+  # Not `awaiting_rebuild`, for the reason recorded on 11_model_analysis and 14 above: it
+  # resolves the named official populations `sp500-options-baseline-validation-v1` and
+  # `sp500-options-cost-sensitivity-validation-v1` and calls `require_complete` on them, and
+  # a preview run cannot create an official population
+  # (research/population.py::_refuse_preview_activation). The condition is a property of the
+  # seeded fixture registry, which `awaiting_rebuild` cannot express - it reads
+  # ML4T_ARTIFACT_ROOT, so declaring it there turned this file red on every workstation that
+  # had run the models while still skipping here.
+  skip: true
+  skip_reason: "Resolves the named official baseline and cost-sensitivity populations and requires them complete, and a preview run cannot create one (research/population.py::_refuse_preview_activation). Runnable when the fixture registry ships canonical populations under those names."
 case_studies/sp500_options/90_ic_diagnostic:
   # MAX_SYMBOLS was 5 while the notebook screens every cross-section at MIN_SYMBOLS_PER_DATE = 10,
   # so the cap guaranteed that no date could ever qualify - a reduction that made the run
@@ -2499,30 +3286,57 @@ case_studies/sp500_options/90_ic_diagnostic:
 case_studies/us_equities_panel/01_feasibility_analysis:
   timeout: 120
 case_studies/us_equities_panel/02_labels:
+  # 1996, not 2000. The three stages that take a START_DATE have to agree - 04 asserts the
+  # panel it loads digests to what 02 recorded - and the value is set by what 06_linear needs,
+  # not by what 02 needs. See 04 below for the measurement.
   parameters:
-    START_DATE: '2000-01-01'
-  timeout: 120
+    START_DATE: '1996-01-01'
+  timeout: 150
 case_studies/us_equities_panel/03_financial_features:
+  # START_DATE has to match 02_labels and 04_model_based_features; see 04 for why it is 1996.
+  # The timeout goes up with it: 400s measured at the 2000 start on 2026-09-06, over a span
+  # 22% shorter than this one. Raised to 900 rather than to a scaled estimate, because the
+  # scaling of this stage across a longer span has not been measured and 600 left no room to
+  # find out.
   parameters:
-    START_DATE: '2000-01-01'
-  timeout: 600
+    START_DATE: '1996-01-01'
+  timeout: 900
 case_studies/us_equities_panel/04_model_based_features:
   # START_DATE has to match 02_labels above. 04 asserts that the panel it loads
   # digests to the value 02_labels recorded against the label file it scores
   # against, and without this it loaded its own 1990-01-01 default (298,055 rows,
-  # 067a8e7a6b6ed0bf) against labels written from 2000-01-01 (220,378 rows,
-  # 54d5bec0d92f4f7f).
+  # 067a8e7a6b6ed0bf) against labels written from a later start.
   #
-  # GARCH_MIN_OBS goes with it. #446 dropped both because neither could be received;
-  # START_DATE now can, and GARCH_MIN_OBS was moved into the notebook's parameters cell
-  # so it can too. At a 2000-01-01 start no symbol carries 504 sessions inside a fold's
-  # training window, so every GARCH fit is skipped and the per-fold assembly joins an
-  # empty frame.
+  # No GARCH_MIN_OBS or REGIME_MIN_OBS. Both burn-ins are counted in sessions of one
+  # series now, not inside a fold's training window. The entry used to lower GARCH_MIN_OBS
+  # to 50 because under per-fold fitting no symbol reached 504 inside a ten-year window and
+  # every fit was skipped; that reason went with the schedule (#790).
+  #
+  # START_DATE is 1996-01-01 and not 2000-01-01, and the reason is a stage further down.
+  # The burn-ins are counted from the start of the panel, so the first 756 sessions carry no
+  # `wass_*` value and the first 504 carry no `garch_cond_vol`. That is fine for 02-05, which
+  # is where it was checked before, and it is not fine for 06_linear: 06 fits per fold, and
+  # on a panel starting 2000-02-01 the span is 18.2 years, too short to hold `train_size: 10Y`
+  # plus `n_splits: 16` at `val_size: 1Y`. generate_cv_splits falls back to an expanding
+  # window, the fixture gets 15 folds rather than the declared 16, and fold 0 trains on 223
+  # sessions - inside every burn-in above. Measured on the 2026-09-06 fixture: 19 declared
+  # features entirely missing from fold 0's training rows, 7 from fold 1's and 5 from fold 2's,
+  # which is what `standardized_fold` refuses ("the declared feature list no longer describes
+  # the design matrix").
+  #
+  # Fold 0's training window grows by about 261 sessions per year of earlier start. Measured
+  # against a synthetic weekday index to the same end date: 1998 gives 16 folds and 518
+  # sessions, 1996 gives 16 and 1041, 1990 - the production default all three stages carry -
+  # gives 16 and 2606. 1996 is the latest start that clears the 756-session clustering burn-in,
+  # so it is the cheapest one that works. A full run is unaffected either way.
+  #
+  # XS_MIN_STOCKS stays. The default 50 is a floor on the cross-section a daily return
+  # distribution is summarized from, and the fixture carries 56 symbols in total, so at
+  # the default nearly every date is dropped and the clustering has nothing to fit on.
   parameters:
-    GARCH_MIN_OBS: 50
-    START_DATE: '2000-01-01'
+    START_DATE: '1996-01-01'
     XS_MIN_STOCKS: 25
-  timeout: 300
+  timeout: 450
 case_studies/us_equities_panel/05_evaluation:
   parameters:
     MAX_SYMBOLS: 5
@@ -2533,34 +3347,55 @@ case_studies/us_equities_panel/06_linear:
   # so only on the research_preview=True path. generate_intermediates.py passes this same
   # entry with research_preview=False and no output_dir, so an EXECUTION_TIER written down
   # here would force the preview tier on the run that is meant to be canonical.
-  # MAX_FOLDS and MAX_SYMBOLS are folded into PREVIEW_REDUCTIONS by _collect_preview_reductions.
-  parameters:
-    MAX_FOLDS: 2
-    MAX_SYMBOLS: 5
-  # 300s, not 120s. 06 runs the widest workload of the model notebooks under these reductions -
-  # LABELS and CONFIG_NAMES both empty means all three labels against all sixteen published linear
-  # configurations, 48 config-label fits at two folds each - and it carried the tightest budget of
-  # the seventeen. 07_gbm has 300s for 2 fits and 08_tabular_dl 180s for 1. The budget was inverted
-  # against the work. It timed out at 120s in a full-chain run on a box at load 39 with ten
-  # concurrent pytest processes, then passed alone under the same load, so nothing here is broken -
-  # but a shared CI runner is normally loaded, and a margin that survives only an idle machine is
-  # not a margin.
-  timeout: 300
-case_studies/us_equities_panel/07_gbm:
-  # See 06_linear on why EXECUTION_TIER is not written here.
   #
-  # The declared menu is 15 GBM configurations per label across three labels. All 45 at two
-  # folds does not finish inside any timeout worth having in CI - it ran past 180s on the
-  # population fit - so this narrows to one label and two configurations. 07 refuses to
-  # publish the canonical population from a narrowed menu (narrows_declared_catalog), which
-  # is why POPULATION_NAME is set: the reduced run gets its own population rather than
-  # writing a partial one under the canonical name.
+  # That is also why MAX_FOLDS and MAX_SYMBOLS are gone. They were here on the strength of
+  # "_collect_preview_reductions folds them into PREVIEW_REDUCTIONS", which is true on the
+  # research_preview=True path and false on the one the sentence above says this entry takes.
+  # Papermill logged "Passed unknown parameter" for both on 2026-09-06 and the notebook ran
+  # unreduced. The reduction below is one this notebook takes on the canonical path.
+  #
+  # LABELS and CONFIG_NAMES narrow the menu from three labels against sixteen published
+  # configurations - 48 config-label fits - to one label against two, which is the shape
+  # 07_gbm already uses. Narrowing means the run may not publish the canonical population
+  # (narrows_declared_catalog), which is what POPULATION_NAME is for: the reduced run gets
+  # its own name rather than writing a partial member set under the canonical one.
+  #
+  # The two names are not a free choice. `preset_patches._trim_label_configs` rewrites the
+  # fixture's copy of every `config/training/fwd_*.yaml`, keeping the first
+  # `_MAX_CONFIGS_PER_FAMILY` entries of the `linear` and `gbm` families, and
+  # `load_model_configs` raises on any name the menu does not declare. So a name has to
+  # survive the trim, which for linear leaves `ols` and `ridge_a0.001` - the unpenalized
+  # baseline and the lightest ridge, which still exercises both code paths.
+  # `test_requested_configurations_survive_the_fixture_trim` pins this.
   parameters:
     LABELS: [fwd_ret_1d]
-    CONFIG_NAMES: [default_mse, leaves_31_mse]
+    CONFIG_NAMES: [ols, ridge_a0.001]
+    POPULATION_NAME: ci-preview-linear
+  # 300s stands. It was set when this entry was believed to fit 48 config-label pairs at two
+  # folds each; it was in fact fitting all 48 at every fold, and the narrowing above cuts that
+  # to 2 pairs. The margin is now larger than the number suggests rather than smaller.
+  timeout: 300
+case_studies/us_equities_panel/07_gbm:
+  # See 06_linear on why EXECUTION_TIER is not written here, and on why MAX_FOLDS and
+  # MAX_SYMBOLS are gone: this notebook declares neither, papermill dropped both, and the
+  # "at two folds" in the paragraph below was never what ran.
+  #
+  # The declared menu is 15 GBM configurations per label across three labels. All 45 does not
+  # finish inside any timeout worth having in CI - it ran past 180s on the population fit - so
+  # this narrows to one label and two configurations. 07 refuses to publish the canonical
+  # population from a narrowed menu (narrows_declared_catalog), which is why POPULATION_NAME
+  # is set: the reduced run gets its own population rather than writing a partial one under
+  # the canonical name.
+  #
+  # `default_mae` and not `leaves_31_mse`, for the reason 06_linear gives above: the fixture's
+  # menu is trimmed to the first two of the `gbm` family and `leaves_31_mse` is not among them,
+  # so `load_model_configs` would have raised "configurations not declared" the moment this
+  # stage ran. It never did - 06_linear failed ahead of it on every regeneration that reached
+  # this far - so the entry was wrong and untested at the same time.
+  parameters:
+    LABELS: [fwd_ret_1d]
+    CONFIG_NAMES: [default_mse, default_mae]
     POPULATION_NAME: ci-preview-gbm
-    MAX_FOLDS: 2
-    MAX_SYMBOLS: 5
   timeout: 300
 case_studies/us_equities_panel/08_tabular_dl:
   # A reduction is only legal under the preview tier, as for 06 and 07 above.
@@ -2646,6 +3481,10 @@ case_studies/us_equities_panel/14_causal_dml:
   # CV_FOLDS, MAX_SAMPLES and N_PLACEBO became PREVIEW_N_FOLDS,
   # PREVIEW_MAX_SAMPLES and PREVIEW_N_PLACEBO: the reduced fold count, sample
   # cap and placebo count are part of the preview identity now, not free knobs.
+  # 24 placebo draws, not fewer: the plus-one correction floors the empirical p at
+  # 1/(n+1), so classify_refutation (utils/causal.py:753) returns "Underpowered" for
+  # any n below 20 and the draws are spent on a verdict that cannot be reached. 20 is
+  # the first reachable count; 24 leaves margin for draws that fail.
   parameters:
     MAX_SYMBOLS: 5
     PREVIEW_N_FOLDS: 2
@@ -2690,7 +3529,7 @@ case_studies/us_equities_panel/17_portfolio_management:
     PREVIEW_MAX_ALLOCATORS: 2
     MAX_SYMBOLS: 45
   timeout: 300
-case_studies/us_equities_panel/18_costs:
+case_studies/us_equities_panel/19_costs:
   # TOP_N_COMBOS became PREVIEW_MAX_SOURCE_ROWS, and the cost grid is bounded by
   # PREVIEW_MAX_COST_VALUES rather than run in full.
   # See 16_backtest on the 45-symbol floor.
@@ -2700,7 +3539,7 @@ case_studies/us_equities_panel/18_costs:
     PREVIEW_MAX_COST_VALUES: 2
     MAX_SYMBOLS: 45
   timeout: 600
-case_studies/us_equities_panel/19_risk_management:
+case_studies/us_equities_panel/18_risk_management:
   # TOP_N_COMBOS became PREVIEW_MAX_SOURCE_ROWS and MAX_RISK_VARIANTS became
   # PREVIEW_MAX_RISK_CONTROLS.
   # See 16_backtest on the 45-symbol floor.
@@ -2736,6 +3575,50 @@ case_studies/us_firm_characteristics/04_evaluation:
     MAX_SYMBOLS: 5
   timeout: 300
 case_studies/us_firm_characteristics/05_linear:
+  # 41 symbols, and the number is derived. This case study is long-short and declares
+  # backtest.sweep.top_k_grid [5, 10, 20, 50], so a concentration k needs 2k disjoint
+  # names: 10, 20, 40 and 100. At 41 the first three are realizable and k=50 is not,
+  # because two disjoint legs of fifty need 101 names.
+  #
+  # **us_firm_characteristics therefore realizes three of the four concentrations it
+  # declares.** The fourth needs a 101-symbol universe, which the fixture could supply:
+  # its fold validation artifacts carry 200 entities, measured on test-data 1ea74a26,
+  # which is what CI checks out. The ladder is on ml4t/agent-workspace#1075.
+  #
+  # 41 was estimated at +5.5 minutes, from 08a_ipca at 114.9s on 20 symbols scaling with
+  # rows. **Measured, it costs nothing: the job went 359.32s to 344.23s.** Per stage,
+  # against main at 92ce81b2 and this branch at c14ffeb9, both cs-us_firm_characteristics:
+  # the 11-14 chain costs +21.3s for 12 -> 41, 05_linear and 06_gbm cost +3.6s for 5 -> 41,
+  # and 08a_ipca went 124.7s to 75.9s - 48.8s faster on twice the universe, while every
+  # other stage moved 0.5-4.4s the other way. So the estimate had both the size and the
+  # sign of the dominant term wrong, and the 101-symbol rung cannot be priced by scaling
+  # it. Whether 08a's speedup is IPCA's alternating fit converging in fewer iterations on
+  # a wider cross-section is not established here; what is established is that the number
+  # this ladder was priced from does not hold.
+  #
+  # Both runs skipped 07_tabular_dl, 08b, 08c and 08d, so those figures price a job with
+  # four model stages absent. #855 makes all four run, and this branch declares 41 on
+  # every one of them, so the next run measures a different job and these numbers do not
+  # carry forward to it. They are kept because what they establish is about 08a_ipca's
+  # direction, not about the job total.
+  #
+  # The model stages carry it, not just the backtest chain. They are what bounds the
+  # ranked cross-section: `get_entry_schemes_for` filters against the width of the
+  # predictions a sweep ranks, so leaving these at 5 while raising 11-14 would repair the
+  # chain against a universe its inputs never produce, and the sweep would still register
+  # nothing. That is the state this case study was in, and the proximate polars error it
+  # produced is what #1075 fixed.
+  #
+  # 04_evaluation and 09_causal_dml stay at 5: neither feeds the prediction population
+  # 11_backtest ranks. 05_linear reads its configs from the shared catalog rather than
+  # from the evaluation artifact.
+  # 120s is measured here, not copied. Slowest of 5 green `cs-us_firm_characteristics` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 13.9s, 12% of the budget, against
+  # 16.8s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
   parameters:
     # Restored after #560 removed MAX_FOLDS/MAX_SYMBOLS and left the timeout that had
     # been measured against them, so this preview had been fitting the full declared
@@ -2745,7 +3628,7 @@ case_studies/us_firm_characteristics/05_linear:
     # tests/pm_helpers.py, which only fires when the whole mapping is empty.
     PREVIEW_REDUCTIONS:
       folds: [0]
-      max_symbols: 5
+      max_symbols: 41
   # Measured 2026-08-27 with the reductions above: 88.7 s for the whole pytest
   # invocation, fixture seeding included, at load average 40.8 on 24 cores. No cell
   # approached the per-cell cap, so 120 s is kept rather than raised.
@@ -2759,17 +3642,22 @@ case_studies/us_firm_characteristics/06_gbm:
       checkpoint_interval: 10
       folds: [0]
       max_iterations: 20
-      max_symbols: 5
+      max_symbols: 41
   # Measured the same way and at the same load: 172.9 s end to end. Kept at 180 s.
   timeout: 180
 case_studies/us_firm_characteristics/07_tabular_dl:
-  # setup.yaml pins modeling.tabular_dl.device: cuda, and resolve_torch_device
-  # refuses to silently downgrade an explicit device. So this notebook cannot run
-  # on the CPU runner, and running it there is what the GPU-first rule forbids.
-  # Sibling us_equities_panel/08_tabular_dl passes on CPU only because that case
-  # study pins no tabular_dl device.
-  gpu: true
+  # setup.yaml pins modeling.tabular_dl.device: cuda, and resolve_torch_device still refuses to
+  # silently downgrade an explicit device. What changed is that the notebook now takes a DEVICE
+  # parameter, so the downgrade is requested rather than substituted, and a run that requests one
+  # must name its own population (ml4t/agent-workspace#1064). 18.3 s at the `max_symbols: 20`
+  # below, measured 2026-09-08 on four cores (`taskset -c 0-3`) with CUDA hidden, against
+  # test-data 2c068b5a. Widening it from 5 cost 0.6 s, because the price panel is 12 and the
+  # fit is dominated by fixed cost at either width. Four dedicated cores here approximate a
+  # four-core runner rather than equal one, so 300 keeps room rather than tracking the
+  # measurement. Re-base on the first green `cs-us_firm_characteristics` runs.
   parameters:
+    DEVICE: cpu
+    POPULATION_NAME: us_firm_characteristics-tabular_dl-preview
     # BATCH_SIZE, MAX_FOLDS, MAX_SYMBOLS and N_EPOCHS were the pre-migration knobs and the
     # migrated notebook binds none of them, so `unusable_parameters` flags all four - the
     # folding in `_collect_preview_reductions` happens after that check reads this file, not
@@ -2790,9 +3678,19 @@ case_studies/us_firm_characteristics/07_tabular_dl:
     # `_resolve_tabm_config` has loaded the patched preset. An earlier version of this entry
     # asked for 50 epochs at an interval of 25, which buys the same two checkpoints for
     # twenty-five times the training.
+    # 41, and the number is load-bearing now that #855 makes this stage actually run. At 5
+    # its predictions win the validation ranking with a cross-section smaller than every k
+    # in backtest.sweep.top_k_grid ([5, 10, 20, 50]), and 11_backtest refuses the whole
+    # sweep: a long-short k of 5 needs 10 tradeable names.
+    #
+    # #855 set this to 20 on the reasoning that 20 is what 08a-08d declare and that the
+    # price panel caps it at 12 (ml4t/agent-workspace#1064). Both halves move on this
+    # branch: 08a-08d are raised to 41 here, and 11_backtest's panel goes to 41 with them,
+    # so 20 would now be the one model stage narrower than the chain that ranks it - the
+    # defect this branch exists to remove, reintroduced at a single entry.
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-      max_symbols: 5
+      max_symbols: 41
   timeout: 300
 case_studies/us_firm_characteristics/08_latent_factors:
   # No longer GPU: the index fits nothing. It reads the declared menu, reads each execution
@@ -2837,20 +3735,37 @@ case_studies/us_firm_characteristics/08a_ipca:
     # and it would put the preview's hands on a production declaration.
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-      max_symbols: 20
+      max_symbols: 41
   timeout: 300
-# 08b is genuinely GPU: a Torch conditional autoencoder that trains, and its chapter
-# counterpart 14_latent_factors/06_conditional_autoencoder is already gpu: true.
 case_studies/us_firm_characteristics/08b_conditional_autoencoder:
-  gpu: true
+  # Runs on the CPU in CI (ml4t/agent-workspace#1064): the notebook takes a DEVICE parameter and
+  # a run on any device other than the declared one must name its own population. Measured
+  # 2026-09-07 on four cores (`taskset -c 0-3`) with CUDA hidden, against test-data 2c068b5a.
+  # Four dedicated cores on this workstation approximate a four-core runner rather than equal
+  # one, so the budgets below carry room rather than tracking the seconds. Re-base them on the
+  # first green `cs-us_firm_characteristics` runs, which is where the percentages elsewhere in
+  # this file come from.
+  # 15.5 s.
   parameters:
+    DEVICE: cpu
+    POPULATION_NAME: us_firm_characteristics-cae-preview
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-      max_symbols: 20
+      max_symbols: 41
   timeout: 300
 case_studies/us_firm_characteristics/08c_stochastic_discount_factor:
-  gpu: true
+  # Runs on the CPU in CI (ml4t/agent-workspace#1064): the notebook takes a DEVICE parameter and
+  # a run on any device other than the declared one must name its own population. Measured
+  # 2026-09-07 on four cores (`taskset -c 0-3`) with CUDA hidden, against test-data 2c068b5a.
+  # Four dedicated cores on this workstation approximate a four-core runner rather than equal
+  # one, so the budgets below carry room rather than tracking the seconds. Re-base them on the
+  # first green `cs-us_firm_characteristics` runs, which is where the percentages elsewhere in
+  # this file come from.
+  # 140.7 s, the slowest of the four. 600 rather than 300: 2x is thin for the one member whose
+  # phase budgets are reduced here rather than by preset_patches.py.
   parameters:
+    DEVICE: cpu
+    POPULATION_NAME: us_firm_characteristics-sdf-preview
     # SDF is the one latent member `preset_patches.py` does not reduce. Its patch sets `n_epochs`
     # and `checkpoint_interval`, and SDF reads neither: `_expected_latent_checkpoints` builds its
     # surface from `n_epochs_unc`, `n_epochs_cond` and `checkpoint_epochs`. So a CI run trained
@@ -2858,17 +3773,26 @@ case_studies/us_firm_characteristics/08c_stochastic_discount_factor:
     # described. The three phase budgets are named here because nothing else reduces them.
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-      max_symbols: 20
+      max_symbols: 41
       n_epochs_cond: 2
       n_epochs_moment: 1
       n_epochs_unc: 2
-  timeout: 300
+  timeout: 600
 case_studies/us_firm_characteristics/08d_supervised_autoencoder:
-  gpu: true
+  # Runs on the CPU in CI (ml4t/agent-workspace#1064): the notebook takes a DEVICE parameter and
+  # a run on any device other than the declared one must name its own population. Measured
+  # 2026-09-07 on four cores (`taskset -c 0-3`) with CUDA hidden, against test-data 2c068b5a.
+  # Four dedicated cores on this workstation approximate a four-core runner rather than equal
+  # one, so the budgets below carry room rather than tracking the seconds. Re-base them on the
+  # first green `cs-us_firm_characteristics` runs, which is where the percentages elsewhere in
+  # this file come from.
+  # 23.0 s.
   parameters:
+    DEVICE: cpu
+    POPULATION_NAME: us_firm_characteristics-sae-preview
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-      max_symbols: 20
+      max_symbols: 41
   timeout: 300
 case_studies/us_firm_characteristics/09_causal_dml:
   parameters:
@@ -2886,29 +3810,138 @@ case_studies/us_firm_characteristics/09_causal_dml:
 case_studies/us_firm_characteristics/10_model_analysis:
   timeout: 300
 case_studies/us_firm_characteristics/11_backtest:
-  parameters:
-    MAX_SYMBOLS: 5
-    TOP_K: 2
-  timeout: 120
+  # Three invocations, one per label this case study declares in
+  # backtest.sweep.top_k_grid, and the same three on each of the four stages that
+  # take LABEL as a parameter: 11_backtest, 12_portfolio_management,
+  # 13_risk_management and 14_costs.
+  #
+  # The notebook falls back to bt_config.primary_label when LABEL is empty, so before
+  # this it ran once and the other two were never exercised - while
+  # 14_costs and 17_strategy_analysis assert that every declared label carries rankable
+  # validation backtests. A chain that runs one label of three does not test that
+  # claim; it passes or fails on whether the fixture happens to carry rows from an
+  # earlier generation.
+  #
+  # The primary label is first, so the first run is what this entry did before.
+  invocations:
+    - id: fwd_ret_1m
+      parameters:
+        LABEL: fwd_ret_1m
+        # The sweep's entry schemes come from backtest.sweep.top_k_grid, which for every
+        # us_firm_characteristics label is [5, 10, 20, 50]. `get_entry_schemes_for` drops a
+        # scheme when k >= n_assets (that is the whole universe, i.e. the equal-weight
+        # benchmark) and, long-short, when 2k > n_assets, because the two legs must be
+        # disjoint. So the smallest declared scheme needs ten symbols, and at MAX_SYMBOLS: 5
+        # every member of the grid was filtered out: the sweep ran a 19 x 0 grid, registered
+        # nothing, and section 3 read an empty registry (ml4t/agent-workspace#1075). Twelve
+        # admits ew_top5 and matches 12_portfolio_management, so the two notebooks sweep the
+        # same universe.
+        MAX_SYMBOLS: 41
+        TOP_K: 2
+    - id: fwd_class_1m
+      parameters:
+        LABEL: fwd_class_1m
+        # The sweep's entry schemes come from backtest.sweep.top_k_grid, which for every
+        # us_firm_characteristics label is [5, 10, 20, 50]. `get_entry_schemes_for` drops a
+        # scheme when k >= n_assets (that is the whole universe, i.e. the equal-weight
+        # benchmark) and, long-short, when 2k > n_assets, because the two legs must be
+        # disjoint. So the smallest declared scheme needs ten symbols, and at MAX_SYMBOLS: 5
+        # every member of the grid was filtered out: the sweep ran a 19 x 0 grid, registered
+        # nothing, and section 3 read an empty registry (ml4t/agent-workspace#1075). Twelve
+        # admits ew_top5 and matches 12_portfolio_management, so the two notebooks sweep the
+        # same universe.
+        MAX_SYMBOLS: 41
+        TOP_K: 2
+    - id: fwd_ret_1m_win
+      parameters:
+        LABEL: fwd_ret_1m_win
+        # The sweep's entry schemes come from backtest.sweep.top_k_grid, which for every
+        # us_firm_characteristics label is [5, 10, 20, 50]. `get_entry_schemes_for` drops a
+        # scheme when k >= n_assets (that is the whole universe, i.e. the equal-weight
+        # benchmark) and, long-short, when 2k > n_assets, because the two legs must be
+        # disjoint. So the smallest declared scheme needs ten symbols, and at MAX_SYMBOLS: 5
+        # every member of the grid was filtered out: the sweep ran a 19 x 0 grid, registered
+        # nothing, and section 3 read an empty registry (ml4t/agent-workspace#1075). Twelve
+        # admits ew_top5 and matches 12_portfolio_management, so the two notebooks sweep the
+        # same universe.
+        MAX_SYMBOLS: 41
+        TOP_K: 2
+  timeout: 300
 case_studies/us_firm_characteristics/12_portfolio_management:
-  parameters:
-    # top_k_grid starts at 5, so a cap of 5 empties the grid and the sweep registers
-    # nothing; the fixture's seeded allocation rows then hide it downstream. This case
-    # study is long-short, and signals.py caps each side at n_assets // 2, so a cap of 6
-    # would register rows labelled top_k=5 that trade 3 names per side. The fixture holds
-    # 200 symbols, so 12 realizes the concentration the row claims.
-    MAX_SYMBOLS: 12
-    TOP_N_PREDICTIONS: 2
+  # The same three labels as 11_backtest above, because this stage takes LABEL
+  # too and reads what the previous one registered for that label.
+  invocations:
+    - id: fwd_ret_1m
+      parameters:
+        LABEL: fwd_ret_1m
+        # top_k_grid starts at 5, so a cap of 5 empties the grid and the sweep registers
+        # nothing; the fixture's seeded allocation rows then hide it downstream. This case
+        # study is long-short, and signals.py caps each side at n_assets // 2, so a cap of 6
+        # would register rows labelled top_k=5 that trade 3 names per side. The fixture holds
+        # 200 symbols, so 12 realizes the concentration the row claims.
+        MAX_SYMBOLS: 41
+        TOP_N_PREDICTIONS: 2
+    - id: fwd_class_1m
+      parameters:
+        LABEL: fwd_class_1m
+        # top_k_grid starts at 5, so a cap of 5 empties the grid and the sweep registers
+        # nothing; the fixture's seeded allocation rows then hide it downstream. This case
+        # study is long-short, and signals.py caps each side at n_assets // 2, so a cap of 6
+        # would register rows labelled top_k=5 that trade 3 names per side. The fixture holds
+        # 200 symbols, so 12 realizes the concentration the row claims.
+        MAX_SYMBOLS: 41
+        TOP_N_PREDICTIONS: 2
+    - id: fwd_ret_1m_win
+      parameters:
+        LABEL: fwd_ret_1m_win
+        # top_k_grid starts at 5, so a cap of 5 empties the grid and the sweep registers
+        # nothing; the fixture's seeded allocation rows then hide it downstream. This case
+        # study is long-short, and signals.py caps each side at n_assets // 2, so a cap of 6
+        # would register rows labelled top_k=5 that trade 3 names per side. The fixture holds
+        # 200 symbols, so 12 realizes the concentration the row claims.
+        MAX_SYMBOLS: 41
+        TOP_N_PREDICTIONS: 2
   timeout: 300
 case_studies/us_firm_characteristics/14_costs:
+  # One run, and no LABEL, unlike the three stages above it. Same reason as
+  # sp500_equity_option_analytics/17_costs: this stage sweeps the cost grid over the one
+  # configuration `resolve_solvent_carrier` carries forward. It reads the label off that
+  # carrier - `LABEL = carrier["label"]` at 14_costs.py:142, unconditional once the two
+  # differ - so an injected LABEL never reaches a decision.
+  #
+  # That makes a fan-out inert rather than red: #851 declared three and CI ran the same
+  # carrier three times, passing each. Two of the three were duplicates of the first, and
+  # a green tick on a run that could not have exercised its label is the coverage claim
+  # this file exists to keep honest.
+  #
+  # 41, matching the three stages above, for the reason spelled out on 11_backtest: the
+  # carrier this stage prices was ranked on a 41-symbol panel, so pricing it against a
+  # five-symbol one reports costs for a strategy that was never run.
   parameters:
-    MAX_SYMBOLS: 5
+    MAX_SYMBOLS: 41
   timeout: 600
 case_studies/us_firm_characteristics/13_risk_management:
-  parameters:
-    MAX_RISK_VARIANTS: 3
-    MAX_SYMBOLS: 5
-    TOP_N_COMBOS: 1
+  # The same three labels as 11_backtest above, because this stage takes LABEL
+  # too and reads what the previous one registered for that label.
+  invocations:
+    - id: fwd_ret_1m
+      parameters:
+        LABEL: fwd_ret_1m
+        MAX_RISK_VARIANTS: 3
+        MAX_SYMBOLS: 41
+        TOP_N_COMBOS: 1
+    - id: fwd_class_1m
+      parameters:
+        LABEL: fwd_class_1m
+        MAX_RISK_VARIANTS: 3
+        MAX_SYMBOLS: 41
+        TOP_N_COMBOS: 1
+    - id: fwd_ret_1m_win
+      parameters:
+        LABEL: fwd_ret_1m_win
+        MAX_RISK_VARIANTS: 3
+        MAX_SYMBOLS: 41
+        TOP_N_COMBOS: 1
   timeout: 600
 case_studies/us_firm_characteristics/15_holdout_predictions:
   skip: true

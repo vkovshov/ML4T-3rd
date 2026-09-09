@@ -49,16 +49,8 @@ if TYPE_CHECKING:
     from case_studies.utils.latent_factors.case_study import LatentFactorCaseStudyContext
 
 
-_PREVIEW_FIELDS = {
-    "folds",
-    "max_iter",
-    "max_symbols",
-    "n_epochs",
-    "n_epochs_cond",
-    "n_epochs_moment",
-    "n_epochs_unc",
-    "n_factors",
-}
+from case_studies.utils.preview_fields import LATENT_PREVIEW_FIELDS as _PREVIEW_FIELDS
+
 _MODEL_PREVIEW_FIELDS = {
     "cae": {"folds", "max_symbols", "n_epochs", "n_factors"},
     "ipca": {"folds", "max_iter", "max_symbols", "n_factors"},
@@ -604,6 +596,7 @@ def reconstruct_locked_request(
             split,
             case.temporal_by_fold,
             source_timeline=case.dataset.get_column(case.date_col),
+            declared_folds=case.temporal_artifact_splits,
             date_col=case.date_col,
         )
     case.splits = [split]
@@ -725,6 +718,16 @@ def _valid_model_dir(model_dir: Path, context: LatentFactorContext) -> bool:
 
 
 def _normalize_prediction_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    """One representation for both sides of the persisted-vs-reconstructed comparison.
+
+    The zone is part of that. `register_prediction_set` writes a naive decision-time column
+    as UTC-aware, while a frame rebuilt from the fitted state carries whatever the context
+    holds, so comparing them as they arrive reports two identical checkpoints as
+    disagreeing. Both sides come through here, so normalizing once is enough.
+    """
+    from case_studies.utils.registry.store import _timestamps_as_utc
+
+    frame = _timestamps_as_utc(frame)
     rename = {
         old: new
         for old, new in {

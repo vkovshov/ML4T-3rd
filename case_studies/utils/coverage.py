@@ -36,16 +36,21 @@ separate answer.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
+import pandas as pd
 import polars as pl
+from ml4t.diagnostic.splitters.calendar import TradingCalendar
 
-from case_studies.utils.notebook_contracts import _ENTITY_ALIASES, _first_present
+from case_studies.utils.notebook_contracts import _first_present, _is_finite
 
 __all__ = [
     "CoverageError",
+    "absent_calendar_sessions",
+    "assert_sessions_complete",
     "CoverageGap",
     "CoverageReport",
     "declared_sessions",
@@ -103,6 +108,98 @@ class CoverageReport:
     def raise_if_incomplete(self) -> None:
         if not self.complete:
             raise CoverageError(self.summary())
+
+
+def absent_calendar_sessions(
+    session_dates: Iterable[date],
+    *,
+    calendar: str,
+    known_absent: Iterable[date] = (),
+) -> list[date]:
+    """Sessions the exchange held between the first and last of *session_dates*, that are not
+    in *session_dates* and are not declared in *known_absent*.
+
+    A panel is normally checked the other way round: each date it carries is asked whether the
+    exchange was open, and the dates that fail are dropped as stray prints. That direction
+    cannot see this one. A session the exchange held and the archive never printed leaves no
+    row to test, so nothing raises, every query succeeds, and one day's rows are simply gone.
+    `us_equities_panel`'s single missing session was found by two counts of an unrelated
+    quantity differing by one, which is the only way a defect of this shape surfaces on its own.
+
+    It matters because every rolling window downstream reads its input in order and treats
+    consecutive elements as consecutive sessions. A variance recursion, a fractional-difference
+    convolution and a rolling average all price the gap across a missing session as one day's
+    move.
+
+    *known_absent* is the declaration, not a suppression: a caller states the sessions it has
+    established are missing upstream, and anything else is returned for the caller to refuse.
+
+    A date counts as a session when it settles itself, which is the rule
+    :meth:`TradingCalendar.get_sessions` applies and the same one a stray-print filter uses -
+    so the two directions cannot disagree about what a session is. Running it over every
+    calendar day of the span enumerates what the exchange held, rather than classifying only
+    the dates the archive happens to carry.
+
+    Args:
+        session_dates: The panel's session index. Order and duplicates do not matter.
+        calendar: Exchange calendar name, as ``config/setup.yaml``'s ``evaluation.calendar``
+            gives it.
+        known_absent: Sessions already established as missing upstream.
+
+    Returns:
+        The undeclared absent sessions, earliest first. Empty when the panel is complete.
+    """
+    present = {d.date() if isinstance(d, datetime) else d for d in session_dates}
+    if not present:
+        return []
+
+    span = pd.date_range(str(min(present)), str(max(present)), freq="D", tz="UTC")
+    settling = TradingCalendar(calendar).get_sessions(pd.DatetimeIndex(span))
+    held = set(pd.DatetimeIndex(settling.to_numpy()).date) & set(span.date)
+    declared = {d.date() if isinstance(d, datetime) else d for d in known_absent}
+    return sorted(held - present - declared)
+
+
+def assert_sessions_complete(
+    session_dates: Iterable[date],
+    *,
+    calendar: str,
+    known_absent: Iterable[date] = (),
+    source: str,
+) -> list[date]:
+    """Refuse a session index missing a session the exchange held and nobody declared.
+
+    The refusing half of :func:`absent_calendar_sessions`, so the message that explains why a
+    gap matters is written once rather than pasted into each notebook that builds an index.
+
+    Returns the declared absences that fall inside this index's own span, so a caller can print
+    what it deliberately tolerated. A caller that tolerates nothing gets an empty list.
+
+    :raises CoverageError: on any absent session that *known_absent* does not name.
+    """
+    undeclared = absent_calendar_sessions(
+        session_dates, calendar=calendar, known_absent=known_absent
+    )
+    if undeclared:
+        shown = ", ".join(str(d) for d in undeclared[:10])
+        more = "" if len(undeclared) <= 10 else f" (and {len(undeclared) - 10} more)"
+        raise CoverageError(
+            f"{source}: {len(undeclared)} {calendar} session(s) the exchange held that this "
+            f"panel does not carry and nothing declared: {shown}{more}. A rolling window reads "
+            "its input in order and treats consecutive elements as consecutive sessions, so a "
+            "missing session is priced as though the gap across it were one period's move. "
+            "Establish whether the session is absent upstream or dropped in a join, then either "
+            "fix the join or declare the session."
+        )
+    present = {d.date() if isinstance(d, datetime) else d for d in session_dates}
+    if not present:
+        return []
+    first, last = min(present), max(present)
+    return sorted(
+        d
+        for d in (x.date() if isinstance(x, datetime) else x for x in known_absent)
+        if first <= d <= last
+    )
 
 
 def _as_date(value) -> date:
@@ -371,6 +468,7 @@ def _coverage(
     case_dir: Path | None,
     fold_column: tuple[str, ...] | str | None,
     decision_axis: pl.Series | None = None,
+    folds: Sequence[int] | None = None,
 ) -> CoverageReport:
     if frame.is_empty():
         raise CoverageError(
@@ -385,6 +483,26 @@ def _coverage(
     expected = declared_sessions(
         case_study, label, split=split, case_dir=case_dir, decision_axis=decision_axis
     )
+    if folds is not None:
+        # A reduced run fits the folds it declared and no others, so measuring it against all of
+        # them reports a gap that is the reduction itself. Narrowing here rather than in the
+        # caller keeps every condition below comparing against a declaration: the windows are
+        # still setup.yaml's, and a fold present in the frame but outside the subset is still
+        # refused as undeclared.
+        keep = {int(fold) for fold in folds}
+        if not keep:
+            raise CoverageError(
+                f"{case_study}/{label}/{split}: an empty fold subset asks for no coverage at all"
+            )
+        declared_ids = {fold for fold, _, _ in windows if fold is not None}
+        unknown = sorted(keep - declared_ids)
+        if unknown:
+            raise CoverageError(
+                f"{case_study}/{label}/{split}: folds {unknown} are not declared in setup.yaml, "
+                f"which declares {sorted(declared_ids)}; a subset can only narrow"
+            )
+        windows = [window for window in windows if window[0] in keep]
+        expected = {fold: sessions for fold, sessions in expected.items() if fold in keep}
 
     observed = _normalize_time(frame.select(pl.col(time_col)).unique().get_column(time_col))
     observed_set = set(observed.to_list())
@@ -442,7 +560,9 @@ def _coverage(
                     )
                 )
 
-    # (2) Every session inside a declared fold carries at least one row.
+    # (2) Every session inside a declared fold carries at least one row. On the prediction
+    #     path `check_prediction_coverage` has already dropped rows with no score, so a row
+    #     there is a prediction; a backtest input frame is not required to carry one.
     expected_total = 0
     for fold, sessions in expected.items():
         expected_total += len(sessions)
@@ -534,6 +654,35 @@ def _sessions_between(
     return axis.filter(keep).to_list()
 
 
+def _scored_rows(frame: pl.DataFrame, *, case_study: str, label: str, split: str) -> pl.DataFrame:
+    """Restrict a prediction frame to the rows that actually carry a score.
+
+    ``_coverage`` counts a session as observed when a row exists for it. On the
+    prediction path that is not what the module promises: a frame with no score column
+    at all, or one whose scores are all null, described a complete set of decisions
+    that were never made.
+
+    Null is not the whole of it. NaN and infinity are non-null and rank against nothing,
+    so a session holding only those is as empty of decisions as one holding only nulls -
+    ``_is_finite`` is the same reading the IC series already applies, and on a non-float
+    column being non-null is the whole of the condition.
+    """
+    score_col = _first_present(frame.columns, _SCORE_ALIASES)
+    if score_col is None:
+        raise CoverageError(
+            f"{case_study}/{label}/{split} predictions: no prediction column among "
+            f"{_SCORE_ALIASES} in columns {sorted(frame.columns)}. A frame with no score "
+            "is not a prediction set, and a check that cannot run must not read as a pass."
+        )
+    scored = frame.filter(_is_finite(frame.schema[score_col], score_col))
+    if scored.is_empty():
+        raise CoverageError(
+            f"{case_study}/{label}/{split} predictions: no finite value in {score_col!r} across "
+            f"{frame.height} rows; the frame carries sessions but no predictions."
+        )
+    return scored
+
+
 def check_prediction_coverage(
     predictions: pl.DataFrame,
     case_study: str,
@@ -544,15 +693,25 @@ def check_prediction_coverage(
     fold_column: tuple[str, ...] | str | None = _FOLD_ALIASES,
     raise_on_gap: bool = True,
     decision_axis: pl.Series | None = None,
+    folds: Sequence[int] | None = None,
 ) -> CoverageReport:
     """Assert a prediction set covers the declared validation geometry.
 
     Call this where the predictions are produced, before anything downstream reads
     them. ``raise_on_gap=False`` returns the report for a notebook that wants to
     display it before failing.
+
+    Condition (2) is read here as the module docstring states it - a session carries a
+    **prediction**, not merely a row. The score column is required and rows with a null
+    score are dropped before the geometry is measured, so a frame carrying a timestamp
+    for every declared session and no usable score reports the gap rather than
+    ``complete``. The requirement sits here and not in ``_coverage`` because
+    ``check_backtest_input_coverage`` shares that helper and a backtest input frame is
+    not required to carry a score column.
     """
+    scored = _scored_rows(predictions, case_study=case_study, label=label, split=split)
     report = _coverage(
-        predictions,
+        scored,
         case_study=case_study,
         label=label,
         split=split,
@@ -560,6 +719,7 @@ def check_prediction_coverage(
         case_dir=case_dir,
         fold_column=fold_column,
         decision_axis=decision_axis,
+        folds=folds,
     )
     if raise_on_gap:
         report.raise_if_incomplete()
