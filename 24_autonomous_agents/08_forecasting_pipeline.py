@@ -51,8 +51,9 @@
 """Full Forecasting Pipeline: agent-debate-supervisor end-to-end."""
 
 import json
+import textwrap
 import time
-from datetime import date
+from datetime import date, datetime
 
 import matplotlib.pyplot as plt
 import polars as pl
@@ -97,9 +98,11 @@ from utils.style import COLORS, add_message_title, show_with_alt
 # aggregated.
 #
 # Three weights decide how much each later stage can move the answer, and they are the numbers
-# to argue with. `DEBATE_WEIGHT` is the debate midpoint's share of the post-debate probability.
-# `SUPERVISOR_MEDIUM_WEIGHT` is the supervisor's share when it states medium confidence; at
-# high confidence it replaces the value outright and at low confidence it is ignored.
+# to argue with - on a live run. `DEBATE_WEIGHT` is the debate midpoint's share of the
+# post-debate probability. `SUPERVISOR_MEDIUM_WEIGHT` is the supervisor's share when it states
+# medium confidence; at high confidence it replaces the value outright and at low confidence it
+# is ignored. A replay reports the probabilities its capture recorded, so changing either weight
+# with `RUN_LIVE` left at `False` changes nothing: the run that produced the numbers is over.
 #
 # The three `CONFIDENCE_WHEN_*` values are what the pipeline reports as its own confidence in
 # each of those three cases. They are an ordering, not an estimate: a forecast the supervisor
@@ -405,6 +408,8 @@ def _run_research_agents(
 def _blend_final_probability(
     post_debate: float,
     supervisor_artifact: SupervisorArtifact,
+    *,
+    medium_weight: float = SUPERVISOR_MEDIUM_WEIGHT,
 ) -> tuple[float, float]:
     """Phase 4 to final: confidence-gated supervisor override. Returns (p_yes, confidence)."""
     final_p = post_debate
@@ -414,8 +419,8 @@ def _blend_final_probability(
         final_confidence = CONFIDENCE_WHEN_OVERRIDDEN
     elif supervisor_artifact.confidence == "medium":
         if supervisor_artifact.p_yes is not None:
-            final_p = (1 - SUPERVISOR_MEDIUM_WEIGHT) * post_debate + (
-                SUPERVISOR_MEDIUM_WEIGHT * supervisor_artifact.p_yes
+            final_p = (1 - medium_weight) * post_debate + (
+                medium_weight * supervisor_artifact.p_yes
             )
             final_confidence = CONFIDENCE_WHEN_BLENDED
     return max(0.01, min(0.99, final_p)), final_confidence
@@ -441,7 +446,11 @@ def _forecast_one(forecaster, question: ForecastQuestion) -> ForecastResult:
     aggregation = neyman_extremize(
         [agent.p_yes for agent in answered], base=0.5, correlation=forecaster.correlation
     )
-    aggregate_p = aggregation.extremized_probability or aggregation.raw_probability
+    aggregate_p = (
+        aggregation.extremized_probability
+        if aggregation.extremized_probability is not None
+        else aggregation.raw_probability
+    )
     debate = DebateAgent(
         llm=forecaster.llm,
         max_rounds=forecaster.debate_rounds,
@@ -456,7 +465,9 @@ def _forecast_one(forecaster, question: ForecastQuestion) -> ForecastResult:
         question.question, summaries, cutoff_date=cutoff
     )
     post_debate = (1 - DEBATE_WEIGHT) * aggregate_p + DEBATE_WEIGHT * midpoint
-    final_p, confidence = _blend_final_probability(post_debate, supervisor)
+    final_p, confidence = _blend_final_probability(
+        post_debate, supervisor, medium_weight=SUPERVISOR_MEDIUM_WEIGHT
+    )
     tokens = sum((agent.token_usage for agent in agents), start=TokenUsage())
     tokens = tokens + debate.token_usage + supervisor.token_usage
     return ForecastResult(
@@ -519,9 +530,10 @@ class AIAForecaster:
 # [`07_adversarial_debate`](07_adversarial_debate.ipynb). Running both shows what each stage
 # does when the panel already agrees and when it does not.
 #
-# Both were unresolved on the 2026-06-09 capture date, which is what makes them honest
-# forecasts and also what makes them unscoreable. Replayed by default; `RUN_LIVE = True` with
-# `ANTHROPIC_API_KEY` and `TAVILY_API_KEY` forecasts current questions instead.
+# Both were unresolved when the captures were taken, which is what makes them honest forecasts
+# and also what makes them unscoreable; the replay cell reports each capture's date from the
+# record. Replayed by default; `RUN_LIVE = True` with `ANTHROPIC_API_KEY` and `TAVILY_API_KEY`
+# forecasts current questions instead.
 
 # %%
 questions = [get_chapter_clear_question(), get_chapter_contested_question()]
@@ -569,6 +581,8 @@ def _run_live_questions(questions_to_run: list[ForecastQuestion]) -> tuple[list,
                 "max_steps": MAX_STEPS,
                 "debate_rounds": DEBATE_ROUNDS,
                 "correlation": NEYMAN_CORRELATION,
+                "debate_weight": DEBATE_WEIGHT,
+                "supervisor_medium_weight": SUPERVISOR_MEDIUM_WEIGHT,
             },
             llm_calls=tracer.calls,
             notes="Full AIA pipeline: research, aggregate, debate, supervisor.",
@@ -595,9 +609,10 @@ def _load_pinned_questions() -> tuple[list, list]:
     for pinned_name in PINNED_TRACES:
         run = RunTrace.load(TRACES_DIR / pinned_name)
         result = run.forecast_result()
+        recorded = datetime.fromisoformat(run.created_at).date().isoformat()
         print(
             f"  ✓ {result.question.question[:50]}... → {result.final_probability:.2f} "
-            f"(replay) | {len(run.llm_calls)} calls from {pinned_name}"
+            f"(replay of a capture recorded {recorded}) | {len(run.llm_calls)} calls"
         )
         replay_results.append(result)
         replay_traces.append(run)
@@ -654,8 +669,10 @@ r = results[0]
 print(f"Question: {r.question.question}\n")
 print(show_agents(r.agents))
 
+# %% [markdown]
+# ### Aggregation
+
 # %%
-print("── Aggregation ──")
 if r.aggregation:
     print(f"  method:     {r.aggregation.method}")
     print(f"  inputs:     {r.aggregation.input_probabilities}")
@@ -663,15 +680,20 @@ if r.aggregation:
     print(f"  extremized: {r.aggregation.extremized_probability:.2f}")
     print(f"  d={r.aggregation.extremization_factor:.2f}, n_eff={r.aggregation.effective_n:.1f}")
 
+# %% [markdown]
+# ### Debate
+
 # %%
 if r.debate:
     print(show_debate_transcript(r.debate))
+
+# %% [markdown]
+# ### Supervisor, and what the pipeline returned
 
 # %%
 if r.supervisor:
     print(show_supervisor(r.supervisor))
 
-print("\n── Final ──")
 print(f"  probability: {r.final_probability:.2f}")
 print(f"  confidence:  {r.final_confidence:.2f}")
 if r.duration_seconds is not None:
@@ -682,75 +704,185 @@ else:
 # %% [markdown]
 # ## Where the Probability Went
 #
-# One line per question, one point per stage, in the order the pipeline ran them. This is the
-# figure to read before the final number: it shows which stage moved the answer and by how
-# much, and a stage that never moves anything on any question is a stage that is being paid
-# for and not used.
+# Three of the numbers a run produces are the same quantity at different points in the
+# pipeline: the aggregate over the research agents, the post-debate blend, and the final
+# probability. Those are what the line below joins. Everything else a stage produced is an
+# input to one of them - the market price the agents were shown, the agents' own answers, the
+# debate midpoint that enters the post-debate blend at the run's own debate weight, and the
+# supervisor's own probability - and is drawn as an open marker at the stage that read it.
 #
-# The market price appears first, as a reference rather than a stage. It was shown to the
-# research agents, so it is where they started rather than something they were tested against.
+# The distinction decides what a gap on this chart means. Between two carried values it is
+# movement, and a stage that never moves anything on any question is being paid for and not
+# used. Between two research agents it is disagreement: they answer in parallel and neither
+# saw the other.
+
+# %% [markdown]
+# The post-debate value is the one number on the line that no stage stores: it is rebuilt from
+# the aggregate and the debate midpoint. On a replay it has to be rebuilt with the weights the
+# capture was recorded with rather than the ones set in this notebook now. Mixing the two
+# recomputes the middle point of the line and leaves the points either side of it at their
+# recorded values. Raising `DEBATE_WEIGHT` far enough would pull the post-debate point above
+# both of its neighbours and draw a large supervisor correction that never happened. So the
+# weights take effect on a live run, and are read back from the trace on a replay.
+#
+# Neither weight was recorded when the two committed captures were taken, so they fall back to
+# the values in use then. `carried_probabilities` re-derives each capture's final probability
+# from its own parts and raises if the fallback does not reproduce it, which is what keeps the
+# fallback from becoming an assumption nobody checks.
+
 
 # %%
-flow_rows = []
-for r in results:
-    q_short = r.question.question.split("?")[0][:36]
-    phases = []
+CAPTURED_DEBATE_WEIGHT = 0.3
+CAPTURED_SUPERVISOR_MEDIUM_WEIGHT = 0.4
+
+
+def carried_probabilities(result: ForecastResult, run: RunTrace) -> tuple[float, float, float]:
+    """Return (aggregate, debate midpoint, post-debate) under the run's own weights."""
+    debate_weight = float(run.params.get("debate_weight", CAPTURED_DEBATE_WEIGHT))
+    medium_weight = float(
+        run.params.get("supervisor_medium_weight", CAPTURED_SUPERVISOR_MEDIUM_WEIGHT)
+    )
+    aggregate_p = (
+        result.aggregation.extremized_probability
+        if result.aggregation.extremized_probability is not None
+        else result.aggregation.raw_probability
+    )
+    midpoint = (
+        (result.debate.bull_final_probability + result.debate.bear_final_probability) / 2
+        if result.debate and result.debate.bull_final_probability is not None
+        else aggregate_p
+    )
+    post_debate = (1 - debate_weight) * aggregate_p + debate_weight * midpoint
+
+    if result.supervisor is not None:
+        rebuilt, _ = _blend_final_probability(
+            post_debate, result.supervisor, medium_weight=medium_weight
+        )
+        if abs(round(rebuilt, 4) - result.final_probability) > 1e-4:
+            raise RuntimeError(
+                f"Rebuilt final probability {rebuilt:.4f} does not match the recorded "
+                f"{result.final_probability:.4f} for {result.question.question[:50]}: "
+                f"the weights this line is drawn with are not the ones the run used."
+            )
+    return aggregate_p, midpoint, post_debate
+
+
+# %%
+STAGE_X = {
+    "Market": 0,
+    "Agents": 1,
+    "Aggregate": 2,
+    "Post-debate": 3,
+    "Supervisor": 4,
+    "Final": 5,
+}
+
+carried_rows, input_rows = [], []
+for r, run in zip(results, run_traces, strict=True):
+    q_short = textwrap.shorten(r.question.question, width=44, placeholder="...")
+    aggregate_p, midpoint, post_debate = carried_probabilities(r, run)
+
+    carried_rows += [
+        {"question": q_short, "stage": "Aggregate", "p_yes": aggregate_p},
+        {"question": q_short, "stage": "Post-debate", "p_yes": post_debate},
+        {"question": q_short, "stage": "Final", "p_yes": r.final_probability},
+    ]
 
     if r.question.current_market_price is not None:
-        phases.append(("Market", r.question.current_market_price))
-
-    for a in r.agents:
-        phases.append((a.agent_id, a.p_yes))
-
-    if r.aggregation:
-        phases.append(
-            ("Aggregate", r.aggregation.extremized_probability or r.aggregation.raw_probability)
+        input_rows.append(
+            {"question": q_short, "stage": "Market", "p_yes": r.question.current_market_price}
         )
-
+    for a in r.agents:
+        if a.p_yes is not None:
+            input_rows.append({"question": q_short, "stage": "Agents", "p_yes": a.p_yes})
     if r.debate and r.debate.bull_final_probability is not None:
-        mid = (r.debate.bull_final_probability + r.debate.bear_final_probability) / 2
-        phases.append(("Debate", mid))
-
+        input_rows.append({"question": q_short, "stage": "Post-debate", "p_yes": midpoint})
     if r.supervisor and r.supervisor.p_yes is not None:
-        phases.append(("Supervisor", r.supervisor.p_yes))
+        input_rows.append({"question": q_short, "stage": "Supervisor", "p_yes": r.supervisor.p_yes})
 
-    phases.append(("Final", r.final_probability))
-
-    for name, p in phases:
-        flow_rows.append({"question": q_short, "phase": name, "p_yes": p})
-
-flow_df = pl.DataFrame(flow_rows)
+carried_df = pl.DataFrame(carried_rows)
+inputs_df = pl.DataFrame(input_rows)
 
 fig, ax = plt.subplots()
-phase_order = flow_df["phase"].unique(maintain_order=True).to_list()
-for i, (question_text, group) in enumerate(flow_df.group_by("question", maintain_order=True)):
-    group = group.with_columns(pl.col("phase").cast(pl.Enum(phase_order))).sort("phase")
+questions = carried_df["question"].unique(maintain_order=True).to_list()
+palette = dict(zip(questions, [COLORS["blue"], COLORS["amber"]]))
+for q in questions:
+    carried = carried_df.filter(pl.col("question") == q)
     ax.plot(
-        group["phase"].to_list(),
-        group["p_yes"].to_list(),
+        [STAGE_X[stage] for stage in carried["stage"]],
+        carried["p_yes"].to_list(),
         marker="o",
         linewidth=2,
-        color=[COLORS["blue"], COLORS["amber"]][i],
-        label=question_text[0],
+        color=palette[q],
+        label=q,
+        zorder=3,
     )
+    stage_inputs = inputs_df.filter(pl.col("question") == q)
+    ax.scatter(
+        [STAGE_X[stage] for stage in stage_inputs["stage"]],
+        stage_inputs["p_yes"].to_list(),
+        facecolors="none",
+        edgecolors=palette[q],
+        s=55,
+        zorder=2,
+    )
+ax.set_xticks(list(STAGE_X.values()), list(STAGE_X.keys()))
 ax.set_xlabel("Pipeline stage")
 ax.set_ylabel("Probability of yes")
 ax.set_ylim(0, 1)
 add_message_title(
     ax,
-    "Most of the pipeline's movement happens before the debate",
-    subtitle="Market price shown first as the agents' starting context, not a stage",
+    "The probability the pipeline carries, and what each stage read",
+    subtitle="Filled markers joined by a line are the running answer; open markers are inputs",
 )
-ax.legend(loc="best")
+ax.legend(loc="upper right")
 show_with_alt(
     fig,
-    "Line chart of probability against pipeline stage, one line per question, running from "
-    f"the market price through the {N_AGENTS} research agents to the aggregate, the debate "
-    "midpoint, the supervisor and the final blend. The recession line runs from "
-    f"{results[0].question.current_market_price:.0%} to {results[0].final_probability:.0%} and "
-    f"the rate-hike line from {results[1].question.current_market_price:.0%} to "
-    f"{results[1].final_probability:.0%}.",
+    "Chart of probability against pipeline stage, one colour per question. A line joins three "
+    "filled markers on each - the aggregate, the post-debate blend and the final probability - "
+    "passing over the supervisor stage without a marker there. Open markers of the same colour "
+    "sit at the market price, at each research agent's answer, at the debate midpoint and at "
+    "the supervisor's own probability. On one question the three agent markers coincide; on "
+    "the other, two coincide and the third sits far above them. Both lines stay in the lower "
+    "half of the range, and one ends higher than it started while the other ends lower.",
 )
+
+# %% [markdown]
+# The steps below are taken over the carried values alone, so each one is the same quantity
+# before and after a stage weighted something into it.
+
+# %%
+largest_move = (
+    carried_df.with_columns(
+        pl.col("p_yes").diff().over("question").alias("move"),
+        pl.col("stage").shift().over("question").alias("from_stage"),
+    )
+    .drop_nulls("move")
+    .with_columns(pl.col("move").abs().alias("size"))
+    .sort("size", descending=True)
+    .group_by("question", maintain_order=True)
+    .first()
+    .select(
+        "question",
+        pl.format("{} to {}", "from_stage", "stage").alias("largest step"),
+        pl.col("move").round(3),
+    )
+)
+largest_move
+
+# %% [markdown]
+# The largest carried step falls at a different stage on each question: the post-debate blend
+# on one, the supervisor blend on the other. No stage in this pipeline decides the answer and
+# none of them is idle.
+#
+# The open markers carry a reading the line cannot. On the recession question all three
+# research agents returned the same probability and the aggregate came out below every one of
+# them, because extremizing away from a base of even odds treats agreement between agents as
+# evidence - which is the assumption
+# [`05_aggregation_math`](05_aggregation_math.ipynb) derives and
+# [`06_multi_agent_research`](06_multi_agent_research.ipynb) tests against agents that share a
+# prompt. Whether any of this movement is an improvement is a scoring question, and neither of
+# these questions had resolved.
 
 # %% [markdown]
 # ## Token use

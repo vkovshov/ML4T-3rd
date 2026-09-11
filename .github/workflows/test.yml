@@ -286,10 +286,11 @@ jobs:
           if [[ "$all" == "true" ]] || [[ "${{ steps.filter.outputs.ch22 }}" == "true" ]]; then
             add_ch "ch22" "22_rag"
           fi
-          # Ch23 skipped — requires Neo4j service (tested in test-neo4j when ready)
-          # if [[ "$all" == "true" ]] || [[ "${{ steps.filter.outputs.ch23 }}" == "true" ]]; then
-          #   add_ch "ch23" "23_knowledge"
-          # fi
+          if [[ "$all" == "true" ]] || [[ "${{ steps.filter.outputs.ch23 }}" == "true" ]]; then
+            # Named rather than "23_knowledge": six of the ten need the Neo4j service,
+            # which this job does not start, and they run in test-neo4j instead.
+            add_ch "ch23" "01_sp100 or 04_rag_comparison or 06_gnn or 10_network"
+          fi
           if [[ "$all" == "true" ]] || [[ "${{ steps.filter.outputs.ch24 }}" == "true" ]]; then
             add_ch "ch24" "24_autonomous"
           fi
@@ -314,8 +315,14 @@ jobs:
           fi
           echo "run_py312=$run_py312" >> "$GITHUB_OUTPUT"
 
-          # --- Neo4j flag (needs populated Neo4j — skip until infra is ready) ---
+          # --- Neo4j flag ---
+          # The service and the --network host wiring below are in place, and the
+          # notebooks that need Neo4j run against it in dependency order. This job is
+          # not one of the required contexts, so it reports rather than blocks.
           run_neo4j="false"
+          if [[ "$all" == "true" ]] || [[ "${{ steps.filter.outputs.ch23 }}" == "true" ]]; then
+            run_neo4j="true"
+          fi
           echo "run_neo4j=$run_neo4j" >> "$GITHUB_OUTPUT"
 
           # --- Benchmark flag (disabled — QuestDB container fails health check in CI) ---
@@ -362,24 +369,8 @@ jobs:
           if [[ "$all" == "true" ]] || [[ "${{ steps.filter.outputs.cs-sp500opt }}" == "true" ]]; then
             add_cs "sp500_options"
           fi
-          # us_equities_panel is DEFERRED and does not enroll, even on a push to
-          # main. It is the most expensive case study in the corpus - the runtime
-          # reference puts one tabular_dl configuration at 4.1 hours - and its
-          # rebuild is scheduled after the other eight complete. Until then its
-          # notebooks fail CI for reasons nobody is working on, which trains
-          # readers of this workflow to expect a red job and to stop reading it.
-          #
-          # A deferred case study must not also be a permanently red one. Enroll
-          # it again by deleting CS_DEFERRED below; nothing else needs changing,
-          # and the notice in the log names the condition so the skip cannot be
-          # forgotten silently.
-          CS_DEFERRED="us_equities_panel"
           if [[ "$all" == "true" ]] || [[ "${{ steps.filter.outputs.cs-usequity }}" == "true" ]]; then
-            if [[ " $CS_DEFERRED " == *" us_equities_panel "* ]]; then
-              echo "::notice title=us_equities_panel deferred::case-study job skipped by design while its rebuild is descheduled; re-enroll by clearing CS_DEFERRED in .github/workflows/test.yml"
-            else
-              add_cs "us_equities_panel"
-            fi
+            add_cs "us_equities_panel"
           fi
 
           echo "case_matrix=$cases" >> "$GITHUB_OUTPUT"
@@ -1012,21 +1003,30 @@ jobs:
           # CI job, which is a real gap and is stated in that file's docstring.
           # The other three tests in the same file assert relations that hold on any
           # extract - they collect as six cases - and are what this job gates.
-          # The two deselects below are not quarantine entries: the quarantine file
-          # describes what test-unit does not run, and both of these are inside a
-          # file this job DOES run. They need the stage 01-05 artifacts of
-          # us_equities_panel and nasdaq100_microstructure, the two case studies
-          # whose rebuild has not produced them, so they fail on any checkout -
-          # here and on a workstation alike. Take them out when those two rebuild.
           #
-          # The artifact dependency was true and was not the whole reason. Until
-          # 2026-09-06 the microstructure test also asserted `label_buffer ==
-          # "15min"` against a config that has declared 16min since #737, and that
-          # assertion reads the repo config and no data, so it failed two lines
-          # before the artifacts were ever touched. The rebuild alone would not have
-          # made the test pass, and whoever lifted this deselect afterwards would
-          # have read the red as the rebuild being wrong. The literal is corrected,
-          # so this deselect now blocks only on the artifacts, which is what it says.
+          # Two tests in test_artifact_specs.py were deselected here until 2026-09-10
+          # on the stated grounds that they needed stage 01-05 artifacts of
+          # us_equities_panel and nasdaq100_microstructure "whose rebuild has not
+          # produced them", and would come back when those two case studies rebuilt.
+          # That reason was wrong in a way worth recording, because it pointed at a
+          # workstation run that this job never reads and would never have fixed it.
+          #
+          # ml4t/third-edition-test-data carries the features and labels both tests
+          # need, under intermediates/<case study>/. What neither test did was ask
+          # for them. conftest's seeded_output_dir fixture is what copies the
+          # fixture's intermediates into the directory get_case_study_dir resolves
+          # to; it is not autouse, and both tests took no fixtures at all, so the
+          # loader looked in the checked-out source tree, found no features/ or
+          # labels/ there, and raised. A rebuild on the workstation puts artifacts
+          # in ~/ml4t/artifacts, which is not on any path this container can see.
+          #
+          # Both tests now request seeded_output_dir and both pass, so the deselects
+          # are gone and this job gates 97 tests rather than 95. The fixture is
+          # session-scoped and exports ML4T_OUTPUT_DIR for the rest of the run, so
+          # the order it lands in relative to test_eoa_universe_roster.py decides
+          # whether that file reads a redirect or the source tree. Both orders were
+          # measured before this change landed and both are green: the roster tests
+          # read a SEEDED redirect, which is the case the unset above never covered.
           .venv/bin/python -m pytest \
             tests/test_eoa_universe_roster.py \
             tests/test_fixture_registry_identity.py \
@@ -1037,8 +1037,6 @@ jobs:
             tests/test_etf_baseline_parity.py \
             tests/test_sp500_options_research.py::test_official_population_is_snapshotted_before_option_execution \
             tests/test_us_firm_research_workflow.py::test_open_study_writes_canonical_results_to_output_dir \
-            --deselect tests/test_artifact_specs.py::test_us_equities_pilot_helpers_preserve_current_outputs \
-            --deselect tests/test_artifact_specs.py::test_microstructure_pilot_helpers_preserve_current_outputs \
             -m "not production_extract" \
             -v --tb=short -rs --junitxml=unit-data.xml
       # A skip here is a failure: these tests run in this job and nowhere else,
@@ -1719,14 +1717,26 @@ jobs:
             -e NEO4J_URI -e NEO4J_USER -e NEO4J_PASSWORD \
             "${{ steps.image.outputs.ref }}" \
             bash -c '
-              # Dependency order: upstream notebooks generate data for downstream ones.
+              # One invocation per dependency level, because a group runs in pytest
+              # collection order: "03 or 05" collects 03 first, and 03 reads the graph
+              # 05 writes. Each producer gets its own invocation ahead of its consumer.
+              #   05 writes Institution/Stock/HOLDS  -> 03 queries them
+              #   02 writes the supply graph          -> 09 reads it and its snapshot
+              #   08 writes the event graph           -> 07 reads it
+              # 08 needs a CUDA device and skips on a GPU-less runner, which is why 07
+              # carries a skip in tests/overrides.yaml rather than failing here.
               python -m pytest tests/test_docker_notebooks.py -v --tb=short \
-                -k "08_8k_event_extraction" && \
+                -k "05_institutional_holdings_kg" && \
+              python -m pytest tests/test_docker_notebooks.py -v --tb=short \
+                -k "03_graph_rag_qa" && \
               python -m pytest tests/test_docker_notebooks.py -v --tb=short \
                 -k "02_supply_chain_kg_construction" && \
               python -m pytest tests/test_docker_notebooks.py -v --tb=short \
-                -k "07_dynamic_kg_temporal or 03_graph_rag_qa or 05_institutional_holdings_kg \
-                    or 09_knowledge_graph_features"
+                -k "09_knowledge_graph_features" && \
+              python -m pytest tests/test_docker_notebooks.py -v --tb=short \
+                -k "08_8k_event_extraction" && \
+              python -m pytest tests/test_docker_notebooks.py -v --tb=short \
+                -k "07_dynamic_kg_temporal"
             '
 
   # ---------------------------------------------------------------------------

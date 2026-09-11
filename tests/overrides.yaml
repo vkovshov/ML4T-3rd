@@ -162,7 +162,6 @@
   gpu: true
   timeout: 600
 05_synthetic_data/02_tailgan_tail_risk:
-  gpu: true
   parameters:
     BATCH_SIZE: 64
     LATENT_DIM: 32
@@ -182,7 +181,6 @@
   requires_import: signatory
   timeout: 900
 05_synthetic_data/04_gtgan_irregular:
-  gpu: true
   parameters:
     BATCH_SIZE: 4
     HIDDEN_DIM: 4
@@ -194,7 +192,6 @@
     SEQ_LENGTH: 4
   timeout: 120
 05_synthetic_data/05_diffusion_ts:
-  gpu: true
   parameters:
     BATCH_SIZE: 8
     CLASSIFIER_EPOCHS: 1
@@ -211,7 +208,6 @@
     WARMUP_STEPS: 1
   timeout: 180
 05_synthetic_data/06_llm_tabular_great:
-  gpu: true
   parameters:
     BATCH_SIZE: 8
     EPOCHS: 1
@@ -361,29 +357,94 @@
   requires_import: gensim
   timeout: 300
 10_text_feature_engineering/04_bert_finetuning:
-  env:
-    TEST: '1'
-  gpu: true
-  timeout: 600
+  # Runs on CPU. The `gpu: true` this entry used to carry was a cost decision, not a hardware
+  # one - there is no CUDA requirement in the source - and the cost it named was not measured.
+  # The 637s and 645s the earlier version of this comment quoted are FAIL rows: the per-cell
+  # timeout plus harness overhead, not a runtime. The fine-tuning cell had never completed on
+  # CPU, so there was no number to compare against the limit.
+  #
+  # What costs here is scoring, not training. `tests/pm_helpers.py`'s KERNEL_THREAD_CAP pins the
+  # kernel to one thread, and a full pass over the 727-sentence validation or test split costs
+  # 183s there. MAX_TRAIN_STEPS bounds training only: at 20 steps, `eval_steps` resolves to 10,
+  # so each model still pays two in-training evaluations plus two passes over the test split -
+  # about twelve minutes of inference behind twenty training steps. Lowering MAX_TRAIN_STEPS
+  # further makes evaluation a larger share, not a smaller one.
+  #
+  # MAX_EVAL_SAMPLES bounds the scored splits, which is the knob that reaches that cost. All
+  # three checkpoints run: FinBERT is the contaminated one and the notebook is a three-way
+  # comparison, so bounding the model count instead would leave figures and alt text describing
+  # panels that were not produced.
+  #
+  # Measured at 20 steps and 100 sentences, all three checkpoints, through this harness with
+  # `-k 04_bert_finetuning`: 863s and 6.2 GB, PASS, under load average 9. That figure is from
+  # the CPU path the removal of `gpu: true` creates - `CUDA_VISIBLE_DEVICES=""` and
+  # `ML4T_DATA_PATH` on the CI fixture - and not from the card. The GPU renders in
+  # `notebook-runtimes.tsv` are 54-126s and size nothing here.
+  #
+  # `timeout` is papermill's per-cell limit, not a notebook budget, so 1800 is being compared
+  # against the fine-tuning cell rather than against the 863s. That cell carries most of the
+  # run, so the margin is closer to 2x than to the ratio against the whole notebook. It is set
+  # above the measurement because a GitHub-hosted runner is slower per thread than the machine
+  # that measured it. The ch10 job's budget is 60 minutes and it currently finishes in 4-7, so
+  # the headroom is in the job.
+  #
+  # ml4t/agent-workspace#1097.
+  parameters:
+    MAX_TRAIN_STEPS: 20
+    MAX_EVAL_SAMPLES: 100
+  timeout: 1800
 10_text_feature_engineering/05_financial_ner_finetuning:
-  env:
-    TEST: '1'
-  gpu: true
+  parameters:
+    N_EPOCHS: 1
+    N_SAMPLES: 100
   timeout: 600
 10_text_feature_engineering/06_finbert_cross_dataset:
-  gpu: true
+  # FinBERT inference over the whole split - the SAMPLE_SIZE default of 10,000 exceeds its 8,142
+  # rows, so it never binds - overruns the 300s per-cell limit on CPU: measured 334s idle, 353s
+  # under load 9.5. The notebook picks its device with a plain `0 if torch.cuda.is_available()
+  # else -1` fallback and has no CUDA guard, so what it needed was a reduction, not a card. At
+  # 1,500 it passes in 160s and the majority-class rate it benchmarks against moves
+  # 43.1% -> 42.9%. ml4t/agent-workspace#1097.
+  parameters:
+    SAMPLE_SIZE: 1500
   timeout: 300
 10_text_feature_engineering/07_news_return_signals:
-  gpu: true
+  # Runs on CPU: the embedding pass is the cost, not the card. ml4t/agent-workspace#1116 was a
+  # fixture with no builder - hand-placed synthetic headlines for tickers and years the price
+  # panel does not carry, so every feature row dropped at the join and the notebook wrote an
+  # empty panel that 08 then failed on. `tests/create_test_data.py`'s `fnspid_news` dataset now
+  # generates it from production, and `test_the_news_fixture_lands_inside_the_price_panel` is
+  # what keeps the two in the same window.
+  #
+  # MAX_ARTICLES is the cost knob, and it is set from a measurement rather than a guess:
+  # `tests/pm_helpers.py`'s KERNEL_THREAD_CAP pins the kernel to one thread, and the notebook
+  # makes two transformer passes over every headline, so the uncapped 5,599-headline fixture
+  # takes ~15 minutes. The floor is not the article count. `MAX_ARTICLES` caps per ticker, and
+  # the cross-sectional IC loop needs days carrying at least ten tickers: at 1200 there are none
+  # even with 254 merged observations, at 3000 there are 20. 3000 keeps 2,304 articles and 955
+  # merged observations, well clear of the `len(factor_with_returns) > 100` branch and of the
+  # `lookback_days + 1` news dates each ticker needs for a surprise row. Measured at 3000:
+  # 420s and 1.7 GB, taken under load, so idle is faster. That is cheaper than the two
+  # chapter-10 notebooks that still overrun 600s, 04_bert_finetuning and 09_filing_text_signals.
+  #
+  # MAX_TICKERS is left at its default: the fixture carries 28 and the notebook's 50 does not
+  # bind, and lowering it is what would take the IC loop's days below ten tickers.
   parameters:
-    MAX_ARTICLES: 500
-    MAX_TICKERS: 5
+    MAX_ARTICLES: 3000
   timeout: 600
 10_text_feature_engineering/08_text_feature_evaluation:
   parameters:
     MIN_ASSETS_PER_DAY: 3
   timeout: 300
 10_text_feature_engineering/09_filing_text_signals:
+  # No CUDA requirement in the source - the flag is a cost decision. FinBERT chunks each ~6,500
+  # word MD&A section into ~16 windows of 512 tokens and costs over 15s per filing on CPU, so its
+  # FinBERT scoring cell overran the 600s per-cell limit at both sizes measured: 639s idle with
+  # MAX_SYMBOLS 5 (75 filings), and again with MAX_FILINGS 40. Reducing further is blocked,
+  # not merely slow: the IC loop skips any signal-horizon pair with `valid.height < 20`, at 12
+  # filings that is every pair, and the figure cell's `len(ic_summary)` then raises NameError
+  # because the `if ic_results:` else branch never binds it. ml4t/agent-workspace#1115; a usable
+  # reduction here needs it fixed first. ml4t/agent-workspace#1097.
   gpu: true
   parameters:
     MAX_SYMBOLS: 5
@@ -401,7 +462,17 @@
 11_ml_pipeline/03_logistic_classification:
   parameters:
     MAX_SYMBOLS: 10
-  timeout: 300
+  # Not the 300s default. The L1 cell sweeps five C values through eight
+  # walk-forward folds on liblinear, and the cost sits at the weakly regularized
+  # end: single-threaded at MAX_SYMBOLS=10 (46,551 rows, 57 features, 8 folds)
+  # the five values cost 0.34s, 1.29s, 11.39s, 114.07s and 80.54s - 207.63s in
+  # total. That fits 300s on this workstation and does not fit it on a hosted
+  # runner, which is why ch11-12 alternated pass and fail rather than staying
+  # red. Nothing here fails to converge: n_iter peaks at 81 against
+  # MODEL_MAX_ITER = 1000. Cutting the universe instead was measured and not
+  # taken - MAX_SYMBOLS 6 costs 115.2s and 4 costs 44.4s, both keeping 8 folds -
+  # because 01, 02, 05, 06 and 08 all read these same features and labels at 10.
+  timeout: 900
 11_ml_pipeline/04_nested_cv_hpo:
   parameters:
     ALPHA_GRID_POINTS: 10
@@ -443,7 +514,6 @@
     MAX_SYMBOLS: 3
   timeout: 900
 12_gradient_boosting/03_dl_vs_gbm:
-  gpu: true
   parameters:
     MAX_FOLDS: 2
     MAX_SYMBOLS: 15
@@ -455,7 +525,9 @@
     N_TRIALS: 5
   timeout: 360
 12_gradient_boosting/05_cross_library_hpo:
-  gpu: true
+  # No GPU required: the notebook reads torch.cuda.is_available() and falls back to
+  # XGB_DEVICE=cpu / CB_TASK_TYPE=CPU. Measured at these parameters with the card
+  # hidden: 81s wall clock, 2.3 GB peak (2026-09-10).
   parameters:
     N_LIBRARIES: 1
     N_TRIALS: 2
@@ -491,10 +563,23 @@
     MAX_SYMBOLS: 10
   timeout: 300
 12_gradient_boosting/09_xai_limitations:
+  # MAX_SYMBOLS is stated because this notebook declares the parameter for the reduced run and
+  # nothing set it, so CI fitted three LightGBMs and a 200-tree RandomForest on the full etfs
+  # panel and then ran TreeSHAP over the whole validation fold for each. It is the same
+  # reduction 11_ml_pipeline/05_shap_analysis takes for the same work.
+  #
+  # The cell is parallel (RandomForest at n_jobs=-1, and LightGBM inside it), which is why this
+  # entry read as green until it did not: unreduced it takes 123s of wall clock and 17m12s of
+  # CPU on 24 cores here, so a runner with a quarter of the cores spends most of the 300s
+  # budget and crosses it whenever it is contended. It passed on run 34318568178 and timed out
+  # on 34342897088 with nothing between them touching this notebook.
+  parameters:
+    MAX_SYMBOLS: 10
   timeout: 300
 12_gradient_boosting/10_shap_nlp_sentiment:
   docker_env: py312
-  gpu: true
+  # No GPU required: line 65 reads torch.cuda.is_available() and falls back to CPU.
+  # Measured in the py312 CPU image: 73s wall clock, 1.9 GB peak (2026-09-10).
   timeout: 300
 12_gradient_boosting/11_conformal_gbm:
   # No `gpu:`. This one is stronger than stale: line 229 passes `"device_type": "cpu"`, and
@@ -504,7 +589,6 @@
 12_gradient_boosting/12_case_study_insights:
   timeout: 300
 13_dl_time_series/01_core_architectures:
-  gpu: true
   parameters:
     BATCH_SIZE: 64
     EPOCHS: 2
@@ -512,7 +596,6 @@
     LOOKBACK: 10
   timeout: 300
 13_dl_time_series/02_nbeats_interpretable:
-  gpu: true
   parameters:
     BATCH_SIZE: 64
     EPOCHS: 2
@@ -522,7 +605,6 @@
     N_LAYERS: 2
   timeout: 300
 13_dl_time_series/03_great_debate:
-  gpu: true
   parameters:
     BATCH_SIZE: 64
     D_MODEL: 16
@@ -532,7 +614,6 @@
     N_LAYERS: 1
   timeout: 300
 13_dl_time_series/04_transformers:
-  gpu: true
   parameters:
     BATCH_SIZE: 64
     D_MODEL: 16
@@ -543,7 +624,6 @@
     PATCH_SIZE: 6
   timeout: 300
 13_dl_time_series/05_tcn:
-  gpu: true
   parameters:
     BATCH_SIZE: 64
     EPOCHS: 2
@@ -551,7 +631,6 @@
     N_CHANNELS: 16
   timeout: 300
 13_dl_time_series/06_tsmixer:
-  gpu: true
   parameters:
     BATCH_SIZE: 64
     D_MODEL: 16
@@ -560,7 +639,6 @@
     N_LAYERS: 1
   timeout: 300
 13_dl_time_series/07_mamba_ssm:
-  gpu: true
   parameters:
     BATCH_SIZE: 64
     D_MODEL: 16
@@ -573,7 +651,6 @@
     N_LAYERS: 1
   timeout: 300
 13_dl_time_series/08_cnn_image_encoding:
-  gpu: true
   parameters:
     BATCH_SIZE: 64
     EPOCHS: 2
@@ -584,7 +661,6 @@
     MAX_VAL_SAMPLES: 2000
   timeout: 300
 13_dl_time_series/09_foundation_models:
-  gpu: true
   parameters:
     BATCH_SIZE: 64
     CHRONOS_NUM_SAMPLES: 3
@@ -596,7 +672,6 @@
     PREDICTION_LENGTH: 5
   timeout: 300
 13_dl_time_series/10_uncertainty:
-  gpu: true
   parameters:
     BATCH_SIZE: 64
     EPOCHS: 2
@@ -607,7 +682,6 @@
     N_ENSEMBLE: 2
   timeout: 300
 13_dl_time_series/11_library_landscape:
-  gpu: true
   parameters:
     BATCH_SIZE: 64
     EPOCHS: 2
@@ -650,7 +724,6 @@
     TOP_N_STOCKS: 50
   timeout: 900
 14_latent_factors/07_stochastic_discount_factor:
-  gpu: true
   parameters:
     ADVERSARIAL_ROUNDS: 1
     BETA_EPOCHS: 8
@@ -663,7 +736,6 @@
     UNCONDITIONAL_EPOCHS: 8
   timeout: 360
 14_latent_factors/08_supervised_autoencoder:
-  gpu: true
   parameters:
     N_EPOCHS: 5
     N_SPLITS: 2
@@ -732,7 +804,7 @@
   timeout: 900
 15_causal_estimation/10_case_study_insights:
   skip: true
-  skip_reason: "Empty causal_runs table \u2192 pl.concat([]) blows up; needs production causal-DML registry data"
+  skip_reason: "Reads nine case-study registries; CI has none of them, and the loader raises on a missing registry file"
   timeout: 300
 15_causal_estimation/11_factor_zoo_validation:
   timeout: 360
@@ -807,18 +879,15 @@
 17_portfolio_construction/09_allocator_comparison:
   timeout: 600
 17_portfolio_construction/11_dl_portfolio_allocation:
-  gpu: true
   parameters:
     N_EPOCHS: 2
   timeout: 600
 17_portfolio_construction/12_vlstm_portfolio:
-  gpu: true
   parameters:
     MAX_SYMBOLS: 10
     N_EPOCHS: 2
   timeout: 600
 17_portfolio_construction/13_deepm_regime_robust:
-  gpu: true
   parameters:
     MAX_ITERS: 40
     MAX_SYMBOLS: 10
@@ -867,22 +936,26 @@
 19_risk_management/04_factor_exposure:
   timeout: 300
 19_risk_management/05_trade_shap_diagnostics:
-  # `GPU_DEVICE = "cuda"` at line 80, passed as `device_type` at 222 and asserted at 231.
-  # That needs a LightGBM built with -DUSE_CUDA=1, which the PyPI wheel this repo's lockfile
-  # resolves is not; torch seeing a card says nothing about it. ml4t/agent-workspace#862.
-  gpu: lightgbm_cuda
+  # Moved to CPU 2026-09-11. It asked for `device_type="cuda"`, which needs a LightGBM built
+  # with -DUSE_CUDA=1; the PyPI wheel this lockfile resolves is not one, so the notebook ran
+  # nowhere - not in CI, not on the workstation, and its last render came from a container
+  # whose kaleido had no Chrome, so its figures carried no text. `LGB_DEVICE` now defaults to
+  # "cpu" and the fit asserts the booster honoured it. ml4t/agent-workspace#862.
+  # Measured 12s end to end on the workstation, so 300 is ample.
   timeout: 300
 19_risk_management/06_stress_testing:
   timeout: 300
 19_risk_management/07_drift_detection:
-  # Both, and separately: `device_type="cuda"` at line 306 needs the CUDA LightGBM build,
-  # and lines 223-226 read `torch.cuda.get_device_name` directly. It runs only where both
-  # are present.
-  gpu: [torch, lightgbm_cuda]
+  # Moved to CPU 2026-09-11, same reason as 05. It also carried a fail-closed
+  # `torch.cuda.is_available()` gate that had nothing to do with what the notebook computes -
+  # no tensor is ever built here - so torch is gone from it entirely. `LGB_DEVICE` defaults to
+  # "cpu" and every fold plus the final fit is checked against it. Measured 26s end to end on
+  # the workstation across two runs, so 300 is ample.
   timeout: 300
 19_risk_management/08_ml_exit_signals:
-  # `LGB_DEVICE = "cuda"` at line 64, passed as `device_type` at 303 and read back at 449.
-  gpu: lightgbm_cuda
+  # `LGB_DEVICE` defaults to "cpu" and the run asserts the booster honoured whatever was
+  # requested, so no card is needed. Thirteen LightGBM fits at max_bin=255 on one thread
+  # measured 16s end to end on the workstation, so the original 300 is ample.
   timeout: 300
 19_risk_management/09_deep_hedging:
   # torch alone: it refuses at line 105 unless CUDA is available and calls
@@ -921,6 +994,12 @@
     # Isolated test registry has no nasdaq out-of-band cost-feasible carrier,
     # so its spine can't resolve; report cost/risk N/A instead of raising.
     ALLOW_MISSING_SPINE: true
+    # The notebook refuses a full-mode run unless all nine registries are present and
+    # hold backtests, so a partial aggregation cannot overwrite the nine-case-study
+    # artifacts as if it were complete (ml4t/agent-workspace#964). The seeded test
+    # registry is not the production store and is not expected to satisfy that, so the
+    # precondition is relaxed here and nowhere else.
+    REQUIRE_ALL_REGISTRIES: false
   timeout: 600
 20_strategy_synthesis/02_feature_evaluation:
   timeout: 300
@@ -952,7 +1031,6 @@
     TOTAL_TIMESTEPS: 1000
   timeout: 600
 21_rl_execution_hedging/03_market_making_ppo:
-  gpu: true
   parameters:
     EVAL_EPISODES: 2
     TOTAL_TIMESTEPS: 1000
@@ -978,48 +1056,70 @@
     COHORT_SAMPLE: 10
   timeout: 300
 22_rag_financial_research/01_sec_filing_pipeline:
-  # SYMBOLS, not TICKERS: the notebook's parameters cell declares SYMBOLS, so the
-  # old key was dropped by Papermill and the weekly job fetched all five default
-  # symbols across both default years from EDGAR instead of one.
-  parameters:
-    SYMBOLS:
-    - AAPL
-    YEARS:
-    - 2024
-  requires_env: EDGAR_IDENTITY
+  # The notebook no longer contacts EDGAR: it reads the shipped 10-K corpus
+  # through data.load_sec_filings and describes it. SYMBOLS and YEARS narrowed
+  # the download it used to perform and have no counterpart in the parameters
+  # cell, and EDGAR_IDENTITY gated a fetch that is gone. Both are removed.
+  # It stays on the weekly tier only because that is where it has always run;
+  # nothing external is left to wait for, and it reads the same corpus the
+  # per-commit fixture already ships.
   tier: weekly
   timeout: 300
 22_rag_financial_research/02_domain_embeddings_comparison:
+  # Was skipped as "Requires RAG infrastructure (chromadb + embedding models) not
+  # provisioned in CI". It imports no chromadb, and chromadb is a core dependency
+  # (pyproject.toml `dependencies`), not an extra, so it is provisioned everywhere.
+  # What actually stopped it is `REQUIRE_GPU`, a declared parameter defaulting to
+  # True that nothing here set: the guard raises before any model loads. With
+  # REQUIRE_GPU false it passes on the CPU path with CUDA_VISIBLE_DEVICES="".
+  # Stays weekly for the one external thing that is real: it pulls
+  # BAAI/bge-large-en-v1.5 (~1.3 GB) and all-MiniLM-L6-v2 from HuggingFace at run
+  # time. The local pass was against a warm HF cache, so it is not a CI cost.
+  # ml4t/agent-workspace#1118.
   parameters:
     MAX_DOCUMENTS: 50
     MAX_QUERIES: 10
     USE_LOCAL_MODELS_ONLY: true
-  skip: true
-  skip_reason: Requires RAG infrastructure (chromadb + embedding models) not provisioned in CI
+    REQUIRE_GPU: false
   tier: weekly
   timeout: 300
 22_rag_financial_research/03_hybrid_retrieval:
+  # Same false reason as 02, same cause: `REQUIRE_GPU` defaulted True and nothing
+  # set it. Passes on CPU in 63s (warm HF cache, so not a CI cost). Stays weekly
+  # because it downloads all-MiniLM-L6-v2 and cross-encoder/ms-marco-MiniLM-L-6-v2.
+  # ml4t/agent-workspace#1118.
   parameters:
     MAX_DOCUMENTS: 50
     MAX_QUERIES: 10
     TOP_K: 5
-  skip: true
-  skip_reason: Requires RAG infrastructure (chromadb + embedding models) not provisioned in CI
+    REQUIRE_GPU: false
   tier: weekly
   timeout: 300
 22_rag_financial_research/04_ragas_evaluation:
+  # Was skipped as "Requires OpenAI API access for ragas evaluator LLM". It has no
+  # LLM client and no ragas import: the metrics are token overlap computed locally,
+  # which is the weakness 08_rag_security's prose says this notebook measures. It
+  # also carried tier: weekly, a second gate that would have kept it out of the
+  # per-commit run even with the skip gone. Both removed; 04 and 08 together pass in
+  # 38s against the CI fixture. ml4t/agent-workspace#1118.
   parameters:
     MAX_SAMPLES: 10
-  skip: true
-  skip_reason: Requires OpenAI API access for ragas evaluator LLM
-  tier: weekly
   timeout: 300
 22_rag_financial_research/05_10k_rag_assistant:
-  skip: true
-  skip_reason: Requires RAG infrastructure (chromadb + embedding models) not provisioned in CI
+  # Same false reason as 02. This one does import chromadb - and chromadb is a core
+  # dependency, so "not provisioned in CI" was wrong about the one package it names.
+  # `REQUIRE_GPU` defaulted True and nothing set it. RUN_LIVE_LLM defaults False, so
+  # no OpenAI call is reached. Passes on CPU in 81s (warm HF cache). Stays weekly for
+  # the HuggingFaceEmbedding download. ml4t/agent-workspace#1118.
+  parameters:
+    REQUIRE_GPU: false
   tier: weekly
   timeout: 300
 22_rag_financial_research/06_esg_rag_vs_finetune:
+  # `REQUIRE_GPU = True` is a module constant, not a papermill parameter, and the guard on
+  # `torch.cuda.is_available()` raises. The later `parameter_device.type != "cuda"` check raises
+  # again if the loaded FinBERT weights are not on the card. There is no CPU path. Measured: fails
+  # in 28s with the card hidden. ml4t/agent-workspace#1097.
   gpu: true
   parameters:
     MAX_HEADLINES: 50
@@ -1031,11 +1131,16 @@
     NUM_QUARTERS: 2
   timeout: 300
 22_rag_financial_research/08_rag_security:
+  # Was skipped as "Requires RAG infrastructure (chromadb + embedding models) not
+  # provisioned in CI". It imports neither, and carried tier: weekly as well. Both
+  # removed. ml4t/agent-workspace#1118.
+  # MAX_ATTACK_CASES is a cap that must not bind: the notebook raises on any
+  # value between one and the fixture count, because dropping a fixture drops
+  # an attack class and the two policies would then be compared on different
+  # threat sets. It was pinned at 5, which stopped binding the moment act_01
+  # made six. 0 means all of them and cannot go stale as fixtures are added.
   parameters:
-    MAX_ATTACK_CASES: 5
-  skip: true
-  skip_reason: Requires RAG infrastructure (chromadb + embedding models) not provisioned in CI
-  tier: weekly
+    MAX_ATTACK_CASES: 0
   timeout: 300
 23_knowledge_graphs/08_8k_event_extraction:
   docker_env: ml4t+neo4j+gpu
@@ -1046,38 +1151,66 @@
 23_knowledge_graphs/07_dynamic_kg_temporal:
   docker_env: ml4t+neo4j
   skip: true
-  skip_reason: Requires 08_8k_event_extraction with GPU to generate temporal edges
+  # It reads the 8k_events GraphSnapshot and the timestamped edges 08 writes, and
+  # raises when they are absent. 08 asserts torch.cuda.is_available() before loading
+  # Qwen, so on a GPU-less runner 08 skips and this notebook has nothing to read.
+  # The test-neo4j job still runs 08 ahead of it, so on a machine with a card the
+  # order is right and only the skip has to come off.
+  skip_reason: Requires 08_8k_event_extraction, which needs a CUDA device
   tier: on_demand
   timeout: 600
 23_knowledge_graphs/06_gnn_feature_engineering:
+  # It raises unless `torch.cuda.is_available()`, then pins `DEVICE = torch.device("cuda")` for
+  # every tensor the fold loop builds. There is no CPU path. Measured: fails in 28s with the card
+  # hidden. ml4t/agent-workspace#1097.
   gpu: true
   timeout: 600
 23_knowledge_graphs/03_graph_rag_qa:
+  docker_env: ml4t+neo4j
   timeout: 300
 23_knowledge_graphs/05_institutional_holdings_kg:
   docker_env: ml4t+neo4j
   timeout: 600
 23_knowledge_graphs/09_knowledge_graph_features:
+  # It reads the supply graph and the SupplyGraphSnapshot that 02 writes, and raises
+  # when either is absent, so 02 has to run against the same Neo4j first. The
+  # test-neo4j job gives 02 its own pytest invocation ahead of this one. 02 no longer
+  # needs a GPU either, which is what the previous skip here was waiting on.
   docker_env: ml4t+neo4j
-  skip: true
-  skip_reason: Requires 02_supply_chain_kg_construction with GPU to populate Neo4j
-  tier: on_demand
   timeout: 600
 23_knowledge_graphs/10_network_portfolio_construction:
-  docker_env: ml4t+neo4j
+  # The test panel carries 56 tickers, so the production universe of 100 names and
+  # the 1,000-symbol market-date threshold both leave it with nothing: measured, the
+  # date filter returned 0 dates and the notebook raised. These four numbers size the
+  # same construction down to the fixture. Measured on a local replica of the fixture
+  # (production us_equities filtered to tests/create_test_data.py's ticker list):
+  # 813 dates clear a 40-symbol threshold, and the notebook runs clean in 7s.
+  parameters:
+    ESTIMATION_DAYS: 120
+    EVALUATION_DAYS: 60
+    MIN_SYMBOLS_PER_DATE: 40
+    N_ASSETS: 25
   timeout: 300
 23_knowledge_graphs/04_rag_comparison_benchmark:
+  # Section 4 asserts `torch.cuda.is_available()`, then constructs the SentenceTransformer
+  # with `device="cuda"` and asserts the encoder landed there. There is no CPU path.
+  # Measured: with the card hidden, `torch.cuda.is_available()` is False, so the assert
+  # fires before any embedding is computed.
+  gpu: true
   timeout: 300
 23_knowledge_graphs/01_sp100_sec_download:
-  skip: true
-  skip_reason: Writes to data volume (read-only in Docker)
+  # It was skipped as "Writes to data volume (read-only in Docker)". It writes
+  # nothing: it loads the staged filings through load_sec_filings and profiles them.
+  # Measured: runs clean in the ml4t image in 25s. The download it documents is a
+  # separate script, which is what the stale reason described.
+  timeout: 300
 23_knowledge_graphs/02_supply_chain_kg_construction:
-  docker_env: ml4t+neo4j+gpu
-  gpu: true
-  long_running: true
-  parameters:
-    MAX_COMPANIES: 3
-  timeout: 1200
+  # The default path loads the committed extraction cache and touches no GPU:
+  # RERUN_EXTRACTION is False, so Qwen is never loaded. Only cache regeneration
+  # needs CUDA. MAX_COMPANIES subsamples the corpus that feeds the extractor, so
+  # on this path it changes nothing that runs.
+  docker_env: ml4t+neo4j
+  timeout: 300
 24_autonomous_agents/01_react_reasoning:
   parameters:
     LLM_PROVIDER: mock
@@ -1140,8 +1273,14 @@
 25_live_trading/02_etfs_deployment_loop:
   parameters:
     REFRESH_DATA: false
-  skip: true
-  skip_reason: Requires running IB Gateway (not available in CI)
+  # Was skipped for "Requires running IB Gateway", which described a different
+  # notebook: this one stages a basket for Alpaca paper equities, and with
+  # SUBMIT_PAPER_ORDERS false by default it opens no broker session at all. Its
+  # real inputs are the ETFs case study's fwd_ret_21d labels and its registry,
+  # both of which the intermediates tree carries - the fixture registry's
+  # validation-IC leader for that label is ridge_a1000000.0, the configuration
+  # the notebook pins, so EXPECTED_RIDGE_CONFIG needs no override here. Measured
+  # against the fixture: 21s, 2.3 GB peak.
   tier: weekly
   timeout: 360
 25_live_trading/03_ib_paper_trading_demo:
@@ -1202,12 +1341,33 @@
 26_mlops_governance/01_drift_monitoring:
   timeout: 300
 26_mlops_governance/02_online_drift_detection:
+  # RIDGE_CONFIG is overridden because the fixture registry carries a different slice
+  # of the linear grid than production does. Both notebooks in this chapter pin a
+  # configuration NAME rather than a prediction hash, so they survive a refit - but the
+  # fixture is sampled from production by tests/sample_registry_for_tests.py and has not
+  # been regenerated since PINNED_PREDICTION_CONFIGS changed, so the names it holds are
+  # ols, ridge_a0.001, ridge_a100000.0 and ridge_a10000000.0.
+  #
+  # Only three of those four are usable, and the registry does not say which: ridge_a0.001
+  # has a training run and a prediction set but no run_log/predictions/<hash>/predictions
+  # parquet, because the sampler carried the rows and not the artifact. Both notebooks in
+  # this chapter check the file and raise when it is absent, so a substitute has to be
+  # picked against the tree rather than against the registry alone.
+  #
+  # ridge_a10000000.0 is the right substitute rather than an arbitrary one: this notebook
+  # needs a stream that genuinely differs from the incumbent's, and the assertion in
+  # section 1 fails the run if it does not. Measured on production over the monitored
+  # year, its bad-day rate differs from ols on 250 of 251 sessions at correlation 0.683,
+  # against 240 and 0.889 for the shipped default. Raise this alongside the fixture.
+  parameters:
+    RIDGE_CONFIG: ridge_a10000000.0
   timeout: 300
 26_mlops_governance/03_safe_model_rollout:
   # Was skipped for a cause that no longer exists: the reason described an A/B and
   # staged-capital slicing the notebook has since dropped, and it now stops after
-  # the 63-session shadow decision. With the prediction artifacts it pins present
-  # in the fixture it runs, so it is a real test again.
+  # the 63-session shadow decision. The prediction sets it needs reach the fixture
+  # through PINNED_PREDICTION_CONFIGS in tests/sample_registry_for_tests.py, so it
+  # is a real test again.
   #
   # TOP_K is reduced because the book is dollar-neutral over the top and bottom
   # TOP_K predictions and the fixture carries well under 200 symbols on any
@@ -1215,8 +1375,32 @@
   # a silent failure any more: build_portfolio_stream raises when a date ranks
   # fewer than 2 * TOP_K distinct symbols. Raise this only alongside the fixture
   # universe.
+  #
+  # CANDIDATE_CONFIG is overridden for the reason given under 02: the fixture holds a
+  # different slice of the linear grid, and ridge_a100.0 is not in it. Production's
+  # default candidate demonstrates the case the gate exists for - an improvement that
+  # is positive and falls short of the required threshold - so what is worth covering
+  # here is the other branch, a candidate that clears all five criteria.
+  #
+  # ridge_a10000000.0 is the one that does. Measured 2026-09-10 against the shipped
+  # fixture at TOP_K: 10, it promotes on all five: Sharpe improvement +3.49 against 0.20,
+  # signal correlation 0.368 and position agreement 0.341 against 0.30 each, drawdown
+  # ratio 0.58 against 1.25, over the full 63 sessions. The two similarity criteria are
+  # what to watch - they clear by 0.068 and 0.041, so they are what a fixture rebuild
+  # would flip first. The previous pin, ridge_a100000.0, fails on Sharpe improvement at
+  # +0.18 against the required 0.20, which is the same criterion and the same direction
+  # production fails on, so CI was covering the rejection path twice and the promotion
+  # path not at all. Of the fixture's remaining linear configs, ols is the incumbent and
+  # ridge_a0.001 has a registry row whose predictions parquet was never sampled, so it
+  # resolves to nothing.
+  #
+  # Nothing asserts the verdict, in this notebook or in the harness, so a fixture rebuild
+  # that moves this model's predictions will silently change which branch CI covers.
+  # Re-measure after a rebuild, and re-pick from whatever linear configs the rebuilt
+  # fixture carries if the margins above have gone.
   parameters:
     TOP_K: 10
+    CANDIDATE_CONFIG: ridge_a10000000.0
   timeout: 300
 26_mlops_governance/04_circuit_breakers:
   timeout: 300
@@ -1441,8 +1625,24 @@ case_studies/cme_futures/11_causal_dml:
 # the reduced run cheap without changing the shape of what the notebook does. The remaining scale
 # comes from the fixture registry itself.
 case_studies/cme_futures/12_model_analysis:
+  # Its inputs are registered by cme_futures::06_linear into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 8 (RuntimeError): preview execution registered no complete validation predictions
+  requires_stage: 06_linear
   timeout: 300
 case_studies/cme_futures/13_backtest:
+  # Its inputs are registered by cme_futures::06_linear into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 9 (RuntimeError): preview execution found no complete validation predictions for ['fwd_ret_21d']
+  requires_stage: 06_linear
   parameters:
     PREVIEW_LABELS: [fwd_ret_21d]
     PREVIEW_MAX_PREDICTIONS: 4
@@ -1483,6 +1683,14 @@ case_studies/cme_futures/18_holdout_backtest:
   skip: true
   skip_reason: "Reads the holdout prediction set 17_holdout_predictions registers and resolves the same carrier to find it, so it refuses at `resolve_solvent_carrier` for the same reason and one step earlier than 17 does. Remove this skip together with 17's."
 case_studies/cme_futures/19_strategy_analysis:
+  # Its inputs are registered by cme_futures::13_backtest into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 9 (NoSelectableCandidates): No validation rank-1 candidate for cme_futures
+  requires_stage: 13_backtest
   parameters:
     PREVIEW_LABELS: [fwd_ret_21d]
   timeout: 600
@@ -1657,6 +1865,14 @@ case_studies/crypto_perps_funding/14_portfolio_management:
     - fwd_ret_8h
   timeout: 300
 case_studies/crypto_perps_funding/15_risk_management:
+  # Its inputs are registered by crypto_perps_funding::13_backtest into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 6 (RuntimeError): no preview baseline or allocation backtest for fwd_ret_8h traded in this workspace
+  requires_stage: 13_backtest
   parameters:
     # MAX_RISK_VARIANTS went the same way as MAX_SYMBOLS: the overlay grid is declared in
     # config/setup.yaml under backtest.risk and read from there, so no parameter trims it.
@@ -1664,6 +1880,14 @@ case_studies/crypto_perps_funding/15_risk_management:
     - fwd_ret_8h
   timeout: 600
 case_studies/crypto_perps_funding/16_costs:
+  # Its inputs are registered by crypto_perps_funding::15_risk_management into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 6 (RuntimeError): no preview baseline, allocation or overlay backtest for fwd_ret_8h traded in this workspace
+  requires_stage: 15_risk_management
   parameters:
     LABELS:
     - fwd_ret_8h
@@ -2249,6 +2473,14 @@ case_studies/fx_pairs/13_backtest:
     TOP_N_PREDICTIONS: 2
   timeout: 900
 case_studies/fx_pairs/14_portfolio_management:
+  # Its inputs are registered by fx_pairs::13_backtest into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 5 (ValueError): official population name 'fx_pairs:preflight:equal-weight-baselines' resolved to 0 current identities among 0 snapshots
+  requires_stage: 13_backtest
   research_preview: false
   parameters:
     POPULATION_NAME: fx_pairs:preflight
@@ -2256,12 +2488,28 @@ case_studies/fx_pairs/14_portfolio_management:
     TOP_N_CONFIGS: 1
   timeout: 900
 case_studies/fx_pairs/15_risk_management:
+  # Its inputs are registered by fx_pairs::13_backtest into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 5 (ValueError): official population name 'fx_pairs:preflight:equal-weight-baselines' resolved to 0 current identities among 0 snapshots
+  requires_stage: 13_backtest
   research_preview: false
   parameters:
     POPULATION_NAME: fx_pairs:preflight
     MAX_RISK_VARIANTS: 3
   timeout: 900
 case_studies/fx_pairs/16_costs:
+  # Its inputs are registered by fx_pairs::13_backtest into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 5 (ValueError): official population name 'fx_pairs:preflight:equal-weight-baselines' resolved to 0 current identities among 0 snapshots
+  requires_stage: 13_backtest
   research_preview: false
   parameters:
     POPULATION_NAME: fx_pairs:preflight
@@ -2549,12 +2797,12 @@ case_studies/sp500_equity_option_analytics/03_financial_features:
   timeout: 120
 case_studies/sp500_equity_option_analytics/04_model_based_features:
   parameters:
-    MAX_SYMBOLS: 5
+    MAX_SYMBOLS: 21
     MIN_OBS: 10
   timeout: 300
 case_studies/sp500_equity_option_analytics/05_evaluation:
   parameters:
-    MAX_SYMBOLS: 5
+    MAX_SYMBOLS: 21
   timeout: 300
 case_studies/sp500_equity_option_analytics/06_linear:
   # 120s is measured here, not copied. Slowest of 5 green `cs-sp500_equity_option_analytics` runs of
@@ -2564,28 +2812,32 @@ case_studies/sp500_equity_option_analytics/06_linear:
   # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
   # grid and the gbm run is the slower of the two in every case study measured. The tier is
   # the one-third line the raised entries elsewhere in this file state.
-  #
-  # The reduction is stated rather than left to the max_symbols: 5 that
-  # `_collect_preview_reductions` applies when an entry declares none, for the reason
-  # 08_tabular_dl gives below: a preview that reduces by default reduces invisibly, and the
-  # next reader of this entry cannot tell a deliberate universe cut from an absent one.
-  # Stating it changes nothing about what runs.
-  #
-  # Only the universe is cut, matching 08_tabular_dl. #560 removed a `MAX_FOLDS: 2` here and
-  # ml4t/agent-workspace#942 reads its absence as this preview running every fold on a budget
-  # priced for two. Measured on run 34271885198, the whole stage takes 26s of its 180s, so the
-  # fold axis is not what this budget is short of and a fold cut is not restored blind.
+  # max_symbols is stated because a notebook that declares no reduction does not run unreduced:
+  # _collect_preview_reductions in tests/pm_helpers.py injects max_symbols: 5 as the fallback. At
+  # five names top_k_grid [5, 10, 20] has no realizable member - this case study is long-only, so
+  # a k survives only while k < the tradeable count - and 14_backtest refuses for every declared
+  # label. 21 is the number #852 gave the four chain stages, and it has to be this number rather
+  # than any width above five: get_top_k_for reads the narrower of the price panel and the ranked
+  # cross-section, so a model stage fitting a narrower universe than the chain caps the sweep at
+  # its own width whatever the chain declares. At 21 all three concentrations are realizable,
+  # which is what setup.yaml declares; at ten only k=5 is. ml4t/agent-workspace#1077.
   parameters:
     PREVIEW_REDUCTIONS:
-      max_symbols: 5
+      max_symbols: 21
   timeout: 120
 case_studies/sp500_equity_option_analytics/07_gbm:
-  # As 06_linear: the universe cut is stated rather than defaulted, and no fold reduction is
-  # invented for a case study whose sibling entries declare none. 26s of 180s on run
-  # 34271885198.
+  # max_symbols is stated because a notebook that declares no reduction does not run unreduced:
+  # _collect_preview_reductions in tests/pm_helpers.py injects max_symbols: 5 as the fallback. At
+  # five names top_k_grid [5, 10, 20] has no realizable member - this case study is long-only, so
+  # a k survives only while k < the tradeable count - and 14_backtest refuses for every declared
+  # label. 21 is the number #852 gave the four chain stages, and it has to be this number rather
+  # than any width above five: get_top_k_for reads the narrower of the price panel and the ranked
+  # cross-section, so a model stage fitting a narrower universe than the chain caps the sweep at
+  # its own width whatever the chain declares. At 21 all three concentrations are realizable,
+  # which is what setup.yaml declares; at ten only k=5 is. ml4t/agent-workspace#1077.
   parameters:
     PREVIEW_REDUCTIONS:
-      max_symbols: 5
+      max_symbols: 21
   timeout: 180
 case_studies/sp500_equity_option_analytics/08_tabular_dl:
   # DEVICE and POPULATION_NAME travel together. The runner refuses to substitute a CPU
@@ -2611,7 +2863,7 @@ case_studies/sp500_equity_option_analytics/08_tabular_dl:
     DEVICE: cpu
     POPULATION_NAME: sp500_equity_option_analytics-tabular_dl-preview
     PREVIEW_REDUCTIONS:
-      max_symbols: 5
+      max_symbols: 21
   timeout: 300
 case_studies/sp500_equity_option_analytics/09_dl_lstm:
   # DEVICE and POPULATION_NAME travel together, as in 08_tabular_dl above: the device is
@@ -2639,7 +2891,7 @@ case_studies/sp500_equity_option_analytics/09_dl_lstm:
     DEVICE: cpu
     POPULATION_NAME: sp500_equity_option_analytics-sequence-preview
     PREVIEW_REDUCTIONS:
-      max_symbols: 5
+      max_symbols: 21
   timeout: 600
 case_studies/sp500_equity_option_analytics/10_dl_patchtst:
   # Same reasoning as 09_dl_lstm, and the same measured outcome on CPU. Its own population
@@ -2648,9 +2900,13 @@ case_studies/sp500_equity_option_analytics/10_dl_patchtst:
     DEVICE: cpu
     POPULATION_NAME: sp500_equity_option_analytics-patchtst-preview
     PREVIEW_REDUCTIONS:
-      max_symbols: 5
+      max_symbols: 21
   timeout: 600
 case_studies/sp500_equity_option_analytics/11_latent_factors:
+  # No reduction, unlike its 11a-11e siblings. This notebook fits nothing and registers nothing:
+  # it reads the sibling `.py` files, extracts each MODEL_NAME, and refuses if that union differs
+  # from the latent_factors menu. A width parameter would be unread here, and declaring one in
+  # this file rather than in the parameters cell is what papermill drops silently.
   timeout: 600
 case_studies/sp500_equity_option_analytics/11a_pca:
   # The harness forces EXECUTION_TIER=preview and WORKSPACE for any notebook declaring both, and
@@ -2659,7 +2915,7 @@ case_studies/sp500_equity_option_analytics/11a_pca:
   # return panel, so the fixture's cross-section bounds nothing the way it does for IPCA below.
   parameters:
     PREVIEW_REDUCTIONS:
-      max_symbols: 5
+      max_symbols: 21
   timeout: 300
 case_studies/sp500_equity_option_analytics/11b_ipca:
   # IPCA estimates a 45-characteristic Gamma from the cross-section. Production
@@ -2706,7 +2962,7 @@ case_studies/sp500_equity_option_analytics/11b_ipca:
   # still does the numerical work described above.
   parameters:
     PREVIEW_REDUCTIONS:
-      max_symbols: 5
+      max_symbols: 21
       n_factors: 2
   reruns: 2
   timeout: 600
@@ -2725,7 +2981,7 @@ case_studies/sp500_equity_option_analytics/11c_conditional_autoencoder:
     DEVICE: cpu
     POPULATION_NAME: sp500_equity_option_analytics-cae-preview
     PREVIEW_REDUCTIONS:
-      max_symbols: 5
+      max_symbols: 21
   timeout: 600
 
 case_studies/sp500_equity_option_analytics/11d_stochastic_discount_factor:
@@ -2738,7 +2994,7 @@ case_studies/sp500_equity_option_analytics/11d_stochastic_discount_factor:
     DEVICE: cpu
     POPULATION_NAME: sp500_equity_option_analytics-sdf-preview
     PREVIEW_REDUCTIONS:
-      max_symbols: 5
+      max_symbols: 21
       n_epochs_unc: 2
       n_epochs_moment: 2
       n_epochs_cond: 4
@@ -2757,7 +3013,7 @@ case_studies/sp500_equity_option_analytics/11e_supervised_autoencoder:
     DEVICE: cpu
     POPULATION_NAME: sp500_equity_option_analytics-sae-preview
     PREVIEW_REDUCTIONS:
-      max_symbols: 5
+      max_symbols: 21
   timeout: 900
 
 case_studies/sp500_equity_option_analytics/12_causal_dml:
@@ -2778,7 +3034,7 @@ case_studies/sp500_equity_option_analytics/12_causal_dml:
   parameters:
     CV_FOLDS: 2
     MAX_SAMPLES: 3000
-    MAX_SYMBOLS: 5
+    MAX_SYMBOLS: 21
     N_PLACEBO: 25
   timeout: 300
 case_studies/sp500_equity_option_analytics/13_model_analysis:
@@ -3188,6 +3444,14 @@ case_studies/sp500_options/11_model_analysis:
   skip: true
   skip_reason: "Resolves four named official populations, and a preview run cannot create one (research/population.py::_refuse_preview_activation). Runnable when the fixture registry ships canonical populations under those names."
 case_studies/sp500_options/12_backtest:
+  # Its inputs are registered by sp500_options::06_linear into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 5 (RuntimeError): preview execution found no complete validation predictions for ['ret_to_expiry']
+  requires_stage: 06_linear
   # MAX_SYMBOLS and TOP_K are gone: the notebook takes its concentration grid from
   # setup.yaml and its universe from the signal, and neither name is bound any more.
   #
@@ -3212,6 +3476,14 @@ case_studies/sp500_options/12_backtest:
     PREVIEW_MAX_PREDICTIONS: 4
   timeout: 900
 case_studies/sp500_options/13_portfolio_management:
+  # Its inputs are registered by sp500_options::12_backtest into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 5 (RuntimeError): preview execution found no complete baseline backtests for 'ret_to_expiry'
+  requires_stage: 12_backtest
   # PREVIEW_MAX_BASELINE_CONFIGS is the preview's own shortlist width, and it counts model
   # configurations rather than backtest rows: the baseline stage registers one row per
   # concentration, so a row limit would spend the whole budget inside the first
@@ -3234,6 +3506,14 @@ case_studies/sp500_options/14_risk_management:
   skip: true
   skip_reason: "Opens the canonical candidate set `sp500-options-strategy-candidates-v1` and refuses a preview tier, and a preview run of 13_portfolio_management cannot create one (`CandidateSet.create` refuses a preview member). Runnable when the fixture registry ships that candidate set."
 case_studies/sp500_options/15_costs:
+  # Its inputs are registered by sp500_options::12_backtest into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 5 (RuntimeError): preview execution found no complete baseline backtests for 'ret_to_expiry'
+  requires_stage: 12_backtest
   # The same conversion as 13 above, one stage further on: this notebook read literal
   # PREVIEW_BASELINE_HASHES and now selects the preview baselines by label. One
   # representative per family is what the canonical run prices, and two configurations is
@@ -3360,15 +3640,20 @@ case_studies/us_equities_panel/06_linear:
   # its own name rather than writing a partial member set under the canonical one.
   #
   # The two names are not a free choice. `preset_patches._trim_label_configs` rewrites the
-  # fixture's copy of every `config/training/fwd_*.yaml`, keeping the first
-  # `_MAX_CONFIGS_PER_FAMILY` entries of the `linear` and `gbm` families, and
-  # `load_model_configs` raises on any name the menu does not declare. So a name has to
-  # survive the trim, which for linear leaves `ols` and `ridge_a0.001` - the unpenalized
-  # baseline and the lightest ridge, which still exercises both code paths.
-  # `test_requested_configurations_survive_the_fixture_trim` pins this.
+  # fixture's copy of every `config/training/fwd_*.yaml`, keeping `_MAX_CONFIGS_PER_FAMILY`
+  # entries spanning the `linear` and `gbm` families, and `load_model_configs` raises on any
+  # name the menu does not declare. So a name has to survive the trim, which for this
+  # sixteen-entry linear menu leaves `ols` and `enet_a0.1` - the unpenalized baseline and the
+  # far end of the penalty path.
+  #
+  # It said `ridge_a0.001` while the trim took the head of the menu. That pair fits the same
+  # model twice: a penalty of 0.001 does not reorder predictions, so the two agree on every
+  # statistic the registry records, and the comparison this entry exists to exercise had no
+  # distinguishable outcome. `test_requested_configurations_survive_the_fixture_trim` pins the
+  # names against the trim as it actually runs.
   parameters:
     LABELS: [fwd_ret_1d]
-    CONFIG_NAMES: [ols, ridge_a0.001]
+    CONFIG_NAMES: [ols, enet_a0.1]
     POPULATION_NAME: ci-preview-linear
   # 300s stands. It was set when this entry was believed to fit 48 config-label pairs at two
   # folds each; it was in fact fitting all 48 at every fold, and the narrowing above cuts that
@@ -3386,14 +3671,14 @@ case_studies/us_equities_panel/07_gbm:
   # is set: the reduced run gets its own population rather than writing a partial one under
   # the canonical name.
   #
-  # `default_mae` and not `leaves_31_mse`, for the reason 06_linear gives above: the fixture's
-  # menu is trimmed to the first two of the `gbm` family and `leaves_31_mse` is not among them,
-  # so `load_model_configs` would have raised "configurations not declared" the moment this
-  # stage ran. It never did - 06_linear failed ahead of it on every regeneration that reached
-  # this far - so the entry was wrong and untested at the same time.
+  # `leaves_63_huber` and not `leaves_31_mse` or `default_mae`, for the reason 06_linear gives
+  # above: the fixture's menu keeps two entries spanning the `gbm` family, and
+  # `load_model_configs` raises "configurations not declared" on any other name the moment
+  # this stage runs. The pair varies both axes the family sweeps - leaf count and loss -
+  # where the head of the menu varied only the loss.
   parameters:
     LABELS: [fwd_ret_1d]
-    CONFIG_NAMES: [default_mse, default_mae]
+    CONFIG_NAMES: [default_mse, leaves_63_huber]
     POPULATION_NAME: ci-preview-gbm
   timeout: 300
 case_studies/us_equities_panel/08_tabular_dl:
@@ -3406,29 +3691,32 @@ case_studies/us_equities_panel/08_tabular_dl:
     DEVICE: cpu
     CONFIG_NAMES: [tabm_s]
     DIAGNOSTIC_CONFIG_NAMES: [tabm_s]
-    MAX_FOLDS: 2
-    MAX_SYMBOLS: 20
+    PREVIEW_MAX_FOLDS: 2
+    PREVIEW_MAX_SYMBOLS: 20
     PREVIEW_N_EPOCHS: 1
   timeout: 180
 case_studies/us_equities_panel/09_dl_nlinear:
+  # n_epochs rides in COMMON_OVERRIDES rather than in a PREVIEW_N_EPOCHS parameter of its own.
+  # SEQUENCE_PREVIEW_FIELDS does not accept an epoch count, so the notebook's old parameter fed
+  # `overrides` while its name promised a preview-tier restriction the shared validation could
+  # not enforce - a canonical run carrying it would have trained one epoch and published it.
+  # An override is refused a canonical population by the notebook's own publish guard.
   # MAX_FOLDS became FOLD_IDS: the sequence runner takes the fold ids it should
   # keep, not a count to slice to.
   parameters:
     DEVICE: cpu
     CONFIG_NAMES: [nlinear]
-    COMMON_OVERRIDES: {batch_size: 32, lookback: 5}
-    FOLD_IDS: [0, 1]
-    MAX_SYMBOLS: 5
-    PREVIEW_N_EPOCHS: 1
+    COMMON_OVERRIDES: {batch_size: 32, lookback: 5, n_epochs: 1}
+    PREVIEW_FOLD_IDS: [0, 1]
+    PREVIEW_MAX_SYMBOLS: 5
   timeout: 600
 case_studies/us_equities_panel/10_dl_lstm:
   parameters:
     DEVICE: cpu
     CONFIG_NAMES: [lstm_h64]
-    COMMON_OVERRIDES: {batch_size: 32, lookback: 5}
-    FOLD_IDS: [0, 1]
-    MAX_SYMBOLS: 5
-    PREVIEW_N_EPOCHS: 1
+    COMMON_OVERRIDES: {batch_size: 32, lookback: 5, n_epochs: 1}
+    PREVIEW_FOLD_IDS: [0, 1]
+    PREVIEW_MAX_SYMBOLS: 5
   timeout: 600
 case_studies/us_equities_panel/11_dl_tsmixer:
   # The pinned SYMBOLS whitelist this entry used to carry has no parameter to
@@ -3442,10 +3730,9 @@ case_studies/us_equities_panel/11_dl_tsmixer:
   parameters:
     DEVICE: cpu
     CONFIG_NAMES: [tsmixer]
-    COMMON_OVERRIDES: {batch_size: 32, lookback: 5}
-    FOLD_IDS: [0, 1]
-    MAX_SYMBOLS: 8
-    PREVIEW_N_EPOCHS: 1
+    COMMON_OVERRIDES: {batch_size: 32, lookback: 5, n_epochs: 1}
+    PREVIEW_FOLD_IDS: [0, 1]
+    PREVIEW_MAX_SYMBOLS: 8
   timeout: 600
 case_studies/us_equities_panel/12_dl_weekly:
   parameters:
@@ -3464,19 +3751,24 @@ case_studies/us_equities_panel/13a_pca:
   # 11b_ipca run under.
   parameters:
     LABELS: [fwd_ret_1d]
-    MAX_SYMBOLS: 5
-    FOLD_IDS: [0, 1]
+    PREVIEW_MAX_SYMBOLS: 5
+    PREVIEW_FOLD_IDS: [0, 1]
     PREVIEW_N_FACTORS: 2
   timeout: 300
 case_studies/us_equities_panel/13b_ipca:
   # See 13a_pca on why this is no longer skipped.
   parameters:
     LABELS: [fwd_ret_1d]
-    MAX_SYMBOLS: 5
-    FOLD_IDS: [0, 1]
+    PREVIEW_MAX_SYMBOLS: 5
+    PREVIEW_FOLD_IDS: [0, 1]
     PREVIEW_N_FACTORS: 2
   timeout: 300
 case_studies/us_equities_panel/14_causal_dml:
+  # MAX_SYMBOLS carries the PREVIEW_ prefix here. Without it, injected_parameters strips it on
+  # neither path: canonically_refused_parameters reads the notebook's canonical guard, whose test
+  # is the local `preview_reductions` aggregate rather than a declared parameter name, so the
+  # intersection with the parameters cell is empty. It reached a canonical run and raised
+  # "Canonical execution cannot declare preview reductions".
   # CV_FOLDS, MAX_SAMPLES and N_PLACEBO became PREVIEW_N_FOLDS,
   # PREVIEW_MAX_SAMPLES and PREVIEW_N_PLACEBO: the reduced fold count, sample
   # cap and placebo count are part of the preview identity now, not free knobs.
@@ -3485,12 +3777,20 @@ case_studies/us_equities_panel/14_causal_dml:
   # any n below 20 and the draws are spent on a verdict that cannot be reached. 20 is
   # the first reachable count; 24 leaves margin for draws that fail.
   parameters:
-    MAX_SYMBOLS: 5
+    PREVIEW_MAX_SYMBOLS: 5
     PREVIEW_N_FOLDS: 2
     PREVIEW_MAX_SAMPLES: 5000
     PREVIEW_N_PLACEBO: 25
   timeout: 120
 case_studies/us_equities_panel/15_model_analysis:
+  # Its inputs are registered by us_equities_panel::06_linear into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 12 (ValueError): Preview analysis selection is empty
+  requires_stage: 06_linear
   # 15 declares EXECUTION_TIER and WORKSPACE, so research_preview_parameters routes it to the
   # preview tier, and the preview branch requires a catalog filter plus explicit prediction and
   # diagnostic limits. Without them it raised before reading anything. Diagnostics must be a
@@ -3503,6 +3803,14 @@ case_studies/us_equities_panel/15_model_analysis:
     PREVIEW_MAX_DIAGNOSTICS: 2
   timeout: 300
 case_studies/us_equities_panel/16_backtest:
+  # Its inputs are registered by us_equities_panel::06_linear into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 8 (ValueError): The baseline requires complete validation predictions from one execution tier
+  requires_stage: 06_linear
   # TOP_K is gone: the signal-to-position mapping grid comes from
   # config/setup.yaml's top_k_grid and is not a notebook parameter any more.
   # A preview needs a catalog filter plus an explicit prediction cap, and
@@ -3518,6 +3826,14 @@ case_studies/us_equities_panel/16_backtest:
     MAX_SYMBOLS: 45
   timeout: 600
 case_studies/us_equities_panel/17_portfolio_management:
+  # Its inputs are registered by us_equities_panel::16_backtest into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 7 (ValueError): Allocation requires complete finite equal-weight validation rows
+  requires_stage: 16_backtest
   # TOP_N_PREDICTIONS became PREVIEW_MAX_BASELINE_ROWS. The canonical shortlist
   # size is read from setup.yaml's top_n_predictions.allocation and is no longer
   # overridable; what a preview bounds is how many baseline rows it reads.
@@ -3529,6 +3845,14 @@ case_studies/us_equities_panel/17_portfolio_management:
     MAX_SYMBOLS: 45
   timeout: 300
 case_studies/us_equities_panel/19_costs:
+  # Its inputs are registered by us_equities_panel::16_backtest into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 7 (ValueError): Cost analysis requires complete finite selection-eligible validation rows
+  requires_stage: 16_backtest
   # TOP_N_COMBOS became PREVIEW_MAX_SOURCE_ROWS, and the cost grid is bounded by
   # PREVIEW_MAX_COST_VALUES rather than run in full.
   # See 16_backtest on the 45-symbol floor.
@@ -3539,6 +3863,14 @@ case_studies/us_equities_panel/19_costs:
     MAX_SYMBOLS: 45
   timeout: 600
 case_studies/us_equities_panel/18_risk_management:
+  # Its inputs are registered by us_equities_panel::16_backtest into this same workspace,
+  # and the seeded registry holds none of them: tests/conftest.py records that seeding
+  # the preview root was measured to starve the coverage group the real predictions land
+  # in, so the dependency is declared rather than removed (ml4t/agent-workspace#1036).
+  # A full in-order run satisfies it. Reproduced 2026-09-09 by running this stage alone,
+  # which failed on:
+  #   Cell 7 (ValueError): Risk overlays require complete finite selection-eligible validation rows
+  requires_stage: 16_backtest
   # TOP_N_COMBOS became PREVIEW_MAX_SOURCE_ROWS and MAX_RISK_VARIANTS became
   # PREVIEW_MAX_RISK_CONTROLS.
   # See 16_backtest on the 45-symbol floor.
