@@ -9,13 +9,13 @@ Two modes of operation:
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
-import yaml
 
 from tests.preset_patches import _patch_presets_for_testing, _trim_label_configs
 
@@ -639,6 +639,12 @@ def _restore_output_root():
     reads the committed ``case_studies/`` tree instead of the seeded output dir. This lives here
     rather than in each module because thirteen copies of it drifted apart once already.
     """
+    # `previous` is not None for the test that installs the session value. Session-scoped
+    # fixtures set up before function-scoped ones, so `seeded_output_dir` has already written
+    # the variable by the time this reads it, and the pop branch below is unreachable for that
+    # test. Measured 2026-09-15 with both module shadows removed and this file unchanged: the
+    # value survives its own first teardown and every teardown after it. A trace showing it
+    # popped was taken with a shadow still in the tree, and the pop was the shadow's.
     previous = os.environ.get("ML4T_OUTPUT_DIR")
     yield
     if previous is None:
@@ -667,3 +673,19 @@ def clean_env():
     yield os.environ
     os.environ.clear()
     os.environ.update(saved_env)
+
+
+@pytest.fixture
+def tmp_repo(tmp_path):
+    """Make a stand-in ``REPO_ROOT`` a real repository.
+
+    Stamping a notebook stores the blob it names - ``source_py_blob`` exists so that a later
+    command can fetch that blob and compare code cells, and a hash recorded without storing the
+    object names something that is not there. Storing it needs somewhere to store it, so a test
+    that stands ``REPO_ROOT`` on a directory has to stand it on a repository.
+
+    Opt in per module with ``pytestmark = pytest.mark.usefixtures("tmp_repo")`` rather than
+    autouse here, so the rest of the suite does not pay for a ``git init`` it never reads.
+    """
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
+    return tmp_path

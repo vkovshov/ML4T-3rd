@@ -64,7 +64,6 @@ from case_studies.utils.backtest_loaders import (
 )
 from case_studies.utils.backtest_presets import (
     ensure_backtest_spec,
-    serializable_backtest_spec,
     strategy_view,
 )
 from case_studies.utils.backtest_runner import resolved_allow_short_selling, run_backtest
@@ -305,7 +304,7 @@ identity["futures_market"] = compute_hash(canonical_json(futures_market))
 # `prices` is the third entry and the same kind of mistake as the other two: cloned from the
 # validation run, it is the digest of the validation price frame while this backtest consumes
 # the holdout one. The record would say the run read prices it did not read, and
-# `us_equities_panel/20_strategy_analysis.py` shows the shape of the consumer that checks
+# `us_equities_panel/22_strategy_analysis.py` shows the shape of the consumer that checks
 # exactly this.
 #
 # It is digested on the engine-keyed frame, which for cme is the reader frame with `product`

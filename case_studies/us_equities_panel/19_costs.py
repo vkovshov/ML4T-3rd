@@ -95,18 +95,12 @@ from utils.style import add_message_title, ml4t_palette, show_with_alt, zero_lin
 CASE_STUDY_ID = "us_equities_panel"
 BASELINE_SET_NAMES = [
     "us-equities-fwd-ret-1d-baseline-v1",
-    "us-equities-fwd-ret-5d-baseline-v1",
-    "us-equities-fwd-ret-21d-baseline-v1",
 ]
 ALLOCATION_SET_NAMES = [
     "us-equities-fwd-ret-1d-allocation-v1",
-    "us-equities-fwd-ret-5d-allocation-v1",
-    "us-equities-fwd-ret-21d-allocation-v1",
 ]
 RISK_SET_NAMES = [
     "us-equities-fwd-ret-1d-risk-overlay-v1",
-    "us-equities-fwd-ret-5d-risk-overlay-v1",
-    "us-equities-fwd-ret-21d-risk-overlay-v1",
 ]
 EXECUTION_TIER = "canonical"
 POPULATION_NAME = ""
@@ -548,7 +542,7 @@ execution_diagnostics
 # ## 6. Naming the curves
 #
 # One set per label, holding both regimes, under a name
-# [`20_strategy_analysis`](20_strategy_analysis.ipynb) opens. These rows describe a strategy that
+# [`22_strategy_analysis`](22_strategy_analysis.ipynb) opens. These rows describe a strategy that
 # was already chosen, so they stay out of the pool anything selects from - a cost row winning a
 # selection would mean the cost assumption picked the strategy.
 #

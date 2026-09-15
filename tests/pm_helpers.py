@@ -68,6 +68,7 @@ overrides.yaml schema (per-notebook, all optional):
 
 import ast
 import functools
+import importlib.util
 import json
 import os
 import re
@@ -83,6 +84,48 @@ import yaml
 
 REPO_ROOT = Path(__file__).parent.parent
 OVERRIDES_PATH = REPO_ROOT / "tests" / "overrides.yaml"
+
+# Every key an entry in that file may carry, each with a reader named beside it. The file
+# is plain YAML, so a key nothing reads is accepted in silence: `env:` was, and it reached
+# nothing, because `test_chapter_notebook` calls `run_notebook` without `extra_env`. A
+# reduction that arrives nowhere does not present as a broken reduction, it presents as an
+# expensive notebook - `12_gradient_boosting/08_shap_analysis` declared `MAX_SYMBOLS: 10`
+# against a 300 s per-cell timeout and trained on the full universe, and the cost read as
+# the notebook being slow.
+#
+# Adding a key here is the act of saying what reads it. `tests/test_overrides_schema.py`
+# fails on any key in the file that is not listed, and separately on any entry whose
+# parameter names do not reach papermill, which catches a new key of this shape without
+# waiting for this list to be updated.
+KNOWN_OVERRIDE_KEYS = frozenset(
+    {
+        "docker_env",  # pm_helpers.check_kernel_routing
+        "gpu",  # pm_helpers.gpu_skip_reason
+        "invocations",  # pm_helpers.invocations_for
+        "kernel_launcher",  # pm_helpers.check_kernel_routing
+        "kernel_python",  # pm_helpers.check_kernel_routing
+        "long_running",  # tests/conftest.py, marker application
+        "parameters",  # pm_helpers.sole_invocation -> papermill
+        "record_mode",  # pm_helpers.get_record_mode
+        "requires_env",  # pm_helpers.missing_required_env
+        "requires_import",  # tests/test_chapter_notebooks.py
+        "requires_stage",  # tests/test_case_studies.py
+        "research_preview",  # pm_helpers.injected_parameters
+        "reruns",  # pm_helpers.get_reruns
+        "skip",  # tests/test_chapter_notebooks.py
+        "skip_blocker",  # tests/skip_blockers.py
+        "skip_reason",  # tests/test_chapter_notebooks.py
+        "tier",  # pm_helpers.get_tier
+        "timeout",  # tests/test_chapter_notebooks.py -> run_notebook
+        # Free VRAM in whole GB a canonical run of this notebook needs before it may
+        # start. Read by the launcher outside this repo (agents/scripts/nb-run.sh,
+        # `needs_vram`), which is why no test here consumes it: the key is declared
+        # beside the notebook because the measurement belongs to the notebook, and a
+        # scheduling gate that lived in the runner alone had to guess from the model
+        # name. Nothing in CI reads it - CI has no card.
+        "vram_gb",  # agents/scripts/nb-run.sh needs_vram
+    }
+)
 
 STAGE_RE = re.compile(r"^(\d{2})([a-z]?)_")
 
@@ -1058,9 +1101,19 @@ def check_kernel_routing(overrides: dict) -> KernelRouting:
     )
 
     if not (Path(kernel_python).is_file() and os.access(kernel_python, os.X_OK)):
+        # Which filesystem was looked at decides who is at fault, and the two read alike
+        # otherwise: run this file from the host venv and a correct image is reported as
+        # needing a rebuild. /.dockerenv is written by the runtime, not by our images.
+        where = (
+            f"inside this container. {rebuild}"
+            if Path("/.dockerenv").exists()
+            else "on this host. That path lives inside the "
+            f"{image or 'notebook'} image, where this test is meant to execute, so nothing "
+            "here says the image is stale. Run it through the docker job instead."
+        )
         return KernelRouting(
             f"overrides.yaml routes this notebook to {kernel_python}, "
-            f"which is not an executable file here. {rebuild}"
+            f"which is not an executable file {where}"
         )
 
     launcher_path = REPO_ROOT / launcher if launcher else None
@@ -1545,7 +1598,12 @@ def run_notebook(
     env_vars = {
         "MPLBACKEND": "Agg",
         "PLOTLY_RENDERER": "json",
-        "DISABLE_HPO": "1",
+        # Which notebook is running. Nothing papermill injects reaches the kernel, so a study
+        # opened without an explicit `entry_point` had no way to name the notebook that opened
+        # it and every training run it registered wrote the column NULL. The launcher is the
+        # one party that knows, so it says so; `research/workspace._resolve_entry_point` reads
+        # it and an explicit argument still wins.
+        "ML4T_ENTRY_POINT": nb_name,
         **KERNEL_THREAD_CAPS,
     }
     if output_dir:
@@ -1566,16 +1624,19 @@ def run_notebook(
     # Ensure torch's bundled CUDA libraries are found before system ones.
     # The system libcudart.so.12 may be outdated and missing symbols like
     # cudaGetDriverEntryPointByVersion that torch's bundled version provides.
+    # Located with find_spec rather than by importing torch: this process only needs
+    # the paths, and executing the package to read them costs 502 MB resident in every
+    # worker (#558). The resulting string is identical.
     try:
-        import torch
-
-        torch_lib = str(Path(torch.__file__).parent / "lib")
-        nvidia_libs = list((Path(torch.__file__).parent.parent / "nvidia").glob("*/lib"))
-        cuda_paths = [torch_lib] + [str(p) for p in nvidia_libs]
+        torch_spec = importlib.util.find_spec("torch")
+    except (ImportError, ValueError):
+        torch_spec = None
+    if torch_spec is not None and torch_spec.origin:
+        torch_root = Path(torch_spec.origin).parent
+        nvidia_libs = list((torch_root.parent / "nvidia").glob("*/lib"))
+        cuda_paths = [str(torch_root / "lib")] + [str(p) for p in nvidia_libs]
         existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
         env_vars["LD_LIBRARY_PATH"] = ":".join(cuda_paths + [existing_ld])
-    except ImportError:
-        pass
 
     # A notebook whose dependencies live in a separate venv runs on its own
     # kernelspec, written to a temp JUPYTER_PATH so nothing global is touched.

@@ -77,8 +77,6 @@
 # %%
 """Crypto perps funding: model-based features from a GJR-GARCH fit and a funding-regime HMM."""
 
-import warnings
-
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
@@ -101,19 +99,24 @@ from case_studies.utils.temporal import (
     walk_forward_feature,
     write_model_based,
 )
+from case_studies.utils.warning_policy import apply_notebook_warning_policy
 from data import load_crypto_perps
 from utils.artifact_specs import (
     load_setup_config,
     resolve_label_buffer,
     resolve_label_horizon,
 )
-from utils.cv_splits import generate_cv_splits, load_evaluation_config
+from utils.cv_splits import (
+    generate_cv_splits,
+    load_evaluation_config,
+    normalize_label_buffer,
+)
 from utils.modeling import load_modeling_dataset
 from utils.paths import get_case_study_dir
 from utils.reproducibility import set_global_seeds
 from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
 
-warnings.filterwarnings("ignore")
+apply_notebook_warning_policy()
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "crypto_perps_funding"
@@ -152,8 +155,13 @@ LABEL_BUFFER = resolve_label_buffer(CASE_STUDY_ID, PRIMARY_LABEL, _SETUP)
 LABEL_HORIZON = resolve_label_horizon(CASE_STUDY_ID, PRIMARY_LABEL, _SETUP)
 assert LABEL_BUFFER, f"No label buffer configured for {PRIMARY_LABEL}"
 # The Newey-West lag below is counted in decision timestamps, not in hours, so the
-# configured horizon is converted into settlement bars once, here.
-LABEL_HORIZON_BARS = round(pd.Timedelta(LABEL_BUFFER) / pd.Timedelta(hours=BAR_HOURS))
+# configured horizon is converted into settlement bars once, here. The conversion goes
+# through `normalize_label_buffer` because the configured string is "8H" and pandas
+# deprecated "H", so `pd.Timedelta` on the raw value writes a FutureWarning into the
+# page. The configured string itself is what registered training runs hash, so it stays
+# as declared. The helper is unit-aware rather than a `.lower()`: "21D" stays "21D".
+LABEL_BUFFER_DELTA = pd.Timedelta(normalize_label_buffer(LABEL_BUFFER))
+LABEL_HORIZON_BARS = round(LABEL_BUFFER_DELTA / pd.Timedelta(hours=BAR_HOURS))
 
 set_global_seeds(SEED)
 
@@ -284,8 +292,8 @@ holdout_end = pd.Timestamp(_evaluation["holdout_end"], tz="UTC")
 print(f"Walk-forward folds: {len(VALIDATION_FOLDS)}")
 for f in VALIDATION_FOLDS:
     embargo = f["test_start"] - f["train_end"]
-    label_endpoint = f["test_end"] + pd.Timedelta(LABEL_BUFFER)
-    assert embargo >= pd.Timedelta(LABEL_BUFFER)
+    label_endpoint = f["test_end"] + LABEL_BUFFER_DELTA
+    assert embargo >= LABEL_BUFFER_DELTA
     assert label_endpoint < holdout_start
     print(
         f"  Fold {f['fold']}: fitted on [{f['train_start']} to {f['train_end']}], "
@@ -420,7 +428,7 @@ FOLDS_BY_DATE = sorted(active_folds, key=lambda item: item["test_start"])
 _bars = labels["timestamp"].unique().sort()
 _burnin_end = _bars[min(MIN_TRAIN_BARS, len(_bars) - 1)]
 
-fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+fig, ax = plt.subplots(figsize=FIGSIZE["single"], layout="tight")
 _top = len(FOLDS_BY_DATE)
 for start_ts, end_ts, color, name in (
     (_bars[0], _burnin_end, COLORS["recede"], f"burn-in, {MIN_TRAIN_BARS} settlements, no value"),
@@ -535,7 +543,7 @@ coverage = (
     .agg(pl.col("timestamp").min().alias("first"), pl.col("timestamp").max().alias("last"))
     .sort("first", descending=True)
 )
-fig, ax = plt.subplots(figsize=FIGSIZE["single_tall"])
+fig, ax = plt.subplots(figsize=FIGSIZE["single_tall"], layout="tight")
 _VALIDATION_BY_DATE = [f for f in FOLDS_BY_DATE if f["fold"] in VALIDATION_FOLD_IDS]
 for fold, color in zip(_VALIDATION_BY_DATE, (COLORS["recede"], COLORS["amber"]), strict=False):
     ax.axvspan(
@@ -1132,7 +1140,7 @@ regime_view = (
 )
 
 # %%
-fig, axes = plt.subplots(2, 1, figsize=FIGSIZE["dual_v"], sharex=True)
+fig, axes = plt.subplots(2, 1, figsize=FIGSIZE["dual_v"], sharex=True, layout="tight")
 _stamps = regime_view["timestamp"].to_list()
 axes[0].plot(
     _stamps, regime_view["xs_mean_funding_bps"].to_list(), color=COLORS["blue"], linewidth=0.7
@@ -1252,7 +1260,7 @@ display(
 display(duration_stability.select("fit_end", "calm_duration_bars", "stress_duration_bars").tail(8))
 
 # %%
-fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+fig, ax = plt.subplots(figsize=FIGSIZE["single"], layout="tight")
 _fit_ends = coefficient_stability["fit_end"].to_list()
 ax.fill_between(
     _fit_ends,
@@ -1292,7 +1300,7 @@ show_with_alt(
 )
 
 # %%
-fig, ax = plt.subplots(figsize=FIGSIZE["single"])
+fig, ax = plt.subplots(figsize=FIGSIZE["single"], layout="tight")
 for column, name, color in (
     ("calm_duration_bars", "calm state", COLORS["blue"]),
     ("stress_duration_bars", "stressed state", COLORS["amber"]),
@@ -1714,7 +1722,7 @@ bar_fill = [COLORS["blue"] if flag else "none" for flag in plot_summary["fdr_sig
 interval = [1.96 * se for se in plot_summary["hac_se"]]
 
 # %%
-fig, ax = plt.subplots(figsize=FIGSIZE["single_tall"])
+fig, ax = plt.subplots(figsize=FIGSIZE["single_tall"], layout="tight")
 ax.barh(
     rows,
     plot_summary["mean_ic"].to_list(),

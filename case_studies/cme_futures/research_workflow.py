@@ -4,11 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-import json
-import sqlite3
-import subprocess
 from collections.abc import Iterable
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -38,6 +34,7 @@ from case_studies.utils.artifact_digest import value_digest
 from case_studies.utils.backtest_loaders import get_backtest_config, load_backtest_prices_for
 from case_studies.utils.backtest_runner import precompute_weights
 from case_studies.utils.registry import prediction_hash_from_parts
+from case_studies.utils.runtime import source_commit
 from data import load_cme_futures
 from utils.modeling import load_configs
 from utils.paths import REPO_ROOT
@@ -182,9 +179,7 @@ def open_study(
             manifest={
                 "schema_version": 1,
                 "case_study": CASE_STUDY,
-                "baseline_source_commit": subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
-                ).strip(),
+                "baseline_source_commit": source_commit(REPO_ROOT),
                 "preview_only": True,
             },
         )

@@ -67,7 +67,11 @@ from case_studies.research.holdout import build_holdout_training_spec
 from case_studies.research.strategy import strategy_warmup_periods
 from case_studies.utils.artifact_digest import value_digest
 from case_studies.utils.backtest_loaders import get_backtest_config, load_backtest_prices_for
-from case_studies.utils.backtest_presets import cost_view, ensure_backtest_spec
+from case_studies.utils.backtest_presets import (
+    EngineBacktestConfig,
+    cost_view,
+    ensure_backtest_spec,
+)
 from case_studies.utils.backtest_runner import resolved_allow_short_selling
 from case_studies.utils.cohort_metrics import compute_and_register
 from case_studies.utils.paired_metrics import populate_paired_metrics
@@ -93,7 +97,7 @@ WORKSPACE: str = ""
 CANDIDATE_SET_NAME = "fx_pairs:holdout-candidates"
 
 # %% [markdown]
-# ## Resolve the carrier and its holdout lineage
+# ## Resolve the selected configuration and its holdout lineage
 #
 # Selection is not a parameter and is not made here. `resolve_solvent_carrier` reads the
 # highest-Sharpe registered validation backtest across the baseline, allocation and risk-overlay
@@ -101,7 +105,7 @@ CANDIDATE_SET_NAME = "fx_pairs:holdout-candidates"
 # siblings are not candidates: a cost variant is a descendant of a selection rather than an
 # entrant in one. Nothing on this page can revise the choice.
 #
-# The holdout lineage is matched to that carrier by CONFIGURATION - family, configuration name,
+# The holdout lineage is matched to that selection by CONFIGURATION - family, configuration name,
 # label and checkpoint - rather than by the validation model's training hash. A genuine retrain
 # does not share that hash; that is what makes it a retrain, and a lineage query keyed on it can
 # only ever find a validation fit scored over a later window.
@@ -115,13 +119,13 @@ CANDIDATE_SET_NAME = "fx_pairs:holdout-candidates"
 # %% tags=["results"]
 study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None)
 
-# The carrier is the highest-Sharpe registered validation backtest across the baseline,
+# The selection is the highest-Sharpe registered validation backtest across the baseline,
 # allocation and risk-overlay stages, among runs that stayed solvent and belong to a generation
 # still in force. Read from the registry, so this page cannot report a configuration the
 # validation stages did not rank first.
-# The frozen set is the field, exactly as in `17` and `18`. This page reports the carrier as the
-# case study's answer, so it resolves over the same restricted field rather than over the whole
-# registry - otherwise a row the set never admitted could still move the common-support
+# The frozen set is the field, exactly as in `17` and `18`. This page reports that configuration
+# as the case study's answer, so it resolves over the same restricted field rather than over the
+# whole registry - otherwise a row the set never admitted could still move the common-support
 # intersection and change which admitted row is reported.
 holdout_candidates = CandidateSet.one(study, name=CANDIDATE_SET_NAME)
 ADMITTED = frozenset(holdout_candidates.members)
@@ -154,13 +158,13 @@ selected_computation = selected_training_spec.get("computation", selected_traini
 # baselines, the allocation variants and the risk overlays. Cost siblings are excluded, because
 # a cost variant is a descendant of a selection rather than a candidate for one.
 #
-# `selectable_validation_candidates` is the function the carrier resolution ranks, called here
+# `selectable_validation_candidates` is the function the selection ranks, called here
 # with the same frozen set, so the table below and the selection are the same field by
 # construction rather than by two filters that have to agree. Rebuilding the field in a query
 # beside it did not agree: that query excluded the *retired* set, which is not the *published*
 # set. A backtest no population ever listed was retired by nobody, so an exclusion filter admits
 # it while the membership test the selection applies does not - and one such row, `56070f34dff1`,
-# sorted above the carrier on raw Sharpe and made this page refuse to render.
+# sorted above the selected configuration on raw Sharpe and made this page refuse to render.
 #
 # The order is the resolver's own. Where a conformal candidate is in the field it re-ranks every
 # member on the timestamps they all price, because a calibration that abstains through its
@@ -171,7 +175,7 @@ candidate_field = selectable_validation_candidates(CASE_STUDY_ID, admitted=ADMIT
 
 pl.DataFrame(
     {
-        "field": ["carrier backtest", "carrier stage", "candidates ranked", "validation Sharpe"],
+        "field": ["selected backtest", "selected stage", "candidates ranked", "validation Sharpe"],
         "value": [
             selected_validation.hash,
             str(carrier["val_stage"]),
@@ -283,9 +287,9 @@ for _candidate in candidate_field:
     )
 
 # Not re-sorted: the rows arrive in the order the selection ranked them, so the top row is the
-# carrier by construction. The check below is kept anyway and is now a real one - it fails if the
-# resolver ever returns a field whose first member is not the carrier it resolved, which would
-# mean the two halves of the same function had come apart.
+# selected configuration by construction. The check below is kept anyway and is now a real one -
+# it fails if the resolver ever returns a field whose first member is not the configuration it
+# resolved, which would mean the two halves of the same function had come apart.
 candidate_evidence = pl.DataFrame(candidate_rows)
 if candidate_evidence["backtest_hash"][0] != selected_validation.hash:
     raise ValueError(
@@ -342,6 +346,29 @@ def _comparison_projection(
         config = projected.get("backtest_config", {})
         config.pop("commission", None)
         config.pop("slippage", None)
+    # The rows being compared were serialized by whatever engine version registered each one, so a
+    # field `BacktestConfig` has since gained is present on one side and absent on the other while
+    # both describe the same strategy. `ml4t-backtest` 0.1.3 to 0.1.6 added
+    # `account.lock_notional_update_mode` and `position_sizing.share_rounding`; every row in this
+    # registry written before 2026-09-12 lacks both, so a cost sibling written after it matched no
+    # selected strategy and this notebook stopped at "no controlled cost siblings match". Round
+    # -tripping both sides through the installed schema states the comparison in one vocabulary, so
+    # it answers whether two runs describe the same strategy rather than which engine wrote them,
+    # and it covers the next added field without naming it. `ensure_backtest_spec` deliberately does
+    # not round-trip, because its result is hashed and a dropped unknown key would move an identity;
+    # here the result is compared and discarded. Metadata is merged back over the serialized view
+    # because the dataclass pins a schema and drops keys it does not know.
+    config = projected.get("backtest_config", {})
+    if EngineBacktestConfig is not None and config:
+        original_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        rebuilt = EngineBacktestConfig.from_dict(config).to_dict()
+        if omit_costs:
+            rebuilt.pop("commission", None)
+            rebuilt.pop("slippage", None)
+        rebuilt_metadata = dict(rebuilt.get("metadata") or {})
+        rebuilt_metadata.update(original_metadata)
+        rebuilt["metadata"] = rebuilt_metadata
+        projected["backtest_config"] = rebuilt
     return {
         "prediction_hash": result.registry_record()["prediction_hash"],
         "spec": projected,
@@ -467,12 +494,12 @@ controlled_summary = pl.DataFrame(
 controlled_summary
 
 # %% [markdown]
-# ## Require the holdout lineage the carrier determines
+# ## Require the holdout lineage the selected configuration determines
 #
 # The holdout results are not whatever happens to carry the holdout split; they are required to
-# be the ones this carrier determines. The match is not on the carrier's own training hash - a
-# genuine retrain never shares the validation model's training identity, which is the whole
-# point of a retrain - and it is not on family, configuration name and label either, because
+# be the ones the selected configuration determines. The match is not on its validation training
+# hash - a genuine retrain never shares the validation model's training identity, which is the
+# whole point of a retrain - and it is not on family, configuration name and label either, because
 # several training specifications carry the same three names. The holdout training identity is
 # derived here the way `17_holdout_predictions` derives it, and the query asks for that hash.
 
@@ -527,15 +554,15 @@ if len(_holdout_backtests) != 1:
     )
 holdout_backtest = Result.open(study, _holdout_backtests[0])
 
-# One complete backtest on the holdout prediction is not the same as the carrier's replay
+# One complete backtest on the holdout prediction is not the same as the selection's replay
 # having been the one that produced it, and comparing the `strategy` block alone does not
 # close the gap: commissions, slippage, account settings and the price identity all sit
 # outside that block, so a cost variant or a stale-price run registered against the same
-# prediction set would pass a strategy comparison and be reported as the carrier's holdout.
+# prediction set would pass a strategy comparison and be reported as the selection's holdout.
 #
 # The backtest hash covers every input that changes the result, by construction. So the
 # expected specification is rebuilt here exactly as `18_holdout_backtest` builds it - the
-# carrier's registered spec, the holdout prediction, the holdout price frame with the
+# selection's registered spec, the holdout prediction, the holdout price frame with the
 # strategy's declared warmup, and the digest of that frame - and the registered backtest is
 # required to BE that identity rather than to resemble it.
 _holdout_prices = load_backtest_prices_for(
@@ -671,10 +698,11 @@ performance_figure.show()
 # than assumed. They used to be a side effect of the holdout lock transaction; with that gone,
 # the notebook that reads them is the notebook that has to produce them.
 #
-# The carrier is passed in rather than left to the populator. Left to itself it ranks the
-# registry on raw Sharpe, which would be a second selector sitting beside `resolve_solvent_carrier`
-# and the cost sweep - and a raw ranking has no notion of a retired generation, so it would pair
-# the superseded conformal-v2 backtest and describe a carrier this case study does not report.
+# The selected configuration is passed in rather than left to the populator. Left to itself it
+# ranks the registry on raw Sharpe, which would be a second selector sitting beside
+# `resolve_solvent_carrier` and the cost sweep - and a raw ranking has no notion of a retired
+# generation, so it would pair the superseded conformal-v2 backtest and describe a configuration
+# this case study does not report.
 
 # %% tags=["results"]
 _periods_per_year = int(

@@ -64,7 +64,6 @@ import logging
 import multiprocessing
 import os
 import re
-import warnings
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -72,7 +71,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import polars as pl
 from hmmlearn.hmm import GaussianHMM
-from IPython.display import display
 from ml4t.diagnostic.evaluation.stats import benjamini_hochberg_fdr
 from ml4t.diagnostic.metrics import compute_ic_hac_stats, cross_sectional_ic_series
 from ml4t.diagnostic.splitters.calendar import TradingCalendar
@@ -96,7 +94,6 @@ from utils.cv_splits import generate_cv_splits, load_evaluation_config, select_f
 from utils.paths import get_case_study_dir
 from utils.style import COLORS, show_plotly_with_alt
 
-warnings.filterwarnings("ignore")
 logging.getLogger("hmmlearn.base").setLevel(logging.ERROR)
 
 # %% [markdown] tags=[]

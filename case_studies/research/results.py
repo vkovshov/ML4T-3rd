@@ -520,8 +520,18 @@ class PredictionResult(Result):
                 # alike and neither reports incomplete.
                 from case_studies.utils.artifact_digest import published_prediction_digest
 
+                # `pl.read_parquet` and not `self.load`: the recorded digest describes the
+                # frame the writer registered, and `load` widens a `Date` decision-time
+                # column so every family presents one dtype. `value_digest` separates
+                # `Date` from `Datetime`, so verifying through `load` compares the
+                # normalized frame against a digest taken before normalization and reports
+                # every artifact those three families wrote as not matching.
                 if (
-                    _verified_digest(prediction_file, self.load, published_prediction_digest)
+                    _verified_digest(
+                        prediction_file,
+                        partial(pl.read_parquet, prediction_file),
+                        published_prediction_digest,
+                    )
                     != recorded_digest
                 ):
                     return f"{prediction_file} does not match its recorded digest"
@@ -544,10 +554,24 @@ class PredictionResult(Result):
         return None
 
     def load(self):
+        """Read this prediction set's artifact, with one decision-time dtype for every family.
+
+        The parquet is returned as written except for the timestamp column, which arrives on
+        `Date` from gbm, linear and tabular_dl and on `Datetime(us, 'UTC')` from deep_learning
+        and latent_factors - same decision times, every aware value at midnight, and a join on
+        (timestamp, symbol) across the two returns nothing. `_timestamps_as_utc` widens to the
+        aware form here rather than narrowing, because narrowing would silently discard the
+        time of day in an intraday case study. Read-only: widening moves `value_digest`, so the
+        artifact and every registered digest over it stay as they are, and
+        `normalize_prediction_columns` produces the identical engine frame either way (verified
+        on a 7.1M-row gbm artifact, 2026-09-14).
+        """
         import polars as pl
 
+        from case_studies.utils.registry.store import _timestamps_as_utc
+
         path = self.root / "run_log" / "predictions" / self.hash / "predictions.parquet"
-        return pl.read_parquet(path)
+        return _timestamps_as_utc(pl.read_parquet(path), widen_dates=True)
 
     def folds(self):
         """Return the per-fold metrics registered for this prediction set.
@@ -688,7 +712,24 @@ class ResultsCatalog:
             # A table column, not part of `resolved`, so recording it moves no training hash.
             # `spec_json.provenance.entry_point` is a different field naming the runner module
             # (`case_studies.utils.linear`); this one names the notebook.
-            entry_point=self.study.entry_point,
+            #
+            # Falls back to the request's own `notebook_path` when the Study was not told. Those
+            # are the same fact declared in two places - `open_study(entry_point=...)` sets the
+            # column, `build_requests(notebook=...)` sets the provenance field - and a notebook
+            # that declares one and not the other is the common state rather than the exception:
+            # measured 2026-09-12 over the 53 notebooks calling `run_model_population`, 20 declare
+            # `entry_point`, 13 declare only `notebook`, and 20 declare neither. Without this the
+            # 13 register a NULL column while carrying the answer in the row they are writing.
+            # The column is NULL on 785 of the 1160 training rows across the nine production
+            # registries; only nasdaq100_microstructure and sp500_equity_option_analytics, whose
+            # notebooks all declare `entry_point`, are clean.
+            #
+            # The direction is fixed by the decision recorded in `tests/test_model_registry.py`
+            # (2026-08-25): the COLUMN is the half that survives when the migration finishes, and
+            # `json_extract(runtime_json, '$.notebook_path')` is the half that goes. So provenance
+            # fills the column, never the reverse. An explicit `entry_point` still wins, because a
+            # Study told which notebook it serves was told deliberately.
+            entry_point=self.study.entry_point or (runtime_provenance or {}).get("notebook_path"),
             runtime_provenance=runtime_provenance,
             # Defaulted here rather than at every call site: a caller that forgets it should
             # still leave a legible row, and "when the identity was registered" is within
