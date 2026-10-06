@@ -695,8 +695,8 @@ performance_figure.show()
 # ### Register the cohort and paired evidence this section reads
 #
 # The bootstrapped comparisons and the effective-rank cohort statistics are computed here rather
-# than assumed. They used to be a side effect of the holdout lock transaction; with that gone,
-# the notebook that reads them is the notebook that has to produce them.
+# than assumed: the notebook that reads them is the notebook that has to produce them, so there is
+# nothing to populate elsewhere first.
 #
 # The selected configuration is passed in rather than left to the populator. Left to itself it
 # ranks the registry on raw Sharpe, which would be a second selector sitting beside
@@ -721,7 +721,7 @@ with warnings.catch_warnings(record=True) as _cohort_warnings:
 _undefined = Counter(str(entry.message).split(" for ")[0] for entry in _cohort_warnings)
 # The cohort call above is scoped to `ADMITTED_PREDICTIONS` and this one is not: the pairs
 # are selected from every registered prediction set. Stated rather than defaulted;
-# narrowing it changes published numbers and is ml4t/agent-workspace#1006.
+# narrowing it would change published numbers, so it is a separate decision from this line.
 _paired_rows = populate_paired_metrics(
     CASE_STUDY_ID,
     periods_per_year=_periods_per_year,

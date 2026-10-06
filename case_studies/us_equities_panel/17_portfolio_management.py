@@ -103,6 +103,7 @@ from case_studies.utils.sweep_config import (
     get_allocators,
     get_checkpoints_per_config,
     get_top_n_predictions,
+    top_n_cap,
 )
 from utils.style import add_message_title, ml4t_palette, show_with_alt, zero_line
 
@@ -115,11 +116,19 @@ EXECUTION_TIER = "canonical"
 POPULATION_NAME = ""
 SUPERSEDES_POPULATION = ""
 SUPERSEDES_SETS: dict = {}
-WORKSPACE = "experiments"
+# Empty means this run writes to the case study's own store, which is what canonical
+# production execution wants. Any other value routes the run's writes there instead, at
+# either tier, and is how a rehearsal at full scale is compared against the published
+# result without being able to damage it.
+WORKSPACE = ""
 PREVIEW_LABELS = []
 PREVIEW_MAX_BASELINE_ROWS = 0
 PREVIEW_MAX_ALLOCATORS = 0
 MAX_SYMBOLS = 0
+# None means the width `setup.yaml` declares; an int overrides it. Declared here because
+# papermill only binds a name the parameters cell already holds - a run that passes
+# TOP_N_PREDICTIONS to a notebook without it sweeps the declared width and exits 0.
+TOP_N_PREDICTIONS = None
 
 # %% [markdown]
 # ## 2. The baseline this notebook varies
@@ -133,12 +142,17 @@ MAX_SYMBOLS = 0
 # publish over it.
 
 # %%
+workspace_override = os.environ.get("ML4T_OUTPUT_DIR") or WORKSPACE
 if EXECUTION_TIER == "canonical":
     if PREVIEW_LABELS or PREVIEW_MAX_BASELINE_ROWS or PREVIEW_MAX_ALLOCATORS or MAX_SYMBOLS:
         raise ValueError("Canonical execution cannot declare preview reductions")
     if not BASELINE_SET_NAMES or len(BASELINE_SET_NAMES) != len(set(BASELINE_SET_NAMES)):
         raise ValueError("Canonical execution requires unique named baseline sets")
-    study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER)
+    study = open_study(
+        CASE_STUDY_ID,
+        execution_tier=EXECUTION_TIER,
+        workspace=Path(workspace_override) if workspace_override else None,
+    )
 elif EXECUTION_TIER == "preview":
     if (
         not PREVIEW_LABELS
@@ -152,7 +166,7 @@ elif EXECUTION_TIER == "preview":
     study = open_study(
         CASE_STUDY_ID,
         execution_tier=EXECUTION_TIER,
-        workspace=Path(os.environ.get("ML4T_OUTPUT_DIR") or WORKSPACE),
+        workspace=Path(workspace_override or "experiments"),
     )
 else:
     raise ValueError(f"Unsupported execution tier: {EXECUTION_TIER!r}")
@@ -241,7 +255,10 @@ excluded.select("label", "family", "config_name", "prediction_hash", "sharpe", "
 # below is evidence against one existing.
 
 # %% tags=["results"]
-top_n = get_top_n_predictions(CASE_STUDY_ID, "allocation")
+if TOP_N_PREDICTIONS is None:
+    TOP_N_PREDICTIONS = get_top_n_predictions(CASE_STUDY_ID, "allocation")
+top_n = TOP_N_PREDICTIONS
+label_cap = top_n_cap(top_n)
 checkpoints_per_config = get_checkpoints_per_config(CASE_STUDY_ID)
 if checkpoints_per_config != 1:
     raise ValueError(
@@ -254,13 +271,18 @@ for label in baseline.get_column("label").unique().sort().to_list():
     ranked = baseline.filter(pl.col("label") == label).sort(
         "sharpe", "backtest_hash", descending=[True, False]
     )
-    shortlist_parts.append(
-        ranked.unique(
-            subset=["family", "config_name"],
-            keep="first",
-            maintain_order=True,
-        ).head(top_n)
+    per_label = ranked.unique(
+        subset=["family", "config_name"],
+        keep="first",
+        maintain_order=True,
     )
+    # `top_n` of 0 asks for every configuration, as `top_n_predictions.signal` does in this
+    # setup.yaml. Passed straight to `.head` it means the opposite, and the empty shortlist
+    # then failed below as "the equal-weight baseline produced no allocation survivors",
+    # blaming the baseline for a width the caller declared.
+    if label_cap is not None:
+        per_label = per_label.head(label_cap)
+    shortlist_parts.append(per_label)
 shortlist = pl.concat(shortlist_parts).sort("label", "sharpe", descending=[False, True])
 if shortlist.is_empty():
     raise RuntimeError("The equal-weight baseline produced no allocation survivors")

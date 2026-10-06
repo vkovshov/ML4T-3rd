@@ -270,12 +270,12 @@ print(
 # %% [markdown]
 # ### The paired rows this notebook reads, built here rather than assumed
 #
-# §6 reads two `backtest_paired_metrics` kinds keyed on the holdout backtest, and it used to
-# load rows that only `20_strategy_synthesis/01_aggregate_synthesis.py` ever wrote. On a
-# registry that has been reset, or one whose configuration moved, those rows are absent or belong to
-# a holdout hash that no longer exists, and the notebook stopped on a message telling the
-# reader to populate the case elsewhere. A case study's own pipeline has to be able to produce
-# everything its own notebooks report.
+# §6 reads two `backtest_paired_metrics` kinds keyed on the holdout backtest. Loading rows that
+# only `20_strategy_synthesis/01_aggregate_synthesis.py` writes would not do: on a registry that
+# has been reset, or one whose configuration moved, those rows are absent or belong to a holdout
+# hash that no longer exists, and the notebook would stop on a message telling the reader to
+# populate the case elsewhere. A case study's own pipeline has to be able to produce everything
+# its own notebooks report.
 #
 # `populate_paired_metrics` is the same producer Chapter 20 calls, and it is given the same
 # selection this notebook made: the configuration from the lineage resolver, and the rung
@@ -319,7 +319,7 @@ _paired_rows = populate_paired_metrics(
     # The cohort call above is scoped to `_CANDIDATE_PREDICTIONS` and this one is not:
     # the pairs are selected from every registered prediction set. That disagreement
     # was there before the scope had to be stated; narrowing it changes published
-    # numbers and is ml4t/agent-workspace#1006, not this line.
+    # numbers, so it is a separate decision from this line.
     prediction_hashes=ENTIRE_REGISTRY,
     periods_per_year=PERIODS_PER_YEAR,
     replace_all=True,

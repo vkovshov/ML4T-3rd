@@ -30,14 +30,11 @@ from case_studies.utils.notebook_contracts import (
     filter_active_model_rows,
     full_coverage_prediction_sql,
 )
+from case_studies.utils.sweep_config import top_n_cap
 from case_studies.utils.uncertainty import STAGE_SEQUENCE, cohort_member_digest
 
 # Sentinel distinguishing "no filter" from "match exit_at_max_days IS NULL".
 _UNSET = object()
-
-# `best` bounds its read with a SQL LIMIT, so counting a whole cohort means asking for
-# more rows than any cohort holds rather than for no limit at all.
-_UNBOUNDED_COHORT = 1_000_000
 
 # Canonical schema for BacktestExplorer.best() output. Used to construct
 # schema-stable empty DataFrames so downstream `.select("source", ...)`
@@ -59,7 +56,7 @@ _BEST_SCHEMA: dict[str, pl.DataType] = {
     "signal_method": pl.Utf8,
     # The entry-scheme sweep varies concentration and nothing else, so without
     # this the ten-row top table reads as one strategy repeated at different
-    # Sharpes (ml4t/agent-workspace#910).
+    # Sharpes.
     "top_k": pl.Int64,
     "universe_filter": pl.Utf8,
     "exit_at_max_days": pl.Int64,
@@ -93,7 +90,7 @@ def _drop_rows_a_reader_cannot_tell_apart(df: pl.DataFrame) -> pl.DataFrame:
 
     ``best`` ranks over every generation in the registry, so both rows compete and a
     ten-row table can show five configurations. This is the same defect
-    ``signal_method`` alone had (ml4t/agent-workspace#910), one level down: there the
+    ``signal_method`` alone had, one level down: there the
     displayed columns could not separate rows that genuinely differed, here the rows
     do not differ at all.
 
@@ -116,7 +113,7 @@ def _drop_rows_a_reader_cannot_tell_apart(df: pl.DataFrame) -> pl.DataFrame:
 # SchemaError instead of returning an empty result. A notebook whose registry holds no rows
 # for the stage it asks about would then fail on the dtype, several cells after the fact,
 # reporting a schema problem for what is actually an empty sweep
-# (ml4t/agent-workspace#1075).
+# .
 _SPEC_SCHEMA: dict[str, pl.DataType] = {
     "backtest_hash": pl.Utf8,
     "stage": pl.Utf8,
@@ -376,6 +373,11 @@ class BacktestExplorer:
     ) -> pl.DataFrame:
         """Top-N backtests at a given stage, ranked by ``metric``.
 
+        ``top_n=0`` returns every matching backtest, the reading
+        ``sweep_config.top_n_cap`` gives the number everywhere else. Counting a whole
+        cohort used to mean asking for more rows than any cohort could hold, through a
+        ``_UNBOUNDED_COHORT`` sentinel of a million, because 0 truncated to nothing.
+
         Returns
         -------
         pl.DataFrame
@@ -385,6 +387,7 @@ class BacktestExplorer:
             cagr, max_drawdown, total_return, volatility, ic_mean,
             ic_mean_daily, ic_ci_lo, ic_ci_hi, ic_n_days
         """
+        cap = top_n_cap(top_n)
         filter_sql = ""
         filter_params: list[str] = []
         coverage_params: list[str] = []
@@ -483,7 +486,7 @@ class BacktestExplorer:
         # Every entry scheme in a baseline sweep is `equal_weight_top_k` and varies
         # only `top_k`, so `signal_method` alone made nine of the ten rows read as
         # the same strategy. `top_k` sits one key across from `method` in the spec
-        # this block already parses (ml4t/agent-workspace#910).
+        # this block already parses.
         top_k = [strategy_view(sp).get("signal", {}).get("top_k") for sp in parsed]
         df = df.with_columns(
             pl.Series("signal_method", methods),
@@ -492,7 +495,7 @@ class BacktestExplorer:
             pl.Series("exit_at_max_days", exit_at_max_days, dtype=pl.Int64),
         )
 
-        return _drop_rows_a_reader_cannot_tell_apart(
+        ranked = _drop_rows_a_reader_cannot_tell_apart(
             df.select(
                 "backtest_hash",
                 "prediction_hash",
@@ -517,7 +520,8 @@ class BacktestExplorer:
                 "ic_ci_hi",
                 "ic_n_days",
             )
-        ).head(top_n)
+        )
+        return ranked if cap is None else ranked.head(cap)
 
     # -----------------------------------------------------------------
     # compare_families: model family comparison at a stage
@@ -710,7 +714,7 @@ class BacktestExplorer:
             return pl.DataFrame()
         placeholders = ", ".join("?" for _ in stages)
         # A run the engine stopped at ruin carries a null Sharpe by design
-        # (ml4t/agent-workspace#920). Dropping those in SQL, as this query used to,
+        # . Dropping those in SQL, as this query used to,
         # would take an allocator that went bankrupt in every run off the table
         # entirely and report the survivors as the whole population. The rows are
         # kept and counted under `ruined`; the Sharpe and drawdown statistics are
@@ -1045,9 +1049,7 @@ class BacktestExplorer:
         scoped_k: dict[tuple[str, str], int] = {}
         scoped_digest: dict[tuple[str, str], str] = {}
         if prediction_hashes:
-            cohort = self.best(
-                stage=stage, top_n=_UNBOUNDED_COHORT, prediction_hashes=prediction_hashes
-            )
+            cohort = self.best(stage=stage, top_n=0, prediction_hashes=prediction_hashes)
             if not cohort.is_empty():
                 grouped = cohort.group_by("family", "label").agg(
                     n=pl.len(), members=pl.col("backtest_hash")
@@ -1384,8 +1386,8 @@ class BacktestExplorer:
                     "num_trades": trades,
                     # How many times the control acted. 0 is an overlay that was
                     # installed and never fired; NULL is a run the engine did not
-                    # count, which is every row registered before
-                    # ml4t/agent-workspace#1051. Matching Sharpe and trade counts
+                    # count, which is every row registered before the trigger log
+                    # existed. Matching Sharpe and trade counts
                     # never established either one on their own.
                     "risk_triggers": triggers,
                     "prediction_hash": pred_h,
@@ -1874,11 +1876,11 @@ class BacktestExplorer:
             hold signal rows and nothing at the allocation stage.
 
             The default is kept rather than removed only because removing it
-            edits a rendered notebook that cannot currently be re-run: see
-            ml4t/agent-workspace#1184. Every call site in the repository names
+            edits a rendered notebook that cannot currently be re-run.
+            Every call site in the repository names
             its stage; the default is now reachable only by a new caller who has
             not read this.
-            (ml4t/agent-workspace#910, ml4t/agent-workspace#1184).
+            the same defect twice over.
 
         Returns
         -------

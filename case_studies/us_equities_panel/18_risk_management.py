@@ -114,10 +114,20 @@ EXECUTION_TIER = "canonical"
 POPULATION_NAME = ""
 SUPERSEDES_POPULATION = ""
 SUPERSEDES_SETS: dict = {}
-WORKSPACE = "experiments"
+# Empty means this run writes to the case study's own store, which is what canonical
+# production execution wants. Any other value routes the run's writes there instead, at
+# either tier, and is how a rehearsal at full scale is compared against the published
+# result without being able to damage it.
+WORKSPACE = ""
 PREVIEW_LABELS = []
 PREVIEW_MAX_SOURCE_ROWS = 0
 PREVIEW_MAX_RISK_CONTROLS = 0
+# How many parents per label the overlay grid sits on. `None` reads
+# `backtest.sweep.top_n_predictions.risk_overlay`, which this case study declares as 1. The
+# declaration was read unconditionally until 2026-09-20 and no parameter was bound, so a
+# launcher could not move the width and only an edit to the private config copy reached it,
+# which is the shape the four notebooks that do bind it were built to avoid.
+TOP_N_COMBOS = None
 MAX_SYMBOLS = 0
 
 # %% [markdown]
@@ -132,12 +142,17 @@ declared_set_names = [*BASELINE_SET_NAMES, *ALLOCATION_SET_NAMES]
 # Both tiers resolve the study through `open_study`. It reads the labels and features in place and
 # redirects only writes, so a preview run scores the same inputs a canonical one does and cannot
 # publish over it.
+workspace_override = os.environ.get("ML4T_OUTPUT_DIR") or WORKSPACE
 if EXECUTION_TIER == "canonical":
     if PREVIEW_LABELS or PREVIEW_MAX_SOURCE_ROWS or PREVIEW_MAX_RISK_CONTROLS or MAX_SYMBOLS:
         raise ValueError("Canonical execution cannot declare preview reductions")
     if not declared_set_names or len(declared_set_names) != len(set(declared_set_names)):
         raise ValueError("Canonical execution requires unique named strategy sets")
-    study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER)
+    study = open_study(
+        CASE_STUDY_ID,
+        execution_tier=EXECUTION_TIER,
+        workspace=Path(workspace_override) if workspace_override else None,
+    )
 elif EXECUTION_TIER == "preview":
     if (
         not PREVIEW_LABELS
@@ -151,7 +166,7 @@ elif EXECUTION_TIER == "preview":
     study = open_study(
         CASE_STUDY_ID,
         execution_tier=EXECUTION_TIER,
-        workspace=Path(os.environ.get("ML4T_OUTPUT_DIR") or WORKSPACE),
+        workspace=Path(workspace_override or "experiments"),
     )
 else:
     raise ValueError(f"Unsupported execution tier: {EXECUTION_TIER!r}")
@@ -232,7 +247,13 @@ def prices_for(label, warmup_periods):
     return _price_cache[key]
 
 
-top_n = get_top_n_predictions(CASE_STUDY_ID, "risk_overlay")
+top_n = (
+    TOP_N_COMBOS
+    if TOP_N_COMBOS is not None
+    else get_top_n_predictions(CASE_STUDY_ID, "risk_overlay")
+)
+if top_n < 1:
+    raise ValueError("the risk overlay needs at least one parent per label")
 selected_parts = []
 for label in eligible.get_column("label").unique().sort().to_list():
     selected_parts.append(

@@ -189,8 +189,8 @@ CREATE TABLE IF NOT EXISTS causal_runs (
     refutation_p     REAL,
     refutation_n_successful INTEGER,
     refutation_placebo_json TEXT,
-    -- The placebo t-statistics behind refutation_p, which since
-    -- ml4t/agent-workspace#1120 is the statistic the test is computed on. The thetas
+    -- The placebo t-statistics behind refutation_p, which is the statistic the
+    -- test is computed on since the correction. The thetas
     -- above stay because they are still what a reader wants to see on the effect scale,
     -- but a figure drawn from them no longer shows the distribution the p-value came
     -- from: permuting the treatment inflates var(T_res) and shrinks every placebo theta
@@ -314,12 +314,35 @@ CREATE INDEX IF NOT EXISTS idx_cohort_leader ON cohort_metrics(leader_hash);
 -- Recording the measurement makes them one object rather than two implementations that agree
 -- by inspection. Only members a sweep actually measured appear here; a member nothing has
 -- measured is absent, which is not the same as admitted and is what the readers treat it as.
+--
+-- The counts are stored beside the verdict because nothing else in the registry holds the
+-- declared denominator. `prediction_coverage.n_expected` is built by the model family's own
+-- adapter from its own prepared fold inputs, so it says the model produced what it set out to
+-- produce and cannot say how much of the declared universe that was. Measured on
+-- sp500_equity_option_analytics: all 140 predictions this table rules `admitted = 0` carry a
+-- `prediction_coverage` row reading `status = 'complete'` and `n_missing = 0`, whose
+-- `n_expected` values (125,119 / 126,458 / 126,478) are exactly the narrowed numerators here
+-- against `n_declared` of 246,641 / 248,460 / 249,373. Both are true of the same predictions,
+-- and only one of them answers "did this cover the cross-section its peers ranked".
+-- The five counts, in the order they narrow: `n_declared` is the (entity, session) pairs the
+-- label declares for the split; `n_delivered` is how many of those this prediction set
+-- carries; `n_offered` is how many of `n_declared` the input feature panel reached, so a
+-- family is charged for what it lost rather than for what it was never given, and is NULL
+-- when no panel was supplied; `n_delivered_offered` is how many of `n_offered` the set
+-- carries, and that over `n_offered` is the ratio the admissibility threshold applies to.
+-- `n_entities_declared` is the width of the declared cross-section. All five are NULL on a
+-- member no sweep has measured, because zero of zero is a measurement and absence is not.
 CREATE TABLE IF NOT EXISTS prediction_admissibility (
-    prediction_hash TEXT PRIMARY KEY,
-    admitted        INTEGER NOT NULL,
-    reason          TEXT,
-    recorded_at     TEXT NOT NULL,
-    git_commit      TEXT
+    prediction_hash      TEXT PRIMARY KEY,
+    admitted             INTEGER NOT NULL,
+    reason               TEXT,
+    recorded_at          TEXT NOT NULL,
+    git_commit           TEXT,
+    n_declared           INTEGER,
+    n_delivered          INTEGER,
+    n_offered            INTEGER,
+    n_delivered_offered  INTEGER,
+    n_entities_declared  INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_prediction_admissibility_admitted
@@ -425,7 +448,7 @@ CREATE TABLE IF NOT EXISTS decision_artifacts (
 -- One declared edge per superseded input artifact: "the file registered runs pin as
 -- `supersedes_sha256` was deliberately replaced by `sha256`". A training run fits on
 -- whatever is on disk, so without a declaration a regenerated artifact silently mixes two
--- vintages into one population (ml4t/agent-workspace#987). `register_training_run` refuses
+-- vintages into one population. `register_training_run` refuses
 -- an undeclared change and `declare_artifact_supersession` is how an author declares one.
 CREATE TABLE IF NOT EXISTS artifact_supersessions (
     artifact_name      TEXT NOT NULL,
@@ -689,11 +712,11 @@ _BACKTEST_UNCERTAINTY_COLUMNS = (
 )
 
 # Written on every run by `compute_portfolio_metrics`: whether the path lost its
-# capital, and the index of the period where it did (ml4t/agent-workspace#920).
+# capital, and the index of the period where it did.
 _BACKTEST_RUIN_COLUMNS = ("ruin", "ruin_period")
 
 # Written on every run by `RiskTriggerLog.as_metrics`: how often each declared risk
-# control acted, NULL where none of that kind was declared (ml4t/agent-workspace#1051).
+# control acted, NULL where none of that kind was declared.
 _BACKTEST_RISK_TRIGGER_COLUMNS = (
     "risk_triggers",
     "risk_triggers_stop_loss",
@@ -877,6 +900,21 @@ def _migrate_registry(db: sqlite3.Connection) -> None:
         if "artifact_digest" not in coverage_cols:
             db.execute("ALTER TABLE prediction_coverage ADD COLUMN artifact_digest TEXT")
 
+    if "prediction_admissibility" in tables:
+        admissibility_columns = {
+            "n_declared": "INTEGER",
+            "n_delivered": "INTEGER",
+            "n_offered": "INTEGER",
+            "n_delivered_offered": "INTEGER",
+            "n_entities_declared": "INTEGER",
+        }
+        existing_admissibility = {
+            row[1] for row in db.execute("PRAGMA table_info(prediction_admissibility)").fetchall()
+        }
+        for column, sql_type in admissibility_columns.items():
+            if column not in existing_admissibility:
+                db.execute(f"ALTER TABLE prediction_admissibility ADD COLUMN {column} {sql_type}")
+
     # Migration 2b: add runtime columns to backtest_runs
     if "backtest_runs" in tables:
         backtest_columns = {
@@ -946,8 +984,8 @@ def _migrate_registry(db: sqlite3.Connection) -> None:
     ):
         db.execute("ALTER TABLE causal_runs ADD COLUMN refutation_placebo_json TEXT")
 
-    # The placebo t-statistics, which since ml4t/agent-workspace#1120 are what
-    # refutation_p is computed on. Additive and outside the causal computation
+    # The placebo t-statistics, which are what refutation_p is computed on
+    # since the correction. Additive and outside the causal computation
     # specification, so it moves no causal hash. A row written before this column existed
     # carries NULL, which is the truthful answer: that run's p-value was computed on raw
     # thetas and the draws behind it are not recoverable on the t scale.

@@ -151,6 +151,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -1150,7 +1151,20 @@ def stamp_notebook(
     py = paired_py(nb_path)
     if py is None:
         raise SystemExit(f"no paired .py for {display_path(nb_path)} — cannot stamp")
-    nb = json.loads(nb_path.read_text(encoding="utf-8"))
+    # Strip before anything reads the outputs, so the digest below describes the file
+    # as it will be committed. A fresh run writes the Plotly payload back every time,
+    # and doing this here is what keeps that from becoming an ordering trap: stamp
+    # then strip leaves a digest computed over outputs that no longer exist, and the
+    # gate reports OUTPUTS CHANGED on a notebook whose numbers never moved. Lossless
+    # and bounded - it removes only a payload duplicated by a static image, touches no
+    # source, no execution count and no other mime type, and skips any output where
+    # the payload is the figure's only copy. See strip_plotly_json.py.
+    raw = nb_path.read_text(encoding="utf-8")
+    stripped_raw, stripped_count, _ = _plotly_rewrite_counted(raw)
+    if stripped_count:
+        nb_path.write_text(stripped_raw, encoding="utf-8")
+        raw = stripped_raw
+    nb = json.loads(raw)
     conflict = contradicts_injected_cell(nb, parameters)
     if conflict:
         raise SystemExit(f"refusing to stamp {display_path(nb_path)}: {conflict}")
@@ -1949,6 +1963,103 @@ def sync_imports(nb_path: Path) -> str:
     return stamp["source_py_blob"]
 
 
+def sync_inert(nb_path: Path, reason: str) -> str:
+    """Fold a code edit that cannot change what the executed run computed, without re-running.
+
+    The last resort of the ``sync-*`` family, and the only one that is not decidable from
+    the source alone. ``sync-prose``, ``sync-alt``, ``sync-paths`` and ``sync-imports`` each
+    recognise their edit mechanically and refuse anything else. Some inert edits are not
+    recognisable that way: removing a conjunct from a guard that the executed run's own
+    parameters already made true, or threading an argument that does not enter any stored
+    identity. Rule 6 says such a fix does not owe a re-run, and for a notebook whose case
+    study froze its populations a re-run is not merely expensive - the freeze refuses it, so
+    the alternatives are shipping the notebook with no outputs or not fixing it at all.
+
+    What is checked mechanically is everything except the claim itself. The outputs on disk
+    must still be byte-for-byte the ones the recorded run produced, so no edited, re-rendered
+    or hand-written output can enter under this command; the ``.py`` must actually have moved;
+    and the ``.ipynb`` source is rebuilt from the ``.py`` so the pair cannot disagree.
+
+    What is not checked is why the edit is inert, which is why ``reason`` is required and is
+    written into the stamp. ``executed_at``, ``executor``, ``parameters`` and
+    ``outputs_digest`` are kept: the outputs are still that run's, and a fabricated execution
+    time would be the one part of the record nobody could later correct.
+    """
+    py = paired_py(nb_path)
+    rel = nb_path.relative_to(REPO_ROOT)
+    if py is None:
+        raise SystemExit(f"no paired .py for {rel}")
+    if len(reason.split()) < 5:
+        raise SystemExit(
+            f"{rel}: --reason must say why the edit cannot change what the run computed. "
+            "It is the only record of an assertion this command cannot check."
+        )
+    nb = json.loads(nb_path.read_text(encoding="utf-8"))
+    stamp = nb.get("metadata", {}).get(STAMP_KEY)
+    if not stamp:
+        raise SystemExit(
+            f"{rel} carries no provenance stamp, so there is no executed state to preserve. Run it."
+        )
+    recorded = stamp.get("outputs_digest")
+    if recorded is None:
+        raise SystemExit(
+            f"{rel}: the stamp records no outputs_digest, so nothing pins its outputs."
+        )
+    if recorded != outputs_digest(nb):
+        raise SystemExit(
+            f"{rel}: the outputs on disk are not the ones the stamp records, so this is not an "
+            "edit that left the run's results alone. Re-run the notebook, or use the sync-* "
+            "command that matches what actually changed."
+        )
+    stamped_blob = stamp["source_py_blob"]
+    if stamped_blob == git_blob(py):
+        raise SystemExit(
+            f"{rel}: the .py has not moved since the stamp, so there is nothing to fold in."
+        )
+
+    before_counts = _output_counts(nb)
+    result = subprocess.run(
+        [sys.executable, "-m", "jupytext", "--to", "ipynb", "--update", str(py)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        if "No module named jupytext" in result.stderr:
+            raise SystemExit(
+                f"{rel}: jupytext is not installed in {sys.executable}. Run this command through "
+                "the repository environment with `uv run python`."
+            )
+        raise SystemExit(f"{rel}: jupytext --update failed:\n{result.stderr}")
+
+    nb = json.loads(nb_path.read_text(encoding="utf-8"))
+    if _output_counts(nb) != before_counts:
+        raise SystemExit(
+            f"{rel}: the update changed the outputs, which is the one thing it exists to avoid. "
+            "The file has been left as jupytext wrote it; restore it with `git checkout`."
+        )
+    if outputs_digest(nb) != recorded:
+        raise SystemExit(
+            f"{rel}: the update changed outputs_digest, so the .py and the executed notebook "
+            "disagree about more than the source. Restore it with `git checkout`."
+        )
+
+    stamp = dict(stamp)
+    previous_library = stamp.get("library_digest")
+    stamp["source_py_blob"] = git_blob(py, write=True)
+    stamp["library_digest"] = library_digest(py)
+    stamp["inert_edit"] = {
+        "reason": reason,
+        "folded_at": datetime.now(UTC).isoformat(),
+        "previous_source_py_blob": stamped_blob,
+        "previous_library_digest": previous_library,
+    }
+    nb.setdefault("metadata", {})[STAMP_KEY] = stamp
+    nb_path.write_text(json.dumps(nb, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    return stamp["source_py_blob"]
+
+
 def sync_paths(nb_path: Path) -> str:
     """Re-stamp a notebook whose only change is the path sanitizer's rewrite.
 
@@ -1970,9 +2081,76 @@ def sync_paths(nb_path: Path) -> str:
     The stamp keeps its `source_py_blob`, `executed_at` and `executor`, because the `.py`
     did not change and the outputs are still the ones that run produced.
     """
-    rel = nb_path.relative_to(REPO_ROOT)
+    return _fold_output_rewrite(
+        nb_path,
+        rewrite=_sanitize_rewrite,
+        what="paths sanitized",
+        note="machine-specific paths sanitized out of the outputs",
+    )
+
+
+def _sanitize_rewrite(raw: str) -> str:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from sanitize_notebook_paths import sanitize_notebook
+
+    return sanitize_notebook(raw)[0]
+
+
+def _plotly_rewrite(raw: str) -> str:
+    return _plotly_rewrite_counted(raw)[0]
+
+
+def _plotly_rewrite_counted(raw: str) -> tuple[str, int, int]:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from strip_plotly_json import strip_plotly
+
+    return strip_plotly(raw)
+
+
+def sync_plotly(nb_path: Path) -> str:
+    """Re-stamp a notebook whose only change is the Plotly JSON strip.
+
+    `strip_plotly_json.py` removes the embedded `application/vnd.plotly.v1+json`
+    payload from outputs that already carry a static `image/png` of the same figure.
+    That payload is hashed by `outputs_digest`, so the strip reads as stale.
+
+    A re-run is the wrong answer for the same reason it is wrong after a path
+    sanitize: re-executing writes the Plotly JSON straight back, so the gate would be
+    demanding the one action that undoes the fix. Nothing a reader sees moves - the
+    PNG the strip relies on is the figure every static reader was already shown, and
+    the stripper refuses to touch an output that has no PNG.
+
+    Decidable rather than trusted, exactly as `sync_paths` is: the committed notebook
+    is re-stripped and the result must equal the file on disk byte for byte.
+    """
+    return _fold_output_rewrite(
+        nb_path,
+        rewrite=_plotly_rewrite,
+        what="Plotly JSON stripped",
+        note="embedded Plotly figure JSON stripped from outputs carrying a static image",
+    )
+
+
+def _fold_output_rewrite(
+    nb_path: Path,
+    *,
+    rewrite: Callable[[str], str],
+    what: str,
+    note: str,
+) -> str:
+    """Fold a mechanical, re-derivable rewrite of a notebook's outputs into its stamp.
+
+    Shared by `sync_paths` and `sync_plotly`, which differ only in the rewrite and the
+    wording. Both are edits that re-executing cannot produce and would in fact reverse,
+    so the stamp keeps its `source_py_blob`, `executed_at` and `executor` and only
+    `outputs_digest` moves.
+
+    Nothing here takes the author's word for what changed. It re-applies *rewrite* to
+    the notebook as committed at HEAD and requires the result to equal the working copy
+    exactly; a moved number, an edited cell or a regenerated figure fails that and is
+    refused, because this cannot tell one from the other.
+    """
+    rel = nb_path.relative_to(REPO_ROOT)
 
     nb = json.loads(nb_path.read_text(encoding="utf-8"))
     stamp = nb.get("metadata", {}).get(STAMP_KEY)
@@ -1997,36 +2175,52 @@ def sync_paths(nb_path: Path) -> str:
     if committed.returncode != 0:
         raise SystemExit(
             f"{rel} is not committed at HEAD, so there is nothing to compare the rewrite "
-            "against. This command folds in a sanitize of an already-committed notebook."
+            "against. This command folds in a rewrite of an already-committed notebook."
         )
 
     old = json.loads(committed.stdout)
     old_stamp = old.get("metadata", {}).get(STAMP_KEY) or {}
+
+    # A stamp written before `outputs_digest` existed has nothing pinning its outputs,
+    # which the gate states explicitly: it counts such a notebook rather than failing
+    # it. There is therefore nothing for this rewrite to invalidate and nothing to
+    # re-stamp. Writing a digest here would assert that these outputs are the ones that
+    # run produced, which is the one claim the absent field means nobody can make.
+    #
+    # Without this branch the comparison below reads `<digest> != None` and refuses the
+    # notebook as "stale before this rewrite", which is false - it is undated, not
+    # stale. Six notebooks in `18_transaction_costs` and `19_risk_management` are in
+    # this state, and `sync_paths` has been refusing them the same way.
+    # This runs before any stamp comparison, and must: it is the only check that says
+    # the working copy is the rewrite and nothing besides, and every branch below needs
+    # that to be true - including the one that writes no stamp at all.
+    if json.loads(rewrite(committed.stdout)) != nb:
+        raise SystemExit(
+            f"{rel}: the file on disk is not the committed notebook with {what}, so something "
+            "else changed too. Refusing - this command cannot tell a moved number from a "
+            "mechanical rewrite, so it insists the two agree exactly."
+        )
+
+    if old_stamp.get("outputs_digest") is None:
+        return ""
+
     if old_stamp.get("outputs_digest") != stamp.get("outputs_digest"):
         raise SystemExit(
             f"{rel}: the stamp on disk is not the one at HEAD, so this working copy carries "
-            "more than a sanitize. Refusing rather than stamping over it."
+            "more than the rewrite. Refusing rather than stamping over it."
         )
     if outputs_digest(old) != old_stamp.get("outputs_digest"):
         raise SystemExit(
             f"{rel}: the committed notebook's outputs already disagree with its own stamp, so "
-            "it was stale before this rewrite. That is a re-run, not a sanitize."
-        )
-
-    expected_raw, _replaced, _skipped = sanitize_notebook(committed.stdout)
-    if json.loads(expected_raw) != nb:
-        raise SystemExit(
-            f"{rel}: the file on disk is not the committed notebook with its paths sanitized, "
-            "so something else changed too. Refusing - this command cannot tell a moved number "
-            "from a moved path, so it insists the two agree exactly."
+            "it was stale before this rewrite. That is a re-run, not a mechanical edit."
         )
 
     stamp = dict(stamp)
     stamp["outputs_digest"] = outputs_digest(nb)
     stamp["notes"] = (
-        f"machine-specific paths sanitized out of the outputs at "
-        f"{datetime.now(UTC).isoformat()} without re-executing; every other byte of every "
-        f"output is identical to the run stamped at {stamp.get('executed_at', 'unknown')}"
+        f"{note} at {datetime.now(UTC).isoformat()} without re-executing; every other "
+        f"byte of every output is identical to the run stamped at "
+        f"{stamp.get('executed_at', 'unknown')}"
     )
     nb.setdefault("metadata", {})[STAMP_KEY] = stamp
     nb_path.write_text(json.dumps(nb, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -2341,13 +2535,43 @@ def _cmd_sync_imports(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_sync_inert(args: argparse.Namespace) -> int:
+    for name in args.notebooks:
+        path = Path(name).resolve()
+        if path.suffix == ".py":
+            path = path.with_suffix(".ipynb")
+        blob = sync_inert(path, args.reason)
+        print(f"inert edit synced {path.relative_to(REPO_ROOT)}: source_py_blob={blob[:12]}")
+    return 0
+
+
 def _cmd_sync_paths(args: argparse.Namespace) -> int:
     for name in args.notebooks:
         path = Path(name).resolve()
         if path.suffix == ".py":
             path = path.with_suffix(".ipynb")
         digest = sync_paths(path)
+        if not digest:
+            print(
+                f"paths synced {path.relative_to(REPO_ROOT)}: stamp predates outputs_digest, nothing to re-stamp"
+            )
+            continue
         print(f"paths synced {path.relative_to(REPO_ROOT)}: outputs_digest={digest[:12]}")
+    return 0
+
+
+def _cmd_sync_plotly(args: argparse.Namespace) -> int:
+    for name in args.notebooks:
+        path = Path(name).resolve()
+        if path.suffix == ".py":
+            path = path.with_suffix(".ipynb")
+        digest = sync_plotly(path)
+        if not digest:
+            print(
+                f"plotly stripped {path.relative_to(REPO_ROOT)}: stamp predates outputs_digest, nothing to re-stamp"
+            )
+            continue
+        print(f"plotly stripped {path.relative_to(REPO_ROOT)}: outputs_digest={digest[:12]}")
     return 0
 
 
@@ -2661,6 +2885,20 @@ def main() -> int:
     sp.add_argument("notebooks", nargs="+", help=".ipynb or .py paths")
     sp.set_defaults(func=_cmd_sync_paths)
 
+    gp = sub.add_parser(
+        "sync-plotly",
+        help="fold the Plotly JSON strip into the executed .ipynb, keeping its outputs",
+        description=(
+            "For a notebook whose only change is `strip_plotly_json.py` removing the "
+            "embedded Plotly payload from outputs that already carry a static image of the "
+            "same figure. Re-running cannot fix that - it writes the payload straight back - "
+            "so the stamp keeps its executed_at and executor and only outputs_digest moves. "
+            "Refuses unless the file on disk is exactly the committed notebook re-stripped."
+        ),
+    )
+    gp.add_argument("notebooks", nargs="+", help=".ipynb or .py paths")
+    gp.set_defaults(func=_cmd_sync_plotly)
+
     pp = sub.add_parser(
         "prose",
         help="print every markdown cell, for a review pass that touches no code",
@@ -2709,6 +2947,26 @@ def main() -> int:
     )
     ap_imp.add_argument("notebooks", nargs="+", help=".ipynb or .py paths")
     ap_imp.set_defaults(func=_cmd_sync_imports)
+
+    ap_inert = sub.add_parser(
+        "sync-inert",
+        help="fold a code edit that cannot change what the executed run computed",
+        description=(
+            "The last resort of the sync-* family, for an inert edit none of the others "
+            "recognises - a guard the run's own parameters already decided, an argument that "
+            "enters no stored identity. It checks everything but the claim: the outputs must "
+            "still be byte-identical to the recorded run's, the .py must have moved, and the "
+            ".ipynb source is rebuilt from the .py. The claim itself goes in --reason and is "
+            "written into the stamp, which keeps executed_at, executor and outputs_digest."
+        ),
+    )
+    ap_inert.add_argument("notebooks", nargs="+", help=".ipynb or .py paths")
+    ap_inert.add_argument(
+        "--reason",
+        required=True,
+        help="why this edit cannot change what the run computed",
+    )
+    ap_inert.set_defaults(func=_cmd_sync_inert)
 
     args = ap.parse_args()
     return args.func(args)
